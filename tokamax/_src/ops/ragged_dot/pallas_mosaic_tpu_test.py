@@ -16,6 +16,7 @@
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import chex
 import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
@@ -141,6 +142,33 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
           None,             # no activation
           task,
       )
+
+  @parameterized.product(
+      use_as_qarray=(True, False),
+      task=(
+          (8, 512, 256, 512),   # K=256 = tile_k, subchannel_iters=2
+          (8, 512, 512, 512),   # K=512 = 2*tile_k
+      ),
+  )
+  def test_blockwise_fp8_large_tile(self, use_as_qarray, task):
+    """Block-wise FP8 with tile_k=256 > eps_k=128 (guard fix validation)."""
+    num_groups, m, k, n = task
+    a, b, group_sizes = self._create_inputs(
+        num_groups, m, k, n, jnp.bfloat16,
+        random_groups=True,
+        use_as_qarray=use_as_qarray,
+        quant_a_dtype=jnp.dtype("float8_e4m3fn"),
+        a_tile_shape=(1, 128),
+        quant_b_dtype=jnp.dtype("float8_e4m3fn"),
+        b_tile_shape=(1, 128, 128),
+    )
+    config = pallas_mosaic_tpu.Config(tile_k=256)
+    expected = test_base.ref(a, b, group_sizes)
+    actual = self._dot_fn(a, b, group_sizes=group_sizes, config=config)
+    count = sum(group_sizes)
+    chex.assert_trees_all_close(
+        actual[:count], expected[:count], atol=0.4, rtol=0.1
+    )
 
   @override
   def _test_bench(self, spec):
