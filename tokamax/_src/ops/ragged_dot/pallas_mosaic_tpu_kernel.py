@@ -735,12 +735,8 @@ def tgmm(
       *,
       subchannel_iters: int,
   ):
-    if subchannel_iters != 1:
-      raise NotImplementedError(
-          "subchannel_iters != 1 not supported yet in tgmm."
-      )
     grid_id = pl.program_id(2)
-    group_offsets, group_ids, _ = group_metadata
+    group_offsets, group_ids, m_tile_ids = group_metadata
     group = group_ids[grid_id]
     prev_group = group_ids[jnp.where(grid_id > 0, grid_id - 1, 0)]
     is_prologue = (grid_id == 0) | (group != prev_group)
@@ -760,37 +756,58 @@ def tgmm(
       out_ref[...] = acc.astype(out_dtype)
 
     def _do():
-      # load lhs and rhs
-      lhs = jax.tree.map(lambda x: x[...], lhs_ref)
-      rhs = jax.tree.map(lambda x: x[...], rhs_ref)
+      sc_tile = tm // subchannel_iters
+      group_start = group_offsets[group]
+      group_end = group_offsets[group + 1]
+      m_base = m_tile_ids[grid_id] * tm
 
-      # optional dynamic quantization within the kernel
-      if lhs_qdtype is not None and not isinstance(lhs, QArray):
-        lhs = _quantize_as(lhs, lhs_qdtype, axis=1, scale=lhs_static_scale)
-      if rhs_qdtype is not None and not isinstance(rhs, QArray):
-        rhs = _quantize_as(rhs, rhs_qdtype, axis=1, scale=rhs_static_scale)
+      for it in range(subchannel_iters):
+        # Sub-slice lhs and rhs refs on M-axis (axis 0, reduction axis)
+        if subchannel_iters == 1:
+          lhs = jax.tree.map(lambda x: x[...], lhs_ref)
+          rhs = jax.tree.map(lambda x: x[...], rhs_ref)
+        else:
+          def _get_sub(x, idx=it):
+            size = x.shape[0] // subchannel_iters
+            s = idx * size
+            return x[s:s + size, :]
+          lhs = jax.tree.map(_get_sub, lhs_ref)
+          rhs = jax.tree.map(_get_sub, rhs_ref)
 
-      # unpack quantized arrays for dot operation
-      scales = []
-      if isinstance(lhs, QArray):
-        scales.append(lhs.scale.T)
-        lhs = lhs.qvalue
-      if isinstance(rhs, QArray):
-        scales.append(rhs.scale)
-        rhs = rhs.qvalue
+        # optional dynamic quantization within the kernel
+        if lhs_qdtype is not None and not isinstance(lhs, QArray):
+          lhs = _quantize_as(lhs, lhs_qdtype, axis=1, scale=lhs_static_scale)
+        if rhs_qdtype is not None and not isinstance(rhs, QArray):
+          rhs = _quantize_as(rhs, rhs_qdtype, axis=1, scale=rhs_static_scale)
 
-      kwargs = dict(grid_id=grid_id, group_metadata=group_metadata, tm=tm)
-      lhs = jnp.where(_get_store_mask(**kwargs, tn=tk), lhs, 0)
-      rhs = jnp.where(_get_store_mask(**kwargs, tn=tn), rhs, 0)
+        # unpack quantized arrays for dot operation
+        scales = []
+        if isinstance(lhs, QArray):
+          scales.append(lhs.scale.T)
+          lhs = lhs.qvalue
+        if isinstance(rhs, QArray):
+          scales.append(rhs.scale)
+          rhs = rhs.qvalue
 
-      is_int = lambda x: jnp.issubdtype(x.dtype, jnp.integer)
-      acc_dtype = jnp.int32 if is_int(lhs) and is_int(rhs) else jnp.float32
-      out = dot(lhs.T, rhs, acc_dtype)
+        # group boundary mask for this sub-tile
+        sub_m = m_base + it * sc_tile
+        lhs_iota = lax.broadcasted_iota(jnp.int32, lhs.shape, 0) + sub_m
+        lhs = jnp.where(
+            (lhs_iota >= group_start) & (lhs_iota < group_end), lhs, 0
+        )
+        rhs_iota = lax.broadcasted_iota(jnp.int32, rhs.shape, 0) + sub_m
+        rhs = jnp.where(
+            (rhs_iota >= group_start) & (rhs_iota < group_end), rhs, 0
+        )
 
-      # apply scales to the output if the inputs were quantized
-      for scale in scales:
-        out = _scale_out_by_scale(out, scale)
-      acc_scratch[...] += out.astype(acc_scratch.dtype)
+        is_int = lambda x: jnp.issubdtype(x.dtype, jnp.integer)
+        acc_dtype = jnp.int32 if is_int(lhs) and is_int(rhs) else jnp.float32
+        out = dot(lhs.T, rhs, acc_dtype)
+
+        # apply scales to the output if the inputs were quantized
+        for scale in scales:
+          out = _scale_out_by_scale(out, scale)
+        acc_scratch[...] += out.astype(acc_scratch.dtype)
 
     if combine_scopes:
       # every conditional introduces an optimization barrier, so splitting this
@@ -871,11 +888,11 @@ def tgmm(
   subchannel_iters = 1
   if isinstance(lhs, QArray):
     lhs_eps = pl.cdiv(lhs.qvalue.shape[0], lhs.scale.shape[0])
-    subchannel_iters = max(subchannel_iters, tk // lhs_eps)
+    subchannel_iters = max(subchannel_iters, tm // lhs_eps)
     lhs, lhs_block_spec = common.quant_block_spec(lhs, lhs_block_spec, 0)
   if isinstance(rhs, QArray):
     rhs_eps = pl.cdiv(rhs.qvalue.shape[0], rhs.scale.shape[0])
-    subchannel_iters = max(subchannel_iters, tk // rhs_eps)
+    subchannel_iters = max(subchannel_iters, tm // rhs_eps)
     rhs, rhs_block_spec = common.quant_block_spec(rhs, rhs_block_spec, 0)
 
   lhs_bytes = jax.tree.reduce(lambda acc, x: acc + x.size * x.itemsize, lhs, 0)
