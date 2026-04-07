@@ -698,6 +698,15 @@ def tgmm(
     raise ValueError(f"No tuned tiling found for (m, k, n) = ({m}, {k}, {n})")
 
   tm, tk, tn = tiling
+
+  # Cap tm to the blockwise scale granularity to avoid subchannel overhead.
+  # After .mT, lhs is [m, k] and rhs is [m, n]; axis 0 is the reduction axis.
+  for arr in (lhs, rhs):
+    if isinstance(arr, QArray):
+      eps = pl.cdiv(arr.qvalue.shape[0], arr.scale.shape[0])
+      if eps > 1:
+        tm = min(tm, eps)
+
   tiles_k = pl.cdiv(k, tk)
   tiles_n = pl.cdiv(n, tn)
 
@@ -756,53 +765,58 @@ def tgmm(
       out_ref[...] = acc.astype(out_dtype)
 
     def _do():
+      # load full tiles
+      lhs = jax.tree.map(lambda x: x[...], lhs_ref)
+      rhs = jax.tree.map(lambda x: x[...], rhs_ref)
+
+      # optional dynamic quantization within the kernel
+      if lhs_qdtype is not None and not isinstance(lhs, QArray):
+        lhs = _quantize_as(lhs, lhs_qdtype, axis=1, scale=lhs_static_scale)
+      if rhs_qdtype is not None and not isinstance(rhs, QArray):
+        rhs = _quantize_as(rhs, rhs_qdtype, axis=1, scale=rhs_static_scale)
+
+      # unpack quantized arrays — extract scales before masking
+      lhs_scale_full = None
+      rhs_scale_full = None
+      if isinstance(lhs, QArray):
+        lhs_scale_full = lhs.scale
+        lhs = lhs.qvalue
+      if isinstance(rhs, QArray):
+        rhs_scale_full = rhs.scale
+        rhs = rhs.qvalue
+
+      # apply group boundary mask ONCE on full tile (not per sub-tile)
+      kwargs = dict(grid_id=grid_id, group_metadata=group_metadata, tm=tm)
+      lhs = jnp.where(_get_store_mask(**kwargs, tn=tk), lhs, 0)
+      rhs = jnp.where(_get_store_mask(**kwargs, tn=tn), rhs, 0)
+
+      # subchannel loop — sub-slice masked qvalues and scales
       sc_tile = tm // subchannel_iters
-      group_start = group_offsets[group]
-      group_end = group_offsets[group + 1]
-      m_base = m_tile_ids[grid_id] * tm
-
       for it in range(subchannel_iters):
-        # Sub-slice lhs and rhs refs on M-axis (axis 0, reduction axis)
         if subchannel_iters == 1:
-          lhs = jax.tree.map(lambda x: x[...], lhs_ref)
-          rhs = jax.tree.map(lambda x: x[...], rhs_ref)
+          lhs_sub, rhs_sub = lhs, rhs
         else:
-          def _get_sub(x, idx=it):
-            size = x.shape[0] // subchannel_iters
-            s = idx * size
-            return x[s:s + size, :]
-          lhs = jax.tree.map(_get_sub, lhs_ref)
-          rhs = jax.tree.map(_get_sub, rhs_ref)
+          s = it * sc_tile
+          lhs_sub = lhs[s:s + sc_tile, :]
+          rhs_sub = rhs[s:s + sc_tile, :]
 
-        # optional dynamic quantization within the kernel
-        if lhs_qdtype is not None and not isinstance(lhs, QArray):
-          lhs = _quantize_as(lhs, lhs_qdtype, axis=1, scale=lhs_static_scale)
-        if rhs_qdtype is not None and not isinstance(rhs, QArray):
-          rhs = _quantize_as(rhs, rhs_qdtype, axis=1, scale=rhs_static_scale)
-
-        # unpack quantized arrays for dot operation
         scales = []
-        if isinstance(lhs, QArray):
-          scales.append(lhs.scale.T)
-          lhs = lhs.qvalue
-        if isinstance(rhs, QArray):
-          scales.append(rhs.scale)
-          rhs = rhs.qvalue
-
-        # group boundary mask for this sub-tile
-        sub_m = m_base + it * sc_tile
-        lhs_iota = lax.broadcasted_iota(jnp.int32, lhs.shape, 0) + sub_m
-        lhs = jnp.where(
-            (lhs_iota >= group_start) & (lhs_iota < group_end), lhs, 0
-        )
-        rhs_iota = lax.broadcasted_iota(jnp.int32, rhs.shape, 0) + sub_m
-        rhs = jnp.where(
-            (rhs_iota >= group_start) & (rhs_iota < group_end), rhs, 0
-        )
+        if lhs_scale_full is not None:
+          if subchannel_iters == 1:
+            scales.append(lhs_scale_full.T)
+          else:
+            sz = lhs_scale_full.shape[0] // subchannel_iters
+            scales.append(lhs_scale_full[it * sz:(it + 1) * sz, :].T)
+        if rhs_scale_full is not None:
+          if subchannel_iters == 1:
+            scales.append(rhs_scale_full)
+          else:
+            sz = rhs_scale_full.shape[0] // subchannel_iters
+            scales.append(rhs_scale_full[it * sz:(it + 1) * sz, :])
 
         is_int = lambda x: jnp.issubdtype(x.dtype, jnp.integer)
-        acc_dtype = jnp.int32 if is_int(lhs) and is_int(rhs) else jnp.float32
-        out = dot(lhs.T, rhs, acc_dtype)
+        acc_dtype = jnp.int32 if is_int(lhs_sub) and is_int(rhs_sub) else jnp.float32
+        out = dot(lhs_sub.T, rhs_sub, acc_dtype)
 
         # apply scales to the output if the inputs were quantized
         for scale in scales:
