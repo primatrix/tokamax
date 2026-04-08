@@ -273,8 +273,8 @@ def _quantize_as(x, qdtype: jnp.dtype, axis: int, scale: float | None):
     ).astype(jnp.bfloat16)
     inv_scales = jnp.broadcast_to(1.0 / scales, x.shape)
   else:  # compile-time (static) quantization scale
-    scales, inv_scales = scale, 1.0 / scale
-  return QArray(jnp.round(x * inv_scales).astype(qdtype), scales)
+    scales = jnp.array(scale, dtype=jnp.float32).reshape(*([1] * x.ndim)); inv_scales = 1.0 / scale
+  return QArray(jnp.round((x * inv_scales).astype(jnp.float32)).astype(qdtype), scales)
 
 
 def _scale_out_by_scale(
@@ -765,9 +765,9 @@ def tgmm(
 
         # optional dynamic quantization within the kernel
         if lhs_qdtype is not None and not isinstance(lhs, QArray):
-          lhs = _quantize_as(lhs, lhs_qdtype, axis=1, scale=lhs_static_scale)
+          lhs = _quantize_as(lhs, lhs_qdtype, axis=0, scale=lhs_static_scale)
         if rhs_qdtype is not None and not isinstance(rhs, QArray):
-          rhs = _quantize_as(rhs, rhs_qdtype, axis=1, scale=rhs_static_scale)
+          rhs = _quantize_as(rhs, rhs_qdtype, axis=0, scale=rhs_static_scale)
 
         # unpack quantized arrays for dot operation
         scales = []
