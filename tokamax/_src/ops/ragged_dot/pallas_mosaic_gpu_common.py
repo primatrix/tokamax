@@ -54,9 +54,7 @@ class Config:
   split_k: pydantic.PositiveInt
   split_m: pydantic.PositiveInt = 1
   grid_block_n: pydantic.PositiveInt = 1
-  warp_specialized: bool = True
   persistent: bool = True
-  async_store: bool = False
   post_scale: bool = False
   # B200 collective MMA
   collective: bool = False
@@ -71,66 +69,11 @@ class GroupInfo:
   """Information regarding the group being processed in a block."""
 
   group_id: jax.Array
-  block: jax.Array | None
   block_start: jax.Array
   actual_start: jax.Array
   actual_end: jax.Array
   start_within_block: jax.Array
   actual_size: jax.Array
-
-  @classmethod
-  def create(
-      cls, group_sizes: Sequence[jax.Array], tile: int, tid_size: int
-  ) -> "GroupInfo":
-    """Get the group info for the current block."""
-
-    tile = jnp.int32(tile)
-    # We usually only have very few groups, so we unroll the loop processing
-    # them. Normally we'd break out of the loop early, once we'd have found our
-    # boundary, but we can't do that when unrolling, so we rely on many selects
-    # to mask out the epilogue of the loop.
-    tid = jnp.arange(0, tid_size)
-    cuts = group_end = group_start = block = group = end = jnp.zeros_like(
-        tid, dtype=jnp.int32
-    )
-
-    for i, group_size in enumerate(group_sizes):
-      # Start/end are inclusive
-      start = end
-      end = start + group_size
-      final = end - 1
-      # How many times has a block been cut so far? This indicates how
-      # many more blocks are required along the dimension.
-      start_block = lax.div(start, tile)
-      final_block = lax.div(final, tile)
-      block_end = final_block + 1
-      tid_begin = start_block + cuts
-      tid_end = block_end + cuts
-      cuts += end % tile != 0
-      # How many blocks after is our block?
-      this_is_group = (tid_begin <= tid) & (tid < tid_end)
-      block = lax.select(this_is_group, tid - tid_begin + start_block, block)
-      group = lax.select(
-          this_is_group, jnp.full_like(tid, i, dtype=jnp.int32), group
-      )
-      group_start = lax.select(this_is_group, start, group_start)
-      group_end = lax.select(this_is_group, end, group_end)
-
-    block_start = block * tile
-    actual_start = jnp.maximum(group_start, block_start)
-    actual_end = jnp.minimum(group_end, block_start + tile)
-    start_within_block = actual_start - block_start
-    # The size can be negative if the tid is out of bounds, so we clamp it to 0.
-    actual_size = jnp.maximum(jnp.int32(0), actual_end - actual_start)
-    return cls(
-        group_id=group,
-        block=block,
-        block_start=block_start,
-        actual_start=actual_start,
-        actual_end=actual_end,
-        start_within_block=start_within_block,
-        actual_size=actual_size,
-    )
 
   @classmethod
   def create_aligned(
@@ -185,7 +128,6 @@ class GroupInfo:
     actual_end = global_m_start + offset_in_block + actual_size
     return cls(
         group_idx,
-        None,
         global_m_start,
         actual_start,
         actual_end,
@@ -246,68 +188,6 @@ def calculate_group_info_tasks(
     )
 
 
-# TODO: Unify this with the non_quant store.
-def store_acc_transposed(
-    acc,
-    o_gmem,
-    ni: jax.Array,
-    m: int,
-    group_info: GroupInfo,
-    o_smem,
-):
-  """Stores the accumulator into the output gmem.
-
-  It does so by first storing the accumulator into a swizzled shared memory
-  array, then copying that to the output gmem. This is done to allow for
-  coalesced writes.
-
-  Args:
-    acc: The accumulator to store.
-    o_gmem: The output gmem.
-    ni: The current n index.
-    m: The total m dimension.
-    group_info: The group info for the current block.
-    o_smem: The shared memory reference.
-  """
-  block_n, block_m = acc.shape
-  out_elem_bits = jnp.finfo(o_gmem.dtype).bits
-  swizzle_out = plgpu.find_swizzle(out_elem_bits * block_n, "out")
-  out_swizzle_elems = (swizzle_out * 8) // out_elem_bits
-  o_smem_swizzled = plgpu.unswizzle_ref(o_smem, swizzle_out)
-
-  if out_swizzle_elems != block_n:
-    raise ValueError(
-        f"Expected out_swizzle_elems ({out_swizzle_elems}) to equal block_n"
-        f" ({block_n})"
-    )
-
-  o_smem = o_smem_swizzled.reshape(block_m // 8, 1, 8, block_n)
-  o_smem = plgpu.untile_ref(o_smem, (8, block_n))
-  o_smem.T[...] = plgpu.layout_cast(
-      acc.astype(o_gmem.dtype), plgpu.Layout.WGMMA_TRANSPOSED
-  )
-  plgpu.commit_smem()
-  # Write out the largest power of two rows first, then the next largest,
-  # etc. This allows us to coalesce writes as much as possible.
-  offset = group_info.start_within_block
-  size = 1 << (min(block_m, m).bit_length() - 1)
-  while size > 0:
-
-    @pl.when(group_info.actual_size & size != 0)
-    def _():
-      o_smem_ = o_smem_swizzled.at[pl.ds(offset, size)]
-      o_gmem_ = o_gmem.at[
-          pl.ds(group_info.block_start + offset, size),
-          pl.ds(ni * block_n, block_n),
-      ]
-      plgpu.copy_smem_to_gmem(o_smem_, o_gmem_, commit_group=False)
-
-    offset += group_info.actual_size & size
-    size //= 2
-  plgpu.commit_smem_to_gmem_group()
-  plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-
-
 def ragged_kernel(
     body, *, g, m, n, out_dtype, config, thread_axis=None, **kwargs
 ) -> Callable[..., jax.Array]:
@@ -347,7 +227,6 @@ def ragged_kernel(
 
   def kernel_body(
       group_id_gmem,
-      block_gmem,
       block_start_gmem,
       actual_start_gmem,
       actual_end_gmem,
@@ -367,7 +246,6 @@ def ragged_kernel(
       )
       group_info = GroupInfo(
           group_id=group_id_gmem[mi],
-          block=block_gmem[mi],
           block_start=block_start_gmem[mi],
           actual_start=actual_start_gmem[mi],
           actual_end=actual_end_gmem[mi],
@@ -417,51 +295,6 @@ def ragged_kernel(
       num_threads=thread_axis and (num_compute_threads + 1),
       **kwargs,
   )
-
-
-def num_bits(dtype: jax.typing.DTypeLike) -> int:
-  fn = jnp.finfo if jnp.issubdtype(dtype, jnp.floating) else jnp.iinfo
-  return fn(dtype).bits
-
-
-def num_bytes(dtype) -> float:
-  return num_bits(dtype) / 8
-
-
-def tile_swizzle_transforms(
-    shape: tuple[int, ...],
-    dtype: jax.typing.DTypeLike,
-    what: str = "",
-    *,
-    tiling_prefix: tuple[int, ...] = (8,),
-) -> tuple[plgpu.TilingTransform, plgpu.SwizzleTransform]:
-  """Returns tiling and swizzling transforms."""
-  elem_bits = num_bits(dtype)
-  swizzle = plgpu.find_swizzle(shape[-1] * elem_bits, what)
-  tiling = (*tiling_prefix, 8 * swizzle // elem_bits)
-  return plgpu.TilingTransform(tiling), plgpu.SwizzleTransform(swizzle)
-
-
-def tiled_swizzled_smem(
-    shape: tuple[int, ...],
-    dtype: jax.typing.DTypeLike,
-    what: str = "",
-    *,
-    tiling_prefix: tuple[int, ...] = (8,),
-) -> pl.MemoryRef:
-  """Returns a memory reference to a tiled and swizzled shared memory array."""
-  transforms = tile_swizzle_transforms(
-      shape, dtype, what, tiling_prefix=tiling_prefix
-  )
-  return plgpu.SMEM(shape, dtype, transforms=transforms)
-
-
-def tiled_swizzled_block_spec(
-    shape, dtype, index_map, what="", **kwargs
-) -> plgpu.BlockSpec:
-  """Returns a block spec with tiling and swizzling transforms."""
-  transforms = tile_swizzle_transforms(shape, dtype, what)
-  return plgpu.BlockSpec(shape, index_map, transforms=transforms, **kwargs)
 
 
 def get_smem_capacity() -> int:

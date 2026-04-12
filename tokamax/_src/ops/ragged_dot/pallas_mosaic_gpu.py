@@ -33,8 +33,6 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant as sm90_quant
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_ws as sm90_quant_ws
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_ws_async_store as sm90_quant_ws_async_store
 from typing_extensions import override
 
 Config = common.Config
@@ -97,12 +95,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
             raise NotImplementedError(f"{precision=} not supported.")
 
-          if config.async_store:
-            fn = sm90_quant_ws_async_store.ragged_dot_quantized_ws_async_store_kernel  # pylint: disable=line-too-long
-          elif config.warp_specialized:
-            fn = sm90_quant_ws.ragged_dot_quantized_ws_kernel
-          else:
-            fn = sm90_quant.ragged_dot_quantized_kernel
+          fn = sm90_quant.ragged_dot_quantized_kernel
         else:
           if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
             lhs = lhs.astype(jnp.bfloat16)
@@ -192,9 +185,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           num_stages=2,
           split_k=1,
           grid_block_n=1,
-          warp_specialized=True,
           persistent=False,
-          async_store=True,
           grid_minor_dim=common.MatmulDimension.M,
           grid_tile_width=1,
       )
@@ -235,7 +226,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             num_stages=2,
             split_k=1,
             grid_block_n=1,
-            warp_specialized=True,
             persistent=False,
             collective=True,
             grid_minor_dim=common.MatmulDimension.M,
@@ -266,43 +256,35 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     out_dtype_bits = jnp.finfo(out_dtype).bits
     out_swizzle_elems = (128 * 8) // out_dtype_bits
 
-    if isinstance(rhs, QArray):
-      ws_async_store_options = ((False, False), (True, False), (True, True))
-    else:
-      ws_async_store_options = ((False, False),)
-
     configs = set()
     for persistent in [True, False]:
-      for warp_specialized, async_store in ws_async_store_options:
-        for block_k in [128, 256, 512]:
-          if (block_k * rhs_dtype_bits) % (128 * 8) or (
-              block_k * lhs_dtype_bits
-          ) % (128 * 8):
-            continue
-          if scale_tile_shape != 0 and scale_tile_shape % block_k != 0:
-            continue
-          for block_m in [128, 64, 32, 16]:
-            for num_stages in [4, 2]:
-              for grid_minor_dim in [
-                  common.MatmulDimension.M,
-                  common.MatmulDimension.N,
-              ]:
-                for grid_tile_width in [1, 2, 4, 8]:
-                  configs.add(
-                      Config(
-                          block_m=block_m,
-                          block_n=out_swizzle_elems,
-                          block_k=block_k,
-                          num_stages=num_stages,
-                          warp_specialized=warp_specialized,
-                          persistent=persistent,
-                          split_k=1,
-                          async_store=async_store,
-                          grid_block_n=grid_tile_width,
-                          grid_minor_dim=grid_minor_dim,
-                          grid_tile_width=grid_tile_width,
-                      )
-                  )
+      for block_k in [128, 256, 512]:
+        if (block_k * rhs_dtype_bits) % (128 * 8) or (
+            block_k * lhs_dtype_bits
+        ) % (128 * 8):
+          continue
+        if scale_tile_shape != 0 and scale_tile_shape % block_k != 0:
+          continue
+        for block_m in [128, 64, 32, 16]:
+          for num_stages in [4, 2]:
+            for grid_minor_dim in [
+                common.MatmulDimension.M,
+                common.MatmulDimension.N,
+            ]:
+              for grid_tile_width in [1, 2, 4, 8]:
+                configs.add(
+                    Config(
+                        block_m=block_m,
+                        block_n=out_swizzle_elems,
+                        block_k=block_k,
+                        num_stages=num_stages,
+                        persistent=persistent,
+                        split_k=1,
+                        grid_block_n=grid_tile_width,
+                        grid_minor_dim=grid_minor_dim,
+                        grid_tile_width=grid_tile_width,
+                    )
+                )
     return configs
 
   def _get_sm100_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
@@ -359,7 +341,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                               num_stages=num_stages,
                               split_k=1,
                               grid_block_n=grid_tile_width,
-                              warp_specialized=True,
                               persistent=False,
                               collective=collective,
                               post_scale=post_scale,
