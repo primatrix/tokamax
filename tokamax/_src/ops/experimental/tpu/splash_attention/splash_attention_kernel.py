@@ -163,9 +163,9 @@ class SplashConfig:
     if self.block_kv_dkv_compute is None:
       object.__setattr__(self, "block_kv_dkv_compute", self.block_kv_dkv)
 
-    if self.dq_reduction_steps is not None and self.dq_reduction_steps != 3:
+    if self.dq_reduction_steps is not None and self.dq_reduction_steps not in (1, 3):
       raise ValueError(
-          f"Invalid dq_reduction_steps: {self.dq_reduction_steps}, only 3 or"
+          f"Invalid dq_reduction_steps: {self.dq_reduction_steps}, only 1, 3 or"
           " None are supported."
       )
     if not self.use_fused_bwd_kernel:
@@ -1601,11 +1601,16 @@ def _splash_attention_bwd_dkv(
     dq_reduction_steps = None
 
   dq = dq_alias_spec = None
-  if dq_reduction_steps == 3:
-    dq_index_map = unravel(lambda h, i, j: (j % 3, h, i, 0))
+  if dq_reduction_steps in (1, 3):
+    n_slots = dq_reduction_steps
+    if n_slots == 1:
+      dq_index_map = unravel(lambda h, i, j: (0, h, i, 0))
+    else:
+      dq_index_map = unravel(lambda h, i, j: (j % n_slots, h, i, 0))
     dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
     dq_alias_spec = dq_spec
-    dq_shape = jax.ShapeDtypeStruct((3, *q.shape), q.dtype)
+    dq_accum_dtype = jnp.float32 if n_slots == 1 else q.dtype
+    dq_shape = jax.ShapeDtypeStruct((n_slots, *q.shape), dq_accum_dtype)
     dq = jnp.zeros_like(dq_shape)
   else:
     dq_index_map = unravel(lambda h, i, j: (j, h, i, 0))
@@ -2056,7 +2061,7 @@ def _make_splash_attention(
         mask,
         (bq_dkv, bkv_dkv),
         is_dkv=True,
-        return_dynamic_grid=config.dq_reduction_steps == 3,
+        return_dynamic_grid=False,  # Disabled: dynamic_grid + dq_reduction_steps=3 triggers SMEM overflow on TPU v7x for large T
     )
 
     assert (mask_function_fwd is None) == (mask_function_dkv is None)
