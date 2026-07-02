@@ -20,8 +20,8 @@ requires-python = ">=3.11"
 dependencies = [
     "absl-py>=2.3.0",
     "einshape",
-    "jax>=0.9.2",
-    "jaxlib>=0.9.2",
+    "jax>=0.10.2",
+    "jaxlib>=0.10.2",
     "jaxtyping>=0.3",
     "pydantic>=2.11.0",
     "qwix>=0.1.2",
@@ -55,22 +55,24 @@ test = [
     "pytest-xdist",
     "pytest",
     "xprof",
+    "hypothesis",
 ]
 
 bench = [
-    "libtpu>=0.0.35",
     "google-benchmark>=1.9.0",
     "xprof",
+    "cuequivariance-jax>=0.10.0",
+    "cuequivariance-ops-jax-cu13>=0.10.0",
+    "triton"
 ]
 
 cuda = [
-    "jax[cuda12]>=0.8.0",
-    "nvidia-cudnn-cu12>=9.0.0",
+    "jax[cuda13]>=0.10.1",
+    "nvidia-cudnn-cu13>=9.23.0.39",
 ]
 
 tpu = [
-    "jax[tpu]>=0.8.0",
-    "hypothesis",
+    "jax[tpu]>=0.10.1",
 ]
 
 [tool.pytest.ini_options]

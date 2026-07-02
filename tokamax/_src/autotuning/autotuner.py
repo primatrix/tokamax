@@ -57,7 +57,8 @@ class AutotuningData(
       return min(valid_benchmarks, key=key_fn)[0]
     except ValueError as e:
       if self:
-        raise ExceptionGroup("All configs failed", tuple(self.values())) from e
+        exceptions = cast(tuple[Exception, ...], tuple(self.values()))
+        raise ExceptionGroup("All configs failed", exceptions) from e
       raise ValueError("Autotuning data is empty") from e
 
   def prune(self) -> Self:
@@ -69,6 +70,9 @@ class AutotuningData(
     except ExceptionGroup as e:
       raise e
     return return_data
+
+  def prune_errors(self) -> dict[_Config, BenchmarkData]:
+    return {k: v for k, v in self.items() if isinstance(v, BenchmarkData)}  # pytype: disable=bad-return-type
 
   @classmethod
   def __get_pydantic_core_schema__(cls, source, handler):
@@ -85,16 +89,19 @@ class AutotuningData(
         ),
     )
 
+  def __or__(self, other: Self) -> Self:
+    return AutotuningData(super().__or__(other))
+
 
 def _compile(fn_factory, config, args, kwargs, *, seed=None):
   fn = fn_factory(config)
   fn, x = benchmarking.standardize_function(fn, *args, kwargs=kwargs, seed=seed)
-  return benchmarking.compile_benchmark(fn, x), x
+  return benchmarking.compile_benchmark(fn, x), x  # pyrefly: ignore[bad-argument-type]
 
 
-def _benchmark(fn_factory, config, args, kwargs):
+def _benchmark(fn_factory, config, args, kwargs, event_filter_regex=None):
   runner, x = _compile(fn_factory, config, args, kwargs, seed=0)
-  return runner(x)
+  return runner(x, event_filter_regex=event_filter_regex)
 
 
 class _SyncExecutor(futures.Executor):
@@ -124,6 +131,7 @@ class Autotuner:
       fn_factory: Callable[[_Config], Callable[_P, Any]],
       configs: set[_Config],
       *args: _P.args,
+      event_filter_regex: str | None = None,  # pyrefly: ignore[bad-function-definition]
       **kwargs: _P.kwargs,
   ) -> AutotuningData[_Config]:
     """Autotunes over configs for the given arguments."""
@@ -154,8 +162,13 @@ class Autotuner:
               compiled_fn, args = future.result()
               if initialized_args is None:
                 initialized_args = numerics.random_initialize(args)
-              executor_args[config] = (compiled_fn, initialized_args)
-            except Exception as e:
+              executor_args[config] = (
+                  functools.partial(
+                      compiled_fn, event_filter_regex=event_filter_regex
+                  ),
+                  initialized_args,
+              )
+            except Exception as e:  # pylint: disable=broad-exception-caught
               vlog_exc_info("Config failed to compile: %s", config)
               results[config] = e
         except TimeoutError as e:
@@ -167,7 +180,14 @@ class Autotuner:
             results[config] = e
     else:
       for config in configs:
-        executor_args[config] = (_benchmark, fn_factory, config, args, kwargs)
+        executor_args[config] = (
+            _benchmark,
+            fn_factory,
+            config,
+            args,
+            kwargs,
+            event_filter_regex,
+        )
 
     with executor:
       future_to_config = {
@@ -208,7 +228,7 @@ class Autotuner:
           1,
           "best config is %s (median execution time: %f ms)",
           config,
-          results[config].median_evaluation_time_ms,
+          cast(BenchmarkData, results[config]).median_evaluation_time_ms,
       )
     except ExceptionGroup:
       logging.exception("all configs failed for %s", fn_factory)

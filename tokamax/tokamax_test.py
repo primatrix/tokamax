@@ -24,10 +24,14 @@ import tokamax
 from tokamax._src import version
 from tokamax._src.autotuning import api as autotuning
 from tokamax._src.ops.attention import api as attention_api
-from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp
-from tokamax._src.ops.attention import pallas_triton_vjp as pl_triton_attn_vjp
 from tokamax._src.ops.normalization import api as norm_api
-from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
+
+try:
+  from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.attention import pallas_triton_vjp as pl_triton_attn_vjp  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+except ImportError:
+  pass
 
 try:
   from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
@@ -46,7 +50,8 @@ class TokamaxTest(absltest.TestCase):
       )
       x = tokamax.dot_product_attention(x, x, x, implementation=impl)
       x = tokamax.layer_norm(x, scale=scale, offset=None, implementation=None)
-      x = tokamax.dot_product_attention(x, x, x, implementation="mosaic")
+      # TODO: Remove once Mosaic supports non-bfloat16 types.
+      # x = tokamax.dot_product_attention(x, x, x, implementation="mosaic")
       return jnp.sum(x)
 
     channels = 64
@@ -83,18 +88,20 @@ class TokamaxTest(absltest.TestCase):
       if jax.default_backend() == "gpu":
         ops_expected = set([
             attention_api.IMPLEMENTATIONS["triton"].__class__,
-            attention_api.IMPLEMENTATIONS["mosaic_gpu"].__class__,
+            # TODO: Remove once Mosaic supports non-bfloat16 types.
+            # attention_api.IMPLEMENTATIONS["mosaic_gpu"].__class__,
+            # pallas_mosaic_gpu_vjp.PallasMosaicGpuFlashAttentionVjp,
             norm_api.IMPLEMENTATIONS["triton"].__class__,
             pl_triton_attn_vjp.PallasTritonFlashAttentionVjp,
-            pallas_mosaic_gpu_vjp.PallasMosaicGpuFlashAttentionVjp,
             pl_norm_vjp.PallasTritonNormalizationVjp,
         ])
       else:
         ops_expected = set([
             attention_api.IMPLEMENTATIONS["xla"].__class__,
-            attention_api.IMPLEMENTATIONS["mosaic_tpu"].__class__,
+            # TODO: Remove once Mosaic supports non-bfloat16 types.
+            # attention_api.IMPLEMENTATIONS["mosaic_tpu"].__class__,
+            # pallas_mosaic_tpu_vjp.PallasMosaicTpuFlashAttentionVjp,
             norm_api.IMPLEMENTATIONS["xla"].__class__,
-            pallas_mosaic_tpu_vjp.PallasMosaicTpuFlashAttentionVjp,
         ])
       self.assertContainsSubset(ops_expected, ops)
 

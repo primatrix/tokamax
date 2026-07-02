@@ -135,7 +135,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
             },
             project='mixtral',
             name='8x7b_bf16',
-            tags=('primary',),
+            tags=('primary', 'ci_tests'),
         ),
         arg_spec.ArgSpec(
             args={
@@ -146,7 +146,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
             },
             project='deepseek2',
             name='16b_bf16',
-            tags=('primary',),
+            tags=('primary', 'ci_tests'),
         ),
         arg_spec.ArgSpec(
             args={
@@ -169,7 +169,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
             },
             project='alphafold',
             name='384x384x4x64',
-            tags=('mlcompass',),
+            tags=('primary',),
         ),
         arg_spec.ArgSpec(
             args={
@@ -181,7 +181,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
             },
             project='alphafold',
             name='768x768x4x64',
-            tags=('mlcompass',),
+            tags=('primary',),
         ),
     )
     + _flash_attention_v3_specs()

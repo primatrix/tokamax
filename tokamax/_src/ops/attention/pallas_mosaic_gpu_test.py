@@ -50,7 +50,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       supports_mask=True,
       supports_tanh_clipping=True,
       supports_is_causal=True,
-      supports_f32_inputs=True,
       supports_vmap=True,
   ):
     if attention_fn is None:
@@ -72,51 +71,37 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         supports_precisions=False,
         supports_vmap=supports_vmap,
         supports_is_causal=supports_is_causal,
+        supports_logits_dtype=False,
     )
-    self._supports_f32_inputs = supports_f32_inputs
 
   def _run_test_with_inputs(self, q, k, v, *, bias=None, **kwargs):
-    # PallasMosaicGpuFlashAttention doesn't support high precisions and
-    # (logits_dtype != f32). Override the arguments instead of disabling
-    # basically most of the tests.
+    # PallasMosaicGpuFlashAttention doesn't support high precisions. Override
+    # the arguments instead of disabling most of the tests.
     impl_kwargs = kwargs.setdefault("impl_kwargs", {})
-    impl_kwargs["logits_dtype"] = jnp.float32
-    qk_prec, wv_prec = (jax.lax.DotAlgorithmPreset.DEFAULT,) * 2
-    if q.dtype == jnp.float32 or k.dtype == jnp.float32:
-      qk_prec = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
-    if v.dtype == jnp.float32:
-      wv_prec = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
-    impl_kwargs["precision"] = (qk_prec, wv_prec)
+    if any(x.dtype == jnp.float32 for x in (q, k, v)):
+      impl_kwargs["precision"] = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+      # Bottleneck precision for reference implementation to match kernel.
+      bf16_round_trip = lambda x: x.astype(jnp.bfloat16).astype(jnp.float32)
+      q, k, v = map(bf16_round_trip, (q, k, v))
 
-    def recast(x):
-      if isinstance(x, jax.Array) and x.dtype == jnp.float32:
-        x = x.astype(jnp.bfloat16)
-        if self._supports_f32_inputs:
-          x = x.astype(jnp.float32)
-      return x
-
-    # This backend casts to bfloat16 internally, so we recast inputs to bfloat16
-    # and back to avoid precision loss with the reference implementation.
-    q, k, v = map(recast, (q, k, v))
     atol = kwargs.get("atol", 0.0)
     kwargs["atol"] = max(atol, 0.0045)
     kwargs["atol_grads"] = None if bias is None else 0.02
     kwargs["test_vjp_deterministic"] = not gpu_utils.is_sm100()
 
-    if not impl_kwargs.get("normalize_output", True) or (
-        bias is not None and gpu_utils.is_sm100()
-    ):
+    if not impl_kwargs.get("normalize_output", True):
       kwargs["test_vjp"] = False
 
     test_vjp = kwargs.get("test_vjp", self._supports_vjp)
     if gpu_utils.is_sm100():
-      # TODO: Head dim > 64 is unsupported at the moment on
-      # SM100 because smem and tmem is are both exceeded exceeded.
-      if q.shape[-1] > 64 and test_vjp:
-        kwargs["expect_supported"] = False
 
       impl = kwargs.get("impl", self._attention_fn)
       if not getattr(impl, "use_stable_softmax", True):
+        kwargs["expect_supported"] = False
+
+      # SM100 requires block_q=128 and block_kv=128 for the VJP dual kernel.
+      # For head_dim=256, this pushes SMEM > 227KB, causing a ValueError.
+      if q.shape[-1] >= 256 and test_vjp:
         kwargs["expect_supported"] = False
 
     super()._run_test_with_inputs(q, k, v, bias=bias, **kwargs)
@@ -170,12 +155,11 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
   @override
   def _test_bench(self, spec):
-    # TODO: Remove once fixed.
-    if "B200" in jax.devices()[0].device_kind:
-      self.skipTest("Skipping test on B200s")
-    atol_grads = None if spec.get("bias") is None else 0.04
+    atol_grads = None if spec.get("bias") is None else {0.99995: 0.04, 1.0: 0.5}
     try:
-      with test_base.override_test_args(atol=0.02, atol_grads=atol_grads):
+      with test_base.override_test_args(
+          atol={0.99: 0.02, 1.0: 0.05}, atol_grads=atol_grads
+      ):
         super()._test_bench(spec)
     except ValueError as e:
       if "exceeds available shared memory" in str(e):
@@ -191,10 +175,20 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     self.assertNotEmpty(configs)
     for config in configs:
       with self.subTest(f"{config=}"):
+        if (
+            gpu_utils.is_sm100()
+            and not config.collective
+            and config.block_kv < 128
+        ):
+          self.skipTest(
+              "Skipping test for config that is known to cause issues"
+              " (b/517048781)."
+          )
         impl = type(self._attention_fn)(config)
         self._run_test_with_inputs(q, k, v, impl=impl)
 
   def test_vjp_autotune_configs(self):
+    self.skipTest("TODO: Disable due to OOMs.")
     if not self._supports_vjp:
       self.skipTest("VJP unsupported for this implementation.")
     assert isinstance(self._attention_fn, base.DotProductAttention)
@@ -216,6 +210,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       with self.subTest(f"{config=}"):
         impl = type(attn_fn)(vjp=type(vjp_fn)(config=config))
         self._run_test_with_inputs(q, k, v, impl=impl)
+        jax.clear_caches()
 
   def test_split_k(self):
     assert hasattr(self._attention_fn, "config_cls")

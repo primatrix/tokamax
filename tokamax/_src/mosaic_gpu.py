@@ -14,12 +14,105 @@
 # ==============================================================================
 """Mosaic-GPU utils."""
 
-import jax.experimental.mosaic.gpu as mgpu
-import jax.experimental.pallas.mosaic_gpu as plgpu
+import functools
+from typing import cast
+
+import jax
+from jax.experimental import pallas as pl
+from jax.experimental.mosaic import gpu as mgpu
+from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import llvm
+from jaxlib.mlir.dialects import nvvm
 import numpy as np
+
+
+def num_bits(dtype: jax.typing.DTypeLike) -> int:
+  fn = jnp.finfo if jnp.issubdtype(dtype, jnp.floating) else jnp.iinfo
+  return fn(dtype).bits
+
+
+def tile_swizzle_transforms(
+    shape: tuple[int, ...],
+    dtype: jax.typing.DTypeLike,
+    what: str = "",
+    *,
+    tiling_prefix: tuple[int, ...] = (8,),
+) -> tuple[plgpu.TilingTransform, plgpu.SwizzleTransform]:
+  """Returns tiling and swizzling transforms."""
+  elem_bits = num_bits(dtype)
+  swizzle = plgpu.find_swizzle(shape[-1] * elem_bits, what)
+  tiling = (*tiling_prefix, 8 * swizzle // elem_bits)
+  return plgpu.TilingTransform(tiling), plgpu.SwizzleTransform(swizzle)
+
+
+def tiled_swizzled_smem(
+    shape: tuple[int, ...],
+    dtype: jax.typing.DTypeLike,
+    what: str = "",
+    *,
+    tiling_prefix: tuple[int, ...] = (8,),
+) -> pl.MemoryRef:
+  """Returns a memory reference to a tiled and swizzled shared memory array."""
+  transforms = tile_swizzle_transforms(
+      shape, dtype, what, tiling_prefix=tiling_prefix
+  )
+  return plgpu.SMEM(shape, dtype, transforms=transforms)
+
+
+def tiled_swizzled_block_spec(
+    shape, dtype, index_map, what="", **kwargs
+) -> plgpu.BlockSpec:
+  """Returns a block spec with tiling and swizzling transforms."""
+  transforms = tile_swizzle_transforms(shape, dtype, what)
+  return plgpu.BlockSpec(shape, index_map, transforms=transforms, **kwargs)
+
+
+def warpgroup_barrier():
+  plgpu.inline_mgpu()(lambda _: mgpu.warpgroup_barrier())()
+
+
+@plgpu.inline_mgpu()
+def fence_async_shared_cta(_):
+  space = nvvm.SharedSpace.shared_cta
+  nvvm.fence_proxy(nvvm.ProxyKind.async_shared, space=space)
+
+
+def _bar_operation(
+    operation: str, barrier_id: int | jax.Array, num_threads: int
+):
+  """Performs a PTX CTA barrier operation."""
+  if isinstance(barrier_id, int):
+
+    @plgpu.inline_mgpu()
+    def bar_op(_):
+      llvm.inline_asm(
+          ir.Type.parse("!llvm.void"),
+          [],
+          f"bar.{operation} {barrier_id}, {num_threads};",
+          "",
+          has_side_effects=True,
+      )
+
+    bar_op()
+  else:
+
+    @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,))
+    def bar_op(_, barrier_id):
+      llvm.inline_asm(
+          ir.Type.parse("!llvm.void"),
+          [barrier_id.registers[()]],
+          f"bar.{operation} $0, {num_threads};",
+          "r",
+          has_side_effects=True,
+      )
+
+    bar_op(barrier_id)
+
+
+bar_arrive = functools.partial(_bar_operation, "arrive")
+bar_sync = functools.partial(_bar_operation, "sync")
 
 
 def int4_as_biased_f8e4m3fn(x, layout):
@@ -104,21 +197,24 @@ def int4_as_biased_f8e4m3fn(x, layout):
 
     def upcast_i4_to_fp8_biased(reg: ir.Value):
 
-      out_struct = llvm.inline_asm(
-          ir.Type.parse("!llvm.struct<(i32, i32)>"),
-          [reg],
-          """
-            {{
-            .reg .b32 biased, evens, odds, odds_raw;
-            xor.b32 biased, $2, 0x88888888;
-            and.b32 evens, biased, 0x0F0F0F0F;
-            shr.u32 odds_raw, biased, 4;
-            and.b32 odds, odds_raw, 0x0F0F0F0F;
-            prmt.b32 $0, evens, odds, 0x5140;
-            prmt.b32 $1, evens, odds, 0x7362;
-            }}
-            """,
-          "=r,=r,r",
+      out_struct = cast(
+          ir.Value,
+          llvm.inline_asm(
+              llvm.StructType.get_literal((i32, i32)),
+              [reg],
+              """
+              {{
+              .reg .b32 odds_raw, c_mask;
+              mov.b32 c_mask, 0x0F0F0F0F;
+              shr.u32 odds_raw, $2, 4;
+              prmt.b32 $0, $2, odds_raw, 0x5140;
+              prmt.b32 $1, $2, odds_raw, 0x7362;
+              lop3.b32 $0, $0, 0x08080808, c_mask, 0x6c;
+              lop3.b32 $1, $1, 0x08080808, c_mask, 0x6c;
+              }}
+              """,
+              "=r,=r,r",
+          ),
       )
 
       lo_i32 = llvm.extractvalue(i32, out_struct, (0,))

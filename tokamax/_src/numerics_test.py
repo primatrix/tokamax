@@ -24,12 +24,6 @@ from tokamax._src import batching
 from tokamax._src import numerics
 
 
-if jax.__version_info__ >= (0, 6, 3):
-  Layout = layout.Layout
-else:
-  Layout = layout.DeviceLocalLayout  # type: ignore
-
-
 class NumericsTest(parameterized.TestCase):
 
   def test_initializer_consistency(self):
@@ -125,8 +119,8 @@ class NumericsTest(parameterized.TestCase):
       self.skipTest('Test broken on TPU')
 
     shape = (2, 3, 4)
-    no_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
-    format_ = layout.Format(Layout((1, 2, 0), ()), no_sharding)
+    no_sharding = jax.sharding.make_single_device_sharding(jax.devices()[0])
+    format_ = layout.Format(layout.Layout((1, 2, 0), ()), no_sharding)
     spec_with_layout = jax.ShapeDtypeStruct(shape, dtype, sharding=format_)
     actual = numerics.random_initialize(spec_with_layout)
     expected = numerics.random_initialize(jax.ShapeDtypeStruct(shape, dtype))
@@ -140,15 +134,18 @@ class NumericsTest(parameterized.TestCase):
           jax.ShapeDtypeStruct((128, 1), jnp.bfloat16),
           jax.ShapeDtypeStruct((32, 32), jnp.float32),
       ),
+      explicit_qtype=(True, False),
   )
-  def test_random_initialize_qarray(self, qtype, scale):
+  def test_random_initialize_qarray(self, qtype, scale, explicit_qtype):
     qvalue = jax.ShapeDtypeStruct((256, 256), qtype)
-    q = qwix.QArray(qvalue, scale)  # pytype: disable=wrong-arg-types
+    kwargs = dict(qtype=qtype) if explicit_qtype else {}
+    q = qwix.QArray(qvalue, scale, **kwargs)  # pytype: disable=wrong-arg-types
     q = numerics.random_initialize(q)
     self.assertEqual(q.qvalue.shape, qvalue.shape)
     self.assertEqual(q.scale.shape, scale.shape)
     self.assertEqual(q.qvalue.dtype, qtype)
     self.assertEqual(q.scale.dtype, scale.dtype)
+    self.assertIs(q.qtype, qtype if explicit_qtype else jnp.dtype(qtype))
     q_rms = jnp.sqrt(jnp.mean(qwix.dequantize(q) ** 2))
     self.assertGreater(q_rms, 0.8)
     self.assertLess(q_rms, 1.2)

@@ -117,14 +117,14 @@ def array_diff_summary(
 def array_numeric_summary(x: jax.Array) -> NumericSummary:
   """Produce a numerical summary of an array."""
   # Convert to numpy fp64 array to avoid issues with XLA:GPU numerics.
-  x = np.array(x).astype(np.float64)
+  x = np.array(x).astype(np.float64)  # pyrefly: ignore[bad-assignment]
   return NumericSummary(
-      has_inf=np.isinf(x).any(),
-      has_nan=np.isnan(x).any(),
-      min=np.nanmin(x),
-      max=np.nanmax(x),
-      mean=np.nanmean(x),
-      mean_abs=np.nanmean(np.abs(x)),
+      has_inf=bool(np.isinf(x).any()),
+      has_nan=bool(np.isnan(x).any()),
+      min=float(np.nanmin(x)),
+      max=float(np.nanmax(x)),
+      mean=float(np.nanmean(x)),
+      mean_abs=float(np.nanmean(np.abs(x))),
   )
 
 
@@ -196,18 +196,25 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     if isinstance(x, ArrayInitializer):
       return jax.device_put(x(rng))
     if isinstance(x, qwix.QArray):
+      if x.zero_point is not None:
+        raise NotImplementedError('Zero point not supported.')
+      if x.qvalue.dtype != x.qtype:
+        raise NotImplementedError('`qvalue.dtype` and `qtype` must match.')
+
       abstract_qvalue = isinstance(x.qvalue, jax.ShapeDtypeStruct)
       abstract_scale = isinstance(x.scale, jax.ShapeDtypeStruct)
 
       if abstract_qvalue and abstract_scale:
-        x = qwix.QArray(_as_vmap_shape(x.qvalue), _as_vmap_shape(x.scale))  # pytype: disable=wrong-arg-types
+        x = dataclasses.replace(
+            x, qvalue=_as_vmap_shape(x.qvalue), scale=_as_vmap_shape(x.scale)
+        )
         try:
           dtype_ = jnp.promote_types(x.dtype, jnp.float32)
-        except jax._src.dtypes.TypePromotionError:
+        except jax.dtypes.TypePromotionError:
           dtype_ = jnp.float32
         values = rng.standard_normal(size=x.shape, dtype=dtype_).astype(x.dtype)
         tiled_axes = {i: d for i, d in enumerate(x.scale_tile_shape)}
-        return qwix.quantize(values, x.qvalue.dtype, tiled_axes=tiled_axes)
+        return qwix.quantize(values, x.qtype, tiled_axes=tiled_axes)
       elif not abstract_qvalue and not abstract_scale:
         return x
       else:
@@ -222,7 +229,7 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     if jnp.issubdtype(dtype, jnp.floating):
       try:
         dtype_ = jnp.promote_types(dtype, jnp.float32)
-      except jax._src.dtypes.TypePromotionError:
+      except jax.dtypes.TypePromotionError:
         dtype_ = jnp.float32
       y = rng.standard_normal(size=x.shape, dtype=dtype_).astype(dtype)
     elif dtype.name == 'bool':

@@ -27,7 +27,7 @@ import re
 import shutil
 import tempfile
 import time
-from typing import Any, Final, Literal, TypeAlias, TypeVar
+from typing import Any, Final, Literal, TypeAlias, TypeVar, overload
 
 import jax
 from jax.experimental.mosaic.gpu import profiler
@@ -56,7 +56,9 @@ TimingMethod: TypeAlias = Literal[
 
 logger = logging.getLogger(__name__)
 
-WORKLOAD_ARTIFACTS_DIR_VARNAME: Final[str] = 'WORKLOAD_ARTIFACTS_DIR'  # for CI
+# for CI
+WORKLOAD_ARTIFACTS_DIR_VARNAME: Final[str] = 'WORKLOAD_ARTIFACTS_DIR'
+RETAIN_ARTIFACTS_VARNAME: Final[str] = 'TOKAMAX_DUMP_XPROF'
 
 
 def get_tempdir(
@@ -125,6 +127,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       self,
       hermetic: bool = True,
       use_jax_profiler: bool = False,
+      event_filter_regex: str | None = None,
       **xprof_session_kwargs,
   ):
     """Initializer.
@@ -136,6 +139,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       use_jax_profiler: Profile with the jax.profiler API writing a temporary
         profile file instead of invoking xprof directly. If False (default),
         profile with xprof directly.
+      event_filter_regex: A regex pattern to include only matching event names.
       **xprof_session_kwargs: Additional keyword arguments to pass to
         `xprof_session.start_session`.
     """
@@ -153,7 +157,9 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     self._profiler_wallclock_start_time: float | None = None
     self._profiler_wallclock_time: float | None = None
     self._profile_tempdir: pathlib.Path | None = None
+    self._event_filter_regex = event_filter_regex
     self._xprof_session_kwargs = xprof_session_kwargs
+    self._retain_artifacts = False
 
   @property
   def total_op_time(self) -> datetime.timedelta:
@@ -180,6 +186,12 @@ class XprofProfileSession(contextlib.AbstractContextManager):
 
     all_lines = sum(xla_xlines.values(), [])
     all_events = sum([list(x.events) for x in all_lines], [])
+
+    if self._event_filter_regex is not None:
+      all_events = [
+          e for e in all_events if re.search(self._event_filter_regex, e.name)
+      ]
+
     xla_lines_repr = {k: [l.name for l in v] for k, v in xla_xlines.items()}
 
     if not xla_xlines or not all_events:  # len(all_events) == 0
@@ -211,6 +223,9 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     return datetime.timedelta(microseconds=duration_ns / 1000.0)
 
   def __enter__(self):
+    self._retain_artifacts = os.environ.get(
+        RETAIN_ARTIFACTS_VARNAME, 'false'
+    ).lower() in ['true', '1', 't', 'y', 'yes']
     if self._jax_profiler_mode:
       try:
         root_dir = os.environ.get(WORKLOAD_ARTIFACTS_DIR_VARNAME, None)
@@ -247,9 +262,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     if self._jax_profiler_mode:
       jax.profiler.stop_trace()
       # get profiling wallclock time right after the profiling ends
-      profiling_time = time.perf_counter() - self._profiler_wallclock_start_time
+      end_time = time.perf_counter()
+      assert (start_time := self._profiler_wallclock_start_time) is not None
       self._profiler_wallclock_start_time = None
-      self._profiler_wallclock_time = profiling_time
+      self._profiler_wallclock_time = end_time - start_time
       assert self._profile_tempdir is not None, 'Profile tempdir should be set.'
       profile_paths = list(
           pathlib.Path(self._profile_tempdir).glob('**/*.xplane.pb')
@@ -262,30 +278,57 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       self._profile = jax.profiler.ProfileData.from_serialized_xspace(
           profile_path.read_bytes()
       )
-      if WORKLOAD_ARTIFACTS_DIR_VARNAME not in os.environ:
+      if (not self._retain_artifacts
+          or WORKLOAD_ARTIFACTS_DIR_VARNAME not in os.environ):
         if self._profile_tempdir is not None and self._profile_tempdir.exists():
           shutil.rmtree(self._profile_tempdir)
       logger.info('JAX profiler trace file written to: %s', profile_path)
       self._profile_tempdir = None
     else:
-      assert profile_data is not None and self._xprof_session is not None
-      if self._xprof_session is None:
-        raise AssertionError(
-            '__exit__ called without a prior call to __enter__'
-        )
+      assert self._xprof_session is not None
       if self._hermetic:
         xspace = self._xprof_session.end_session_and_get_xspace()
       else:
         xspace, url = self._xprof_session.end_session_and_get_xspace_and_url()
         self.xprof_url = url
       # get profiling wallclock time right after the profiling ends
-      profiling_time = time.perf_counter() - self._profiler_wallclock_start_time
+      end_time = time.perf_counter()
+      assert (start_time := self._profiler_wallclock_start_time) is not None
       self._profiler_wallclock_start_time = None
-      self._profiler_wallclock_time = profiling_time
-
+      self._profiler_wallclock_time = end_time - start_time
+      assert profile_data is not None
       self._profile = profile_data.ProfileData.from_serialized_xspace(
           xspace.SerializeToString()
       )
+
+
+_ARRAY_TYPES = (
+    jax.Array, numerics.ArrayInitializer, jax.ShapeDtypeStruct, np.ndarray
+)
+
+
+@overload
+def standardize_function(  # pyrefly: ignore[inconsistent-overload]
+    f: Callable[..., T],
+    *args: PyTree,
+    kwargs: Mapping[str, PyTree] | None = None,
+    mode: BenchmarkMode = ...,
+    seed: int = ...,
+) -> tuple[Callable[[list[jax.Array]], RetT], list[jax.Array]]:
+  ...
+
+
+@overload
+def standardize_function(
+    f: Callable[..., T],
+    *args: PyTree,
+    kwargs: Mapping[str, PyTree] | None = None,
+    mode: BenchmarkMode = ...,
+    seed: None,
+) -> tuple[
+    Callable[[list[jax.Array]], RetT], list[jax.Array | jax.ShapeDtypeStruct]
+]:
+  ...
 
 
 def standardize_function(
@@ -326,9 +369,7 @@ def standardize_function(
 
   is_leaf = lambda x: isinstance(x, numerics.ArrayInitializer)
   args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs), is_leaf=is_leaf)
-  is_array = lambda x: isinstance(
-      x, (jax.Array, numerics.ArrayInitializer, jax.ShapeDtypeStruct)
-  )
+  is_array = lambda x: isinstance(x, _ARRAY_TYPES)
   arrays, other, merge = utils.split_merge(is_array, args_flat)
 
   def forward(arrays: list[jax.Array]) -> T:
@@ -398,10 +439,14 @@ def cupti_timer(f: Callable[[T], Any], args: T) -> Timer:
   return lambda _: (timer(args)[1], {})
 
 
-def xprof_timer(f: Callable[[T], Any], args: T) -> Timer:
+def xprof_timer(
+    f: Callable[[T], Any], args: T, event_filter_regex: str | None = None
+) -> Timer:
   def timer(return_metadata):
     jax.block_until_ready(f(args))  # Warmup.
-    with XprofProfileSession(hermetic=not return_metadata) as profile:
+    with XprofProfileSession(
+        hermetic=not return_metadata, event_filter_regex=event_filter_regex
+    ) as profile:
       jax.block_until_ready(f(args))
 
     metadata = dict(xprof_url=profile.xprof_url) if return_metadata else {}
@@ -410,8 +455,10 @@ def xprof_timer(f: Callable[[T], Any], args: T) -> Timer:
   return timer
 
 
-def hermetic_xprof_timer(f: Callable[[T], Any], args: T) -> Timer:
-  timer = xprof_timer(f, args)
+def hermetic_xprof_timer(
+    f: Callable[[T], Any], args: T, event_filter_regex: str | None = None
+) -> Timer:
+  timer = xprof_timer(f, args, event_filter_regex=event_filter_regex)
   return lambda _: timer(False)
 
 
@@ -422,7 +469,10 @@ _TIMERS: dict[str, Callable[[Callable[[T], Any], T], Timer]] = {
     'hermetic_xprof': hermetic_xprof_timer,
 }
 
-_DEFAULT_TIMING_METHOD = {'gpu': 'cupti', 'tpu': 'hermetic_xprof'}
+_DEFAULT_TIMING_METHOD: Final[dict[str, TimingMethod]] = {
+    'gpu': 'cupti',
+    'tpu': 'hermetic_xprof',
+}
 _FALLBACK_TIMING_METHOD = 'wallclock'
 
 
@@ -446,10 +496,15 @@ def compile_benchmark(
   f_compiled = lowered.compile()
   compile_time = time.perf_counter() - start_time
 
-  peak_mem_mb = f_compiled.memory_analysis().peak_memory_in_bytes / 10**6
+  assert (memory_analysis := f_compiled.memory_analysis()) is not None
+  peak_mem_mb = memory_analysis.peak_memory_in_bytes / 10**6
 
   def runner(
-      x: T, *, iterations: int = 5, method: TimingMethod | None = None
+      x: T,
+      *,
+      iterations: int = 5,
+      method: TimingMethod | None = None,
+      event_filter_regex: str | None = None,
   ) -> BenchmarkData:
     """Runs the compiled benchmark.
 
@@ -462,6 +517,10 @@ def compile_benchmark(
         backend, and does not add any device overhead, but does measure Python
         overhead. 'cupti' uses the CUPTI profiling API to measure the device
         execution time. If `None`, will pick a sensible default for the backend.
+      event_filter_regex: By default, the reported timing result sums the
+        execution time of all XLA Ops present in `x`. This regex enables
+        filtering to consider only a subset of Ops whose event names match the
+        pattern.
 
     Returns:
       A `BenchmarkData` object.
@@ -485,7 +544,14 @@ def compile_benchmark(
       if platform not in ('gpu', 'tpu'):
         raise ValueError('XProf profiling is only supported on GPU or TPU.')
 
-    timer = _TIMERS[method](f_compiled, x)
+    if method == 'xprof':
+      timer = xprof_timer(f_compiled, x, event_filter_regex=event_filter_regex)
+    elif method == 'hermetic_xprof':
+      timer = hermetic_xprof_timer(
+          f_compiled, x, event_filter_regex=event_filter_regex
+      )
+    else:
+      timer = _TIMERS[method](f_compiled, x)
     times = [timer(False)[0] for _ in range(iterations - 1)]
     dt, metadata = timer(True)  # Capture metadata on last iteration.
     return BenchmarkData(
@@ -505,6 +571,7 @@ def benchmark(
     *,
     iterations: int = 5,
     method: TimingMethod | None = None,
+    event_filter_regex: str | None = None,
 ) -> BenchmarkData:
   """Benchmarks a function on a specific input.
 
@@ -521,14 +588,22 @@ def benchmark(
       backend, and does not add any device overhead, but does measure Python
       overhead. `'cupti'` is only supported on GPU, and uses the CUPTI profiling
       API to measure the device execution time, which adds some small device
-      overhead. 'xprof_hermetic' uses XProf as the profiler, and is the
+      overhead. 'hermetic_xprof' uses XProf as the profiler, and is the
       recommended timing method for TPU. If `None` (default), a sensible default
       is chosen for the backend.
+    event_filter_regex: Reported timing sums all XLA operations in `f` by
+      default. This regex enables filtering by specific event names to report
+      timing for just a subset of events that match the pattern.
 
   Returns:
     A `BenchmarkData` object.
   """
-  res = compile_benchmark(f, x)(x, iterations=iterations, method=method)
+  res = compile_benchmark(f, x)(
+      x,
+      iterations=iterations,
+      method=method,
+      event_filter_regex=event_filter_regex,
+  )
   return res
 
 

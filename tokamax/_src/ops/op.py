@@ -16,12 +16,12 @@
 
 import abc
 import collections
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Hashable, Mapping
 import dataclasses
 import functools
 import inspect
 import threading
-from typing import Any, ClassVar, Concatenate, Final, Generic, Literal, ParamSpec, Self, TypeVar, cast, overload
+from typing import Any, ClassVar, Concatenate, Final, Generic, Literal, ParamSpec, Self, TypeVar, cast, final, overload
 
 from absl import logging
 import immutabledict
@@ -40,12 +40,12 @@ from tokamax._src import utils
 from tokamax._src.autotuning import autotuner as autotuner_lib
 from tokamax._src.autotuning import cache as autotuning_cache
 
-
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
+_T2 = TypeVar("_T2")
 _R = TypeVar("_R")
 _Config = TypeVar("_Config")
-_Key = TypeVar("_Key")
+_Key = TypeVar("_Key", bound=Hashable)
 AutotuningData = autotuner_lib.AutotuningData
 DeviceKind = autotuning_cache.DeviceKind
 
@@ -141,7 +141,7 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
     - Optionally, set a default `vjp` function.
   """
 
-  config_cls: ClassVar[type[_Config]] = NullConfig
+  config_cls: ClassVar[type[Any]] = NullConfig  # `type[_Config]` not supported.
   # Whether an op allows abstract inputs with `jax.export.symbolic_shape`
   # instances in array shapes.
   supports_symbolic_shapes: ClassVar[bool] = True
@@ -174,7 +174,7 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
   def __call__(
       self,
       *args: _P.args,
-      return_residuals: Literal[True] = ...,
+      return_residuals: Literal[True],
       **kwargs: _P.kwargs,
   ) -> tuple[_T, _R]:
     ...
@@ -313,12 +313,29 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
       self, device_kind: DeviceKind | None = None
   ) -> dict[_Key, AutotuningData[_Config]]:
     self_no_vjp = self.replace(vjp=None)
-    if (cache := _AUTOTUNING_CACHE.get(self_no_vjp)) is None:
-      cache = autotuning_cache.AutotuningCache(self_no_vjp)
-      _AUTOTUNING_CACHE[self_no_vjp] = cache
+    final_cache = {}
     if device_kind is None:
       device_kind = backend.get_default_device().device_kind
-    return cache[device_kind]
+    if not config_lib.ignore_autotuning_cache.value:
+      if (cache := _AUTOTUNING_CACHE.get(self_no_vjp)) is None:
+        cache = autotuning_cache.AutotuningCache(
+            self_no_vjp, paths=[autotuning_cache.CACHE_PATH]
+        )
+        _AUTOTUNING_CACHE[self_no_vjp] = cache
+
+      final_cache = cache[device_kind]
+      logging.info(
+          "Loaded autotuning cache for %s: %s",
+          self_no_vjp,
+          final_cache,
+      )
+    else:
+      logging.warning(
+          "Ignoring autotuning cache for %s",
+          self_no_vjp,
+      )
+
+    return final_cache
 
   @abc.abstractmethod
   def _fwd(self, *args, **kwargs) -> tuple[_T, _R | None]:
@@ -327,7 +344,9 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
   def _get_heuristics_config(self, ba: "BoundArguments") -> _Config:
     """Returns a config based on heuristics."""
     del ba  # Unused.
-    return _NULL_CONFIG
+    if type(self).config_cls is NullConfig:
+      return _NULL_CONFIG  # pyrefly: ignore[bad-return]
+    raise NotImplementedError("`_get_heuristics_config` not implemented.")
 
   def _get_autotuning_cache_key(self, ba: "BoundArguments") -> _Key:
     """Returns a key for autotuning cache lookup."""
@@ -346,7 +365,7 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
     del ba  # Unused.
     return set()
 
-  def _capture_batched_args(self, fn: Callable[..., _T]) -> Callable[..., _T]:
+  def _capture_batched_args(self, fn: Callable[..., _T2]) -> Callable[..., _T2]:
     if self.supports_batched_args_capture:
       return batching.capture_batched_args(fn)
     return lambda *args, **kwargs: fn(*args, batched_args=None, **kwargs)
@@ -378,6 +397,7 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
 _AUTOTUNING_CACHE: dict[
     Op, dict[DeviceKind, dict[Any, AutotuningData[Any]]]
 ] = {}
+
 _AUTOTUNING_CACHE_OVERLAY = threading.local()
 
 
@@ -388,6 +408,7 @@ def get_autotuning_cache_overlay_state() -> Any:
   return _AUTOTUNING_CACHE_OVERLAY
 
 
+@final
 class AUTO:
   ...
 
@@ -501,6 +522,9 @@ class BoundArguments(Generic[_Config, _Key]):
   @property
   def cached_autotuning_data(self) -> AutotuningData[_Config] | None:
     """Returns autotuning data from the cache, if available."""
+    if config_lib.ignore_autotuning_cache.value:
+      return None
+
     device_kind = infer_device_kind(self)
     if device_kind is None:
       device_kind = backend.get_default_device().device_kind
@@ -550,14 +574,22 @@ class BoundArguments(Generic[_Config, _Key]):
       configs: set[_Config] | type[AUTO] = AUTO,
       autotuner: autotuner_lib.Autotuner = autotuner_lib.Autotuner(),
       cache_results: bool = True,
+      event_filter_regex: str | None = None,
   ) -> AutotuningData[_Config]:
     """Autotunes the op with the bound arguments."""
     if configs is AUTO:
       configs = self.autotuning_configs
+    configs = cast(set[_Config], configs)
 
     logging.debug("Autotuning %s(%s)", self.op, self.arguments)
     op_fn = lambda config: self.op.replace(config=config)
-    data = autotuner.autotune(op_fn, configs, *self.args, **self.kwargs)
+    data = autotuner.autotune(
+        op_fn,
+        configs,
+        *self.args,
+        event_filter_regex=event_filter_regex,
+        **self.kwargs,
+    )
     if cache_results:
       d = self.op.get_autotuning_cache()
       d[self.autotuning_cache_key] = data

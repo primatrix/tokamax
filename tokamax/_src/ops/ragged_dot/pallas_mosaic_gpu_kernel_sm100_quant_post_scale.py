@@ -131,8 +131,9 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
 
   m_iters = pl.cdiv(m, block_m) + num_groups - 1
   n_iters = pl.cdiv(n, block_n)
+  align_tile = 8
   group_info = common.GroupInfo.create_aligned(
-      group_sizes, block_m, m_iters
+      group_sizes, block_m, m_iters, align_tile
   )
 
   def kernel(*refs, scoped):
@@ -140,7 +141,6 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
         x_gmem,
         w_gmem,
         w_scales_gmem,
-        _,
         group_id_gmem,
         start_within_block_gmem,
         actual_size_gmem,
@@ -157,14 +157,19 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
     (
         x_tma_barrier,
         w_tma_barrier,
+        w_tma_consumed_barrier,
         w_bf16_barrier,
-        tcgen05_barrier,
+        w_consumed_tcgen05_barrier,
+        x_consumed_tcgen05_barrier,
+        mma_barrier,
         acc_consumed_barrier,
     ) = barriers
 
     m, k = x_gmem.shape
     num_k_iters = pl.cdiv(k, block_k)
     cluster_idx = lax.axis_index("x")
+    wg = jax.lax.axis_index("wg")
+    is_lead_block = cluster_idx == 0
 
     @plgpu.nd_loop((m_iters * n_iters,), collective_axes=("sm",), init_carry=0)
     def mn_loop(loop_info: plgpu.NDLoopInfo, carry):
@@ -179,11 +184,9 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
       start_within_block = start_within_block_gmem[tid_m]
       actual_size = actual_size_gmem[tid_m]
       block_start = block_start_gmem[tid_m]
+      block_start = pl.multiple_of(block_start, align_tile)
       slice_m = pl.ds(block_start, block_m)
       slice_n = pl.ds(ni * block_n + cluster_idx * tile_n, tile_n)
-      wg = jax.lax.axis_index("wg")
-
-      is_lead_block = cluster_idx == 0
 
       @pl.when(actual_size > 0)
       def _body():
@@ -211,7 +214,7 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
 
                 @pl.when((ki >= num_stages) | (carry > 0))
                 def _():
-                  plgpu.barrier_wait(w_bf16_barrier.at[slot])
+                  plgpu.barrier_wait(w_tma_consumed_barrier.at[slot])
 
                 do_tma_w(ki, slot)
 
@@ -239,13 +242,13 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
                 @pl.when((ki >= num_stages) | (carry > 0))
                 def _():
                   # Wait for the previous mma to complete.
-                  plgpu.barrier_wait(tcgen05_barrier.at[slot])
+                  plgpu.barrier_wait(x_consumed_tcgen05_barrier.at[slot])
 
                 do_tma_x(ki, slot)
 
               lax.fori_loop(0, num_k_iters, _iter_x, None)
 
-            @pl.when(warp_id == _MMA_WARP)
+            @pl.when((warp_id == _MMA_WARP) & is_lead_block)
             def mma_warp():
               def do_mma(ki, _):
                 slot = lax.rem(ki, num_stages)
@@ -257,25 +260,29 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
                     # to ensure the acc_tmem is consumed.
                     plgpu.barrier_wait(acc_consumed_barrier.at[slot])
 
-                @pl.when(is_lead_block)
-                def _():
-                  with jax.named_scope("wait_x_tma"):
-                    plgpu.barrier_wait(x_tma_barrier.at[slot])
+                with jax.named_scope("wait_x_tma"):
+                  plgpu.barrier_wait(x_tma_barrier.at[slot])
 
                 with jax.named_scope("wait_wbf16"):
                   plgpu.barrier_wait(w_bf16_barrier.at[slot])
 
-                @pl.when(is_lead_block)
-                def _():
-                  with jax.named_scope("issuing mma"):
-                    plgpu.tcgen05_mma(
-                        acc_tmem.at[:, pl.ds(slot * block_m, block_m)],
-                        w_bf16_tmem.at[:, pl.ds(slot * block_k, block_k)],
-                        x_smem.at[slot].T,
-                        tcgen05_barrier.at[slot],
-                        accumulate=False,
-                        collective_axis="x" if collective else None,
-                    )
+                with jax.named_scope("issuing mma"):
+                  plgpu.tcgen05_mma(
+                      acc_tmem.at[:, pl.ds(slot * block_m, block_m)],
+                      w_bf16_tmem.at[:, pl.ds(slot * block_k, block_k)],
+                      x_smem.at[slot].T,
+                      x_consumed_tcgen05_barrier.at[slot],
+                      accumulate=False,
+                      collective_axis="x" if collective else None,
+                  )
+                plgpu.tcgen05_commit_arrive(
+                    w_consumed_tcgen05_barrier.at[slot],
+                    collective_axis="x" if collective else None,
+                )
+                plgpu.tcgen05_commit_arrive(
+                    mma_barrier.at[slot],
+                    collective_axis="x" if collective else None,
+                )
 
               lax.fori_loop(0, num_k_iters, do_mma, None)
 
@@ -303,7 +310,7 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
               @pl.when((ki >= num_stages) | (carry > 0))
               def _():
                 # Wait for the previous mma to complete.
-                plgpu.barrier_wait(tcgen05_barrier.at[slot])
+                plgpu.barrier_wait(w_consumed_tcgen05_barrier.at[slot])
 
             # R -> T
             plgpu.async_store_tmem(
@@ -312,6 +319,7 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
             plgpu.commit_tmem()
 
             with jax.named_scope("arrive bf16"):
+              plgpu.barrier_arrive(w_tma_consumed_barrier.at[slot])
               plgpu.barrier_arrive(w_bf16_barrier.at[slot])
 
           lax.fori_loop(0, num_k_iters, _deq, None)
@@ -338,7 +346,7 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
                 lax.broadcast_in_dim(scale, acc.shape, [0]), _TCGEN05
             )
             with jax.named_scope("wait MMA"):
-              plgpu.barrier_wait(tcgen05_barrier.at[slot])
+              plgpu.barrier_wait(mma_barrier.at[slot])
             with jax.named_scope("scale acc"):
               local_acc = plgpu.async_load_tmem(
                   acc_tmem.at[:, pl.ds(slot * block_m, block_m)]
@@ -430,20 +438,30 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
           num_barriers=num_stages,
           collective_axes=("x",),
           orders_tensor_core=True,
+          leader_tracked=True
       )
       acc_consumed_barrier = plgpu.ClusterBarrier(
           num_barriers=num_stages,
           collective_axes=("x",),
           orders_tensor_core=True,
+          leader_tracked=True
       )
     else:
       w_bf16_barrier = plgpu.Barrier(
-          num_barriers=num_stages
+          num_barriers=num_stages, orders_tensor_core=True
       )
       acc_consumed_barrier = plgpu.Barrier(
-          num_barriers=num_stages)
+          num_barriers=num_stages, orders_tensor_core=True
+      )
+    w_tma_consumed_barrier = plgpu.Barrier(num_barriers=num_stages)
 
-    tcgen05_barrier = plgpu.Barrier(
+    w_consumed_tcgen05_barrier = plgpu.Barrier(
+        num_barriers=num_stages, orders_tensor_core=True
+    )
+    x_consumed_tcgen05_barrier = plgpu.Barrier(
+        num_barriers=num_stages, orders_tensor_core=True
+    )
+    mma_barrier = plgpu.Barrier(
         num_barriers=num_stages, orders_tensor_core=True
     )
     pl.run_scoped(
@@ -458,8 +476,11 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
         (
             x_tma_barrier,
             w_tma_barrier,
+            w_tma_consumed_barrier,
             w_bf16_barrier,
-            tcgen05_barrier,
+            w_consumed_tcgen05_barrier,
+            x_consumed_tcgen05_barrier,
+            mma_barrier,
             acc_consumed_barrier,
         ),
         collective_axes="wg",
@@ -471,13 +492,14 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
     num_sms = 1 + collective
   f = plgpu.kernel(
       kernel_entry,
-      out_shape=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
+      out_type=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
       num_threads=3,
       thread_name="wg",
       grid=(num_sms // (1 + collective),),
       grid_names=("sm",),
       cluster=(1 + collective,),
       cluster_names=("x",),
+      kernel_name="ragged_dot_quant_post_scale_sm100",
       compiler_params=plgpu.CompilerParams(
           approx_math=True,
           unsafe_no_auto_barriers=True,
@@ -489,7 +511,6 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
       x,
       w,
       w_scales,
-      group_info.block,
       group_info.group_id,
       group_info.start_within_block,
       group_info.actual_size,

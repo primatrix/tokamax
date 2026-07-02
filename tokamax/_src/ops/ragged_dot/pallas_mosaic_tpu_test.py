@@ -14,19 +14,29 @@
 # ==============================================================================
 """Tests for Pallas Mosaic TPU Ragged Dot."""
 
+import functools
+from typing import Any
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax import shard_map
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 import qwix
 from tokamax._src import mosaic_tpu as common
 from tokamax._src import quantization
 from tokamax._src.ops import op as op_lib
+from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import test_base
 from typing_extensions import override
 
+# TODO: Directly import ManualAxisType JAX is upgraded.
+try:
+  from jax.sharding import ManualAxisType
+except ImportError:
+  ManualAxisType = Any
 
 AsQArray = quantization.AsQArray
 
@@ -97,6 +107,111 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     with test_base.override_chex_args(atol=0.2, rtol=0.01):
       super().test_vjp0()  # pytype: disable=attribute-error
 
+  def test_shard_map_manual_axis_type_varying(self):
+    # TODO: Remove the skipTest once JAX is upgraded.
+    if ManualAxisType is Any:
+      self.skipTest("ManualAxisType is not supported.")
+    if jax.devices()[0].device_kind.startswith("TPU7x"):
+      self.skipTest("Skip the test on TPU v7.")
+    num_devices = jax.device_count()
+    mesh = jax.make_mesh((num_devices, 1), ("x", "y"))
+    # NB: Must not directly run jax.set_mesh in test method.
+    # jax.set_mesh(mesh) sets a global mesh for the entire process but never
+    # clears it. If this test runs before other tests, the global mesh remains
+    # active and causes other tests to fail, while if you only run that failing
+    # test, it passes.
+    with jax.set_mesh(mesh):
+      m, k, n = 256, 128, 128
+      num_groups = 1
+
+      lhs = jnp.ones((m, k))
+      lhs = jax.device_put(
+          lhs,
+          P(
+              "x",
+          ),
+      )
+      rhs = jnp.ones((num_groups, k, n))
+      rhs = jax.device_put(rhs, P(None, None, "y"))
+      group_sizes = jnp.array([m], jnp.uint32)
+
+      config = pallas_mosaic_tpu.Config(tile_m=128, tile_k=128, tile_n=128)
+      op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)
+
+      @functools.partial(
+          shard_map,
+          mesh=mesh,
+          in_specs=(P("x", None), P(None, None, "y"), P(None)),
+          out_specs=P("x", "y"),
+          check_vma=True,
+      )
+      def f(lhs, rhs, sizes):
+        manual_axis_type = ManualAxisType(
+            varying={"x", "y"},
+        )
+        res = op(lhs, rhs, group_sizes=sizes, manual_axis_type=manual_axis_type)
+        self.assertEqual(jax.typeof(res).manual_axis_type, manual_axis_type)
+        return res
+
+      _, vjpfunc = jax.vjp(
+          f,
+          lhs,
+          rhs,
+          group_sizes,
+      )
+      cotangent = jax.random.normal(
+          jax.random.key(0), (m, n), dtype=jnp.float32
+      )
+      cotangent = jax.device_put(cotangent, P("x", "y"))
+      vjpfunc(cotangent)[0].block_until_ready()
+
+  def test_shard_map_manual_axis_type_unreduced(self):
+    # TODO: Remove the skipTest once JAX is upgraded.
+    if ManualAxisType is Any:
+      self.skipTest("ManualAxisType is not supported.")
+    num_devices = jax.device_count()
+    mesh = jax.make_mesh((num_devices, 1), ("x", "y"))
+    with jax.set_mesh(mesh):
+      m, k, n = 256, 256, 256
+      num_groups = 1
+
+      lhs = jnp.ones((m, k))
+      lhs = jax.device_put(lhs, P(None, "x"))
+      rhs = jnp.ones((num_groups, k, n))
+      rhs = jax.device_put(rhs, P(None, "x", None))
+      group_sizes = jnp.array([m], jnp.uint32)
+
+      config = pallas_mosaic_tpu.Config(tile_m=128, tile_k=128, tile_n=128)
+      op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)
+
+      @jax.jit
+      @functools.partial(
+          shard_map,
+          mesh=mesh,
+          in_specs=(P(None, "x"), P(None, "x", None), P(None)),
+          out_specs=P(None, None, unreduced={"x"}),
+          check_vma=True,
+      )
+      def f(lhs, rhs, sizes):
+        manual_axis_type = ManualAxisType(
+            unreduced={"x"},
+        )
+        res = op(lhs, rhs, group_sizes=sizes, manual_axis_type=manual_axis_type)
+        self.assertEqual(jax.typeof(res).manual_axis_type, manual_axis_type)
+        return res
+
+      _, vjpfunc = jax.vjp(
+          f,
+          lhs,
+          rhs,
+          group_sizes,
+      )
+      cotangent = jax.random.normal(
+          jax.random.key(0), (m, n), dtype=jnp.float32
+      )
+      cotangent = jax.device_put(cotangent, P(None, None, reduced={"x"}))
+      vjpfunc(cotangent)[0].block_until_ready()
+
   @override
   def _test_quantized(
       self,
@@ -153,29 +268,6 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     with test_base.override_chex_args(**kwargs):
       super()._test_bench(spec)
 
-  def test_maxtext_config(self):
-    # Test to ensure that we can get the correct config for a specific model.
-    # For this test we are using jax.ShapeDtypeStruct instead of jax.Array
-    # because jax.Array would trigger OOM for our tests.
-    tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
-    maxtext_config = tpu_ragged_dot._get_heuristics_config(
-        op_lib.BoundArguments(
-            op=tpu_ragged_dot,
-            arguments={
-                "lhs": jax.ShapeDtypeStruct((262144, 7168), dtype=jnp.bfloat16),
-                "rhs": jax.ShapeDtypeStruct(
-                    (256, 7168, 2048), dtype=jnp.bfloat16
-                ),
-            },
-        )
-    )
-    tiling_tuple = (
-        maxtext_config.tile_m,
-        maxtext_config.tile_k,
-        maxtext_config.tile_n,
-    )
-    self.assertEqual(tiling_tuple, (256, 7168, 512))
-
   def test_autotuning_configs(self):
     tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
     ba = op_lib.BoundArguments(
@@ -187,6 +279,141 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     )
     autotuning_configs = ba.autotuning_configs
     self.assertGreaterEqual(len(autotuning_configs), 3 * 3 * 3)
+
+  @parameterized.parameters(
+      (128, 128, 128),
+      (1, 2048, 512),
+      (65536, 2048, 512),
+      (65536, 16384, 512),
+      (65536, 2048, 16384),
+      (65536, 32768, 32768),
+  )
+  def test_heuristics_config(self, m, k, n):
+    if not jax.devices()[0].device_kind.startswith("TPU7x"):
+      self.skipTest("This test is only supported on TPU v7.")
+    num_groups = 256
+
+    tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+
+
+    ba_fwd = op_lib.BoundArguments(
+        op=tpu_ragged_dot,
+        arguments={
+            "lhs": jax.ShapeDtypeStruct((m, k), dtype=jnp.bfloat16),
+            "rhs": jax.ShapeDtypeStruct((num_groups, k, n), dtype=jnp.bfloat16),
+            "group_sizes": base.generate_group_sizes(
+                m=m, num_groups=num_groups
+            ),
+        },
+    )
+    fwd_heuristics = ba_fwd.heuristics_config
+    self.assertIsInstance(fwd_heuristics, pallas_mosaic_tpu.Config)
+    self.assertLessEqual(fwd_heuristics.tile_m, min(m, 1024))
+    self.assertLessEqual(fwd_heuristics.tile_k, k)
+    self.assertLessEqual(fwd_heuristics.tile_n, n)
+    self.assertEqual(fwd_heuristics.input_buffer_count, 2)
+    # Deflation order GMM: m -> n -> k.
+    if fwd_heuristics.tile_n < n:
+      self.assertEqual(fwd_heuristics.tile_m, 128)
+    if fwd_heuristics.tile_k < k:
+      self.assertEqual(fwd_heuristics.tile_n, 128)
+
+
+    ba_vjp_dlhs = op_lib.BoundArguments(
+        op=tpu_ragged_dot,
+        arguments={
+            "lhs": jax.ShapeDtypeStruct((m, n), dtype=jnp.bfloat16),
+            "rhs": jax.ShapeDtypeStruct((num_groups, k, n), dtype=jnp.bfloat16),
+            "group_sizes": base.generate_group_sizes(
+                m=m, num_groups=num_groups
+            ),
+            "ragged_dot_dimension_numbers": (
+                pallas_mosaic_tpu.DLHS_RAGGED_DOT_DIM_NUMS
+            ),
+        },
+    )
+    dlhs_heuristics = ba_vjp_dlhs.heuristics_config
+    self.assertIsInstance(dlhs_heuristics, pallas_mosaic_tpu.Config)
+    self.assertLessEqual(dlhs_heuristics.tile_m, min(m, 1024))
+    self.assertLessEqual(dlhs_heuristics.tile_k, k)
+    self.assertLessEqual(dlhs_heuristics.tile_n, n)
+    self.assertEqual(dlhs_heuristics.input_buffer_count, 2)
+    # Deflation order GMM: m -> n -> k.
+    if dlhs_heuristics.tile_n < n:
+      self.assertEqual(dlhs_heuristics.tile_m, 128)
+    if dlhs_heuristics.tile_k < k:
+      self.assertEqual(dlhs_heuristics.tile_n, 128)
+
+    # Try DRHS VJP with heuristics config.
+    ba_vjp_drhs = op_lib.BoundArguments(
+        op=tpu_ragged_dot,
+        arguments={
+            "lhs": jax.ShapeDtypeStruct((m, k), dtype=jnp.bfloat16),
+            "rhs": jax.ShapeDtypeStruct((m, n), dtype=jnp.bfloat16),
+            "group_sizes": base.generate_group_sizes(
+                m=m, num_groups=num_groups
+            ),
+            "ragged_dot_dimension_numbers": (
+                pallas_mosaic_tpu.DRHS_RAGGED_DOT_DIM_NUMS
+            ),
+        },
+    )
+    drhs_heuristics = ba_vjp_drhs.heuristics_config
+    self.assertIsInstance(drhs_heuristics, pallas_mosaic_tpu.Config)
+    self.assertLessEqual(drhs_heuristics.tile_m, min(m, 1024))
+    self.assertLessEqual(drhs_heuristics.tile_k, k)
+    self.assertLessEqual(drhs_heuristics.tile_n, n)
+    self.assertEqual(drhs_heuristics.input_buffer_count, 2)
+    # Deflation order TGMM: k -> n -> m.
+    if drhs_heuristics.tile_n < n:
+      self.assertEqual(drhs_heuristics.tile_k, 128)
+    if drhs_heuristics.tile_m < min(m, 1024):
+      self.assertEqual(drhs_heuristics.tile_n, 128)
+
+  def test_heuristics_monkey_patch(self):
+    """Tests that the heuristics config is monkey-patched correctly."""
+
+    # A tile-size of 2 will never be chosen by the heuristics, as this is
+    # far too small to get reasonable performance. This makes it a good choice
+    # for testing whether the heuristics are being overridden.
+    tile_size = 2
+
+    original_heuristics_f = (
+        pallas_mosaic_tpu.PallasMosaicTpuRaggedDot._get_heuristics_config
+    )
+
+    def _monkey_patch_heuristics_config(
+        self, bound_args: op_lib.BoundArguments
+    ) -> pallas_mosaic_tpu.Config:
+      del bound_args, self
+
+      return pallas_mosaic_tpu.Config(
+          tile_m=tile_size,
+          tile_k=tile_size,
+          tile_n=tile_size,
+          input_buffer_count=1,
+          combine_scopes=True,
+      )
+
+    tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+
+    # Patch the _get_heuristics_config method.
+    pallas_mosaic_tpu.PallasMosaicTpuRaggedDot._get_heuristics_config = (
+        _monkey_patch_heuristics_config
+    )
+
+    config = tpu_ragged_dot._get_heuristics_config(None)  # pytype: disable=wrong-arg-types
+    self.assertEqual(config.tile_m, tile_size)
+    self.assertEqual(config.tile_k, tile_size)
+    self.assertEqual(config.tile_n, tile_size)
+    self.assertEqual(config.input_buffer_count, 1)
+    self.assertEqual(config.combine_scopes, True)
+
+    # Restore the original heuristics config method. Without this, other tests
+    # could use the incorrect heuristics config.
+    pallas_mosaic_tpu.PallasMosaicTpuRaggedDot._get_heuristics_config = (
+        original_heuristics_f
+    )
 
 
 if __name__ == "__main__":

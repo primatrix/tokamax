@@ -21,6 +21,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
@@ -58,11 +59,11 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
   n_iters = pl.cdiv(n, cluster_block_n)
   k_iters = pl.cdiv(k, block_k)
   num_stages = min(config.num_stages, k_iters)
+  align_tile = 8
 
   def kernel(
       x_gmem,
       w_gmem,
-      _,
       group_id_gmem,
       start_within_block_gmem,
       actual_size_gmem,
@@ -91,6 +92,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
       start_within_block = start_within_block_gmem[tid_m]
       actual_size = actual_size_gmem[tid_m]
       block_start = block_start_gmem[tid_m]
+      block_start = pl.multiple_of(block_start, align_tile)
       ms = pl.ds(block_start, cluster_block_m)
       ns = pl.ds(ni * cluster_block_n, cluster_block_n)
 
@@ -212,7 +214,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
         num_barriers=2, orders_tensor_core=True
     )
 
-  tiled_smem = common.tiled_swizzled_smem
+  tiled_smem = mgpu_lib.tiled_swizzled_smem
   scratch_shapes = dict(
       x_smem=tiled_smem((num_stages, block_m, block_k), lhs.dtype, "x"),
       w_smem=tiled_smem((num_stages, block_n, block_k), rhs.dtype, "w"),
@@ -233,14 +235,15 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
   profile = False
   f = plgpu.kernel(
       kernel,
-      out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
-      scratch_shapes=scratch_shapes,
+      out_type=jax.ShapeDtypeStruct((m, n), out_dtype),
+      scratch_types=scratch_shapes,
       num_threads=2,
       thread_name="wg",
       grid=(m_iters * n_iters,),
       grid_names=("mn",),
       cluster=(1 + collective,),
       cluster_names=("cluster",),
+      kernel_name="ragged_dot_sm100",
       compiler_params=plgpu.CompilerParams(
           approx_math=True,
           unsafe_no_auto_barriers=True,
@@ -249,12 +252,11 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
       ),
   )
   group_info = common.GroupInfo.create_aligned(
-      group_sizes, cluster_block_m, m_iters
+      group_sizes, cluster_block_m, m_iters, align_tile
   )
   return f(
       lhs,
       rhs.mT,
-      group_info.block,
       group_info.group_id,
       group_info.start_within_block,
       group_info.actual_size,

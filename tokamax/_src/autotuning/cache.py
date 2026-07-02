@@ -16,12 +16,14 @@
 
 from importlib import resources
 import re
+import traceback
 from typing import Annotated
 from typing import Any, Final, Sequence, TypeAlias
 
 from absl import logging
 import immutabledict
 import pydantic
+from tokamax._src import config as config_lib
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src.autotuning import autotuner
 
@@ -30,9 +32,7 @@ DeviceKind = str
 DeviceAutotuningCache: TypeAlias = dict[Any, AutotuningData[Any]]
 
 
-_CACHE_PATHS: Final[tuple[str, ...]] = (
-    "data/autotuning",
-)
+CACHE_PATH: Final[str] = "data/autotuning"
 
 
 def _get_cache_adapter(op) -> pydantic.TypeAdapter:
@@ -56,16 +56,26 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
   Autotuning data is read lazily from the cache files upon first access.
   """
 
-  def __init__(self, op):
+  cache_paths: Sequence[str]
+
+  def __init__(
+      self,
+      op,
+      paths: Sequence[str] = [
+          CACHE_PATH,
+      ],
+  ):
     super().__init__()
     self.op = op
+    self.cache_paths = paths
 
   def __missing__(self, device_kind: DeviceKind) -> DeviceAutotuningCache:
     self[device_kind] = (cache := self._load_cache(device_kind))
     return cache
 
   def _load_cache(
-      self, device_kind: DeviceKind, cache_path: Sequence[str] = _CACHE_PATHS
+      self,
+      device_kind: DeviceKind,
   ) -> DeviceAutotuningCache:
     """Loads autotuning cache from corresponding JSON files."""
 
@@ -76,7 +86,11 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
     tokamax_files = resources.files("tokamax")
     out = {}
 
-    for base_dir in cache_path:
+    for base_dir in self.cache_paths:
+      if config_lib.ignore_autotuning_cache.value and base_dir == CACHE_PATH:
+        logging.info("Ignoring autotuning cache.")
+        continue
+
       path = tokamax_files.joinpath(base_dir, device_kind, f"{op_name}.json")
       logging.info("Loading cache file: %s", path)
       try:

@@ -26,15 +26,20 @@ from typing import Annotated, Any, Generic, TypeAlias, TypeVar, Union
 import immutabledict
 import jax
 from jax.experimental.pallas import fuser
-import jax.numpy as jnp
 import jaxtyping
+import ml_dtypes
 import numpy as np
 import pydantic
 import pydantic_core
 from pydantic_core import core_schema as cs
 from tokamax._src import batching
-from typing_extensions import TypedDict  # Required for Python <3.12.
+from typing_extensions import TypedDict, override  # Required for Python <3.12.
 
+# TODO: Directly import ManualAxisType JAX is upgraded.
+try:
+  from jax.sharding import ManualAxisType
+except ImportError:
+  ManualAxisType = Any
 
 def _int_power_of_two(n: int) -> int:
   if (n & (n - 1)) != 0:
@@ -51,10 +56,17 @@ def _validate_np_dtype(x) -> np.dtype:
   return x if isinstance(x, np.dtype) else np.dtype(x)
 
 
+def _serialize_np_dtype(dtype) -> str:
+  try:
+    return dtype.name
+  except AttributeError:
+    return getattr(dtype, '__name__', str(dtype))
+
+
 NumpyDtype: TypeAlias = Annotated[
     np.dtype,
     pydantic.PlainValidator(_validate_np_dtype),
-    pydantic.PlainSerializer(lambda dtype: dtype.name),
+    pydantic.PlainSerializer(_serialize_np_dtype),
 ]
 
 
@@ -112,8 +124,31 @@ def annotate(ty: Any) -> Any:
   if origin is fuser.Fusion:
     # TODO: Add support for serializing `Fusion`s.
     return Annotated[ty, pydantic.PlainSerializer(str, return_type=str)]
+  # TODO: Remove "ManualAxisType is not None" once JAX is upgraded.
+  if ManualAxisType is not None and origin is ManualAxisType:
+    def _parse_manual_axis_type(v: Any) -> Any:
+      if isinstance(v, ManualAxisType):
+        return v
+      if isinstance(v, dict):
+        v = {k: frozenset(val) for k, val in v.items()}
+        return ManualAxisType(**v)
+      return v
+
+    return Annotated[
+        ty,
+        pydantic.PlainSerializer(
+            lambda x: dict(
+                varying=list(x.varying),
+                unreduced=list(x.unreduced),
+                reduced=list(x.reduced),
+            ),
+            return_type=dict,
+        ),
+        pydantic.BeforeValidator(_parse_manual_axis_type),
+    ]
   if dataclasses.is_dataclass(origin):
     return Annotated[ty, Dataclass]
+
   return ty
 
 
@@ -123,19 +158,28 @@ def annotate(ty: Any) -> Any:
 _T = TypeVar('_T')
 
 
-class TypeAdapter(pydantic.TypeAdapter[_T], Generic[_T]):
+class TypeAdapter(Generic[_T]):
   """`TypeAdapter` where serialization info is be passed to `dump_python`.
 
   The `mode` and `round_trip` attributes from the `SerializationInfo` are
   forwarded to the `dump_python` method of the underlying `TypeAdapter`.
   """
 
+  def __init__(self, type: type[_T]):
+    self._impl = pydantic.TypeAdapter(type)
+
+  def dump_json(self, instance: _T, /, **kwargs) -> bytes:
+    return self._impl.dump_json(instance, **kwargs)
+
   def dump_python(
-      self, instance: Any, info: pydantic.SerializationInfo, **kwargs
+      self, instance: _T, /, info: pydantic.SerializationInfo, **kwargs
   ) -> Any:
     kwargs.setdefault('mode', info.mode)
     kwargs.setdefault('round_trip', info.round_trip)
-    return super().dump_python(instance, **kwargs)
+    return self._impl.dump_python(instance, **kwargs)
+
+  def validate_python(self, object: Any, /) -> _T:
+    return self._impl.validate_python(object)
 
 
 get_adapter = functools.lru_cache(TypeAdapter)
@@ -149,8 +193,8 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
   """
 
   @classmethod
-  def __class_getitem__(cls, item: _T) -> _T:
-    return Annotated[item, cls()]
+  def __class_getitem__(cls, item: type[_T]) -> type[_T]:
+    return Annotated[item, cls()]  # pyrefly: ignore[bad-return]
 
   @classmethod
   def __get_pydantic_core_schema__(cls, source, handler):
@@ -218,11 +262,16 @@ class ShapeDtype:
   PATTERN = re.compile(r'(.*?)(\[.*?\])(\{vmap_axes=(\[.*\])\})?')
   SHORT_DTYPE_NAMES_MAP = immutabledict.immutabledict(
       bool=bool,
-      i4=jnp.int4,
+      **(dict(i1=ml_dtypes.int1) if hasattr(ml_dtypes, 'int1') else {}),
+      i2=ml_dtypes.int2,
+      i4=ml_dtypes.int4,
       i8=np.int8,
       i16=np.int16,
       i32=np.int32,
       i64=np.int64,
+      **(dict(u1=ml_dtypes.uint1) if hasattr(ml_dtypes, 'uint1') else {}),
+      u2=ml_dtypes.uint2,
+      u4=ml_dtypes.uint4,
       u8=np.uint8,
       u16=np.uint16,
       u32=np.uint32,
@@ -230,8 +279,20 @@ class ShapeDtype:
       f16=np.float16,
       f32=np.float32,
       f64=np.float64,
-      bf16=jnp.bfloat16,
-      f8_e4m3fn=jnp.float8_e4m3fn,
+      bf16=ml_dtypes.bfloat16,
+      f4_e2m1fn=ml_dtypes.float4_e2m1fn,
+      f6_e2m3fn=ml_dtypes.float6_e2m3fn,
+      f6_e3m2fn=ml_dtypes.float6_e3m2fn,
+      f8_e3m4=ml_dtypes.float8_e3m4,
+      f8_e4m3=ml_dtypes.float8_e4m3,
+      f8_e8m0fnu=ml_dtypes.float8_e8m0fnu,
+      f8_e4m3b11fnuz=ml_dtypes.float8_e4m3b11fnuz,
+      f8_e4m3fn=ml_dtypes.float8_e4m3fn,
+      f8_e4m3fnuz=ml_dtypes.float8_e4m3fnuz,
+      f8_e5m2=ml_dtypes.float8_e5m2,
+      f8_e5m2fnuz=ml_dtypes.float8_e5m2fnuz,
+      c64=np.complex64,
+      c128=np.complex128,
   )
 
   @classmethod
@@ -251,7 +312,14 @@ class ShapeDtype:
         return x
       s = jax.core.ShapedArray(x.shape, x.dtype).str_short(short_dtypes=True)
       if isinstance(x, batching.BatchedShapeDtype) and x.vmap_axes:
-        vmap_axes_str = str(vmap_axes_serializer.to_json(x.vmap_axes), 'utf-8')
+        try:
+          vmap_axes_str = str(
+              vmap_axes_serializer.to_json(x.vmap_axes), 'utf-8'
+          )
+        except pydantic_core.PydanticSerializationError:
+          # vmap_axes may contain symbolic dimensions (e.g. _DimExpr) that can't
+          # be serialized. Fall back to string representation.
+          vmap_axes_str = str(x.vmap_axes)
         return f'{s}{{vmap_axes={vmap_axes_str}}}'
       return s
 
@@ -287,9 +355,7 @@ class ShapeDtype:
     )
 
 
-def get_arg_spec_model(
-    name: str, signature: inspect.Signature
-) -> type[dict[str, Any]]:
+def get_arg_spec_model(name: str, signature: inspect.Signature) -> type[Any]:
   """Returns a new `TypedDict` type for the given `inspect.Signature`."""
   fields = {}
   for param_name, p in signature.parameters.items():

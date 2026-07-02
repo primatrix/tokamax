@@ -26,7 +26,7 @@ T = TypeVar("T")
 
 
 def get_vjp_taking_residuals(
-    fn: Callable[..., tuple[T, R]], *primals: ...
+    fn: Callable[..., tuple[T, R]], *primals
 ) -> Callable[[R, T], Any] | None:
   """Attempts to create a VJP function with respect to the requested residuals.
 
@@ -90,7 +90,7 @@ def get_vjp_taking_residuals(
       # inputs from being shadowed.
       for i, var in enumerate(eqn.outvars):
         if var in residual_vars:
-          eqn.outvars[i] = jax.core.DropVar(var.aval)
+          eqn.outvars[i] = jex.core.DropVar(var.aval)
       eqns.append(eqn)  # `eqn` is still present in VJP function.
     else:
       banned_vars |= set(eqn.outvars) - set(residual_vars)

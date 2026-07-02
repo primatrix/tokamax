@@ -18,6 +18,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
+from tokamax._src import gpu_utils
 from tokamax._src.ops.ragged_dot import pallas_triton
 from tokamax._src.ops.ragged_dot import test_base
 from typing_extensions import override
@@ -65,11 +66,19 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
     with mock.patch.object(self, "_dot_fn", split_k_dot):
       self.test_quantized0()  # pytype: disable=attribute-error
 
-  @parameterized.parameters(jnp.bfloat16, jnp.float32)
   @override
-  def test_simple(self, dtype):
+  def _test_simple(self, dtype):
     with test_base.override_chex_args(atol=1e-6):
-      self._test_simple(dtype)
+      super()._test_simple(dtype)
+
+  @override
+  def _test_bench(self, spec):
+    xs = jax.tree.leaves((spec["lhs"], spec["rhs"]))
+    if any(x.dtype == jnp.float8_e4m3fn for x in xs) and gpu_utils.is_sm80():
+      with self.assertRaises(NotImplementedError):
+        super()._test_bench(spec)
+    else:
+      super()._test_bench(spec)
 
 
 if __name__ == "__main__":

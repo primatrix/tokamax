@@ -12,101 +12,91 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Utilities for extracting kernel information from HLO."""
+"""Utilities for extracting kernel information from StableHLO."""
+
 from collections.abc import Callable
-import dataclasses
 import functools
-from typing import Any, Final
-import zlib
+from typing import Any, Final, Sequence, TypeAlias
 
 import immutabledict
 import jax
 from jax import export
-from jax.extend import mlir as jex_mlir
 from jax.interpreters import mlir
 import jax.numpy as jnp
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import func
 from jaxlib.mlir.dialects import stablehlo
+from tokamax._src import hlo_utils_common
 from tokamax._src.ops import op as op_lib
 
-_PALLAS_TRITON_KEY: Final[str] = '__gpu$xla.gpu.triton'
-_MOSAIC_GPU_KEY: Final[str] = 'mosaic_gpu_v2'
-_MOSAIC_TPU_KEY: Final[str] = 'tpu_custom_call'
-_TRITON_KEY: Final[str] = 'triton_kernel_call'
-
 DISABLE_JAX_EXPORT_CHECKS: Final[tuple[export.DisabledSafetyCheck, ...]] = (
-    export.DisabledSafetyCheck.custom_call(_PALLAS_TRITON_KEY),
-    export.DisabledSafetyCheck.custom_call(_MOSAIC_GPU_KEY),
-    export.DisabledSafetyCheck.custom_call(_MOSAIC_TPU_KEY),
-    export.DisabledSafetyCheck.custom_call(_TRITON_KEY),
+    export.DisabledSafetyCheck.custom_call(hlo_utils_common.PALLAS_TRITON_KEY),
+    export.DisabledSafetyCheck.custom_call(hlo_utils_common.MOSAIC_GPU_KEY),
+    export.DisabledSafetyCheck.custom_call(hlo_utils_common.MOSAIC_TPU_KEY),
+    export.DisabledSafetyCheck.custom_call(hlo_utils_common.TRITON_KEY),
+    export.DisabledSafetyCheck.custom_call(hlo_utils_common.TRITON_FFI_KEY),
 )
 
-_XLA_NOISE_OPCODES: Final[set[str]] = {
-    'concatenate',
-    'constant',
-    'convert',
-    'broadcast',
-    'broadcast_in_dim',
-    'reduce',
-    'reshape',
-    'slice',
-    'transpose',
-}
-_TOKAMAX_NAME: Final[str] = 'tokamax'
+HloComputation: TypeAlias = (
+    jax.stages.Lowered
+    | ir.Module
+)
+
+TritonKernelInfo: TypeAlias = hlo_utils_common.TritonKernelInfo
+KernelInfoBase: TypeAlias = hlo_utils_common.KernelInfoBase
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
-class KernelInfoBase:
-  """Kernel information base class."""
+def get_kernel_info(
+    x: HloComputation, include_xla_kernels: bool = True
+) -> tuple[KernelInfoBase, ...]:
+  """Extracts accelerator kernel information from HLO.
 
-  name: str
-  inputs: tuple[jax.ShapeDtypeStruct, ...]
-  outputs: tuple[jax.ShapeDtypeStruct, ...]
-  op_name: str
-  source_file: str
-  source_line: int
-  hlo_module_name: str
+  Args:
+    x: The lowered JAX function from which to extract kernel information.
+    include_xla_kernels: Whether to include XLA kernels in the output.
 
-
-@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
-class TritonKernelInfo(KernelInfoBase):
-  """Triton kernel information."""
-
-  kernel_name: str
-  num_warps: int
-  grid: tuple[int, int, int]
-  num_stages: int | None
-  compute_capability: int | None
-  metadata: bytes
+  Returns:
+    A tuple of objects inheriting from `KernelInfoBase`.
+  """
+  if isinstance(x, (jax.stages.Lowered, ir.Module)):
+    return _get_kernel_info_stablehlo(
+        x, include_xla_kernels=include_xla_kernels
+    )
 
 
-# TODO: Add fields for Mosaic TPU kernel information.
-@dataclasses.dataclass(frozen=True, slots=True)
-class MosaicTpuKernelInfo(KernelInfoBase):
-  """Mosaic TPU kernel information."""
+def get_opspecs(
+    x: HloComputation | KernelInfoBase,
+    include_xla_kernels: bool = True,
+) -> tuple[op_lib.BoundArguments, ...]:
+  """Returns `BoundArguments` for all Tokamax ops in a given computation."""
 
+  kernel_infos = (
+      [x]
+      if isinstance(x, KernelInfoBase)
+      else get_kernel_info(x, include_xla_kernels)
+  )
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class MosaicGpuKernelInfo(KernelInfoBase):
-  """Mosaic GPU kernel information."""
+  op_specs = []
+  for kernel in kernel_infos:
+    json_data = hlo_utils_common.get_json_from_name(kernel.op_name)
+    if json_data is None:
+      continue
 
+    op_specs.append(op_lib.BOUND_ARGS_ADAPTER.validate_json(json_data))
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class TokamaxXlaKernelInfo(KernelInfoBase):
-  """Tokamax XLA kernel information."""
+  return tuple(op_specs)
 
 
 # Adapted from `GetNameFromLocImpl` in `mhlo_to_hlo/location_exporter.cc`.
 def _get_op_name(loc: ir.Location) -> str:
-  if loc.is_a_name():
+  if isinstance(loc, ir.NameLoc):
     name = loc.name_str.split('@', maxsplit=1)[0]
     if name.endswith(':'):
       name = _get_op_name(loc.child_loc)
     return name
-  if loc.is_a_callsite():
+  if isinstance(loc, ir.CallSiteLoc):
     return _get_op_name(loc.callee)
-  if loc.is_a_fused():
+  if isinstance(loc, ir.FusedLoc):
     return ';'.join(filter(bool, map(_get_op_name, loc.locations)))
   return ''
 
@@ -155,13 +145,13 @@ def _get_shape_dtype(ty: ir.Type) -> jax.ShapeDtypeStruct:
 
 def _get_source_file_line(loc: ir.Location) -> tuple[str, int]:
   """Returns the source file and line number of a location."""
-  if loc.is_a_file():
+  if isinstance(loc, ir.FileLineColLoc):
     return loc.filename, loc.start_line
-  if loc.is_a_name():
+  if isinstance(loc, ir.NameLoc):
     return _get_source_file_line(loc.child_loc)
-  if loc.is_a_callsite():
+  if isinstance(loc, ir.CallSiteLoc):
     return _get_source_file_line(loc.callee)
-  if loc.is_a_fused():
+  if isinstance(loc, ir.FusedLoc):
     for inner_loc in reversed(loc.locations):
       file, line = _get_source_file_line(inner_loc)
       if file:
@@ -175,9 +165,9 @@ def _get_common_kernel_info(
   """Extracts common kernel information from a `stablehlo` op."""
   source_file, source_line = _get_source_file_line(op.location)
 
-  parent = op.parent
-  while parent.parent is not None:  # pytype: disable=attribute-error
-    parent = parent.parent
+  assert (parent := op.parent) is not None
+  while (grandparent := parent.parent) is not None:
+    parent = grandparent
 
   # Capture input / output layouts?
   return dict(
@@ -187,27 +177,7 @@ def _get_common_kernel_info(
       op_name=';'.join(filter(bool, call_stack + (_get_op_name(op.location),))),
       source_line=source_line,
       source_file=source_file,
-      hlo_module_name=parent.opview.sym_name.value,
-  )
-
-
-def _get_pallas_kernel_info(
-    op: stablehlo.CustomCallOp, call_stack: tuple[str, ...]
-) -> TritonKernelInfo:
-  """Get Pallas kernel info from a `stablehlo.CustomCallOp`."""
-  if (config := op.backend_config) is None:
-    config = op.attributes['mhlo.backend_config']
-  elif isinstance(config, ir.StringAttr):
-    assert not ir.StringAttr(config).value
-    config = op.attributes['mhlo.backend_config']
-  return TritonKernelInfo(
-      **_get_common_kernel_info(op, call_stack),
-      kernel_name=config['name'].value,
-      num_warps=config['num_warps'].value,
-      num_stages=config['num_stages'].value,
-      grid=tuple(config[f'grid_{dim}'].value for dim in ('x', 'y', 'z')),
-      compute_capability=None,
-      metadata=b'',
+      hlo_module_name=parent.opview.sym_name.value,  # pytype: disable=attribute-error
   )
 
 
@@ -217,17 +187,29 @@ def _kernel_info_getter(cls):
 
 _KERNEL_GETTER: Final[
     immutabledict.immutabledict[
-        str, Callable[[stablehlo.CustomCallOp, tuple[str, ...]], KernelInfoBase]
+        str,
+        Callable[
+            [stablehlo.CustomCallOp, tuple[str, ...]],
+            KernelInfoBase,
+        ],
     ]
 ] = immutabledict.immutabledict({
-    _MOSAIC_GPU_KEY: _kernel_info_getter(MosaicGpuKernelInfo),
-    _MOSAIC_TPU_KEY: _kernel_info_getter(MosaicTpuKernelInfo),
-    _PALLAS_TRITON_KEY: _get_pallas_kernel_info,
+    hlo_utils_common.MOSAIC_GPU_KEY: _kernel_info_getter(
+        hlo_utils_common.MosaicGpuKernelInfo
+    ),
+    hlo_utils_common.MOSAIC_TPU_KEY: _kernel_info_getter(
+        hlo_utils_common.MosaicTpuKernelInfo
+    ),
+    hlo_utils_common.PALLAS_TRITON_KEY: _kernel_info_getter(
+        hlo_utils_common.TritonKernelInfo
+    ),
 })
-_get_tokamax_xla_kernel_info = _kernel_info_getter(TokamaxXlaKernelInfo)
+_get_tokamax_xla_kernel_info = _kernel_info_getter(
+    hlo_utils_common.TokamaxXlaKernelInfo
+)
 
 
-def get_kernel_info(
+def _get_kernel_info_stablehlo(
     x: jax.stages.Lowered | ir.Module,
     include_xla_kernels: bool = True,
 ) -> tuple[KernelInfoBase, ...]:
@@ -241,7 +223,7 @@ def get_kernel_info(
     A tuple of KernelInfoBase objects.
   """
   if isinstance(x, jax.stages.Lowered):
-    x = x.compiler_ir('stablehlo')
+    x = hlo_utils_common.ir_module_from_lowered(x)
 
   symbol_table = ir.SymbolTable(x.operation)
   infos = []
@@ -249,64 +231,31 @@ def get_kernel_info(
   def handle_op(
       op: ir.Operation, call_stack: tuple[str, ...] = ()
   ) -> ir.WalkResult:
-    op = op.opview
+    op_ = op.opview
 
-    if isinstance(op, stablehlo.CustomCallOp):
-      if (getter := _KERNEL_GETTER.get(op.call_target_name.value)) is not None:  # pytype: disable=attribute-error
-        infos.append(getter(op, call_stack))
-    elif isinstance(op, func.CallOp):
-      callee = symbol_table[op.callee.value]  # pytype: disable=attribute-error
-      call_stack = call_stack + (_get_op_name(op.location),)
+    if isinstance(op_, stablehlo.CustomCallOp):
+      if (getter := _KERNEL_GETTER.get(op_.call_target_name.value)) is not None:  # pytype: disable=attribute-error
+        infos.append(getter(op_, call_stack))
+    elif isinstance(op_, func.CallOp):
+      callee = symbol_table[op_.callee.value]  # pytype: disable=attribute-error
+      call_stack = call_stack + (_get_op_name(op_.location),)
       callee.operation.walk(functools.partial(handle_op, call_stack=call_stack))
-    elif isinstance(op, func.FuncOp):
-      if op.name.value != 'main':  # pytype: disable=attribute-error
+    elif isinstance(op_, func.FuncOp):
+      if op_.name.value != 'main':  # pytype: disable=attribute-error
         return ir.WalkResult.SKIP
     elif (
         include_xla_kernels
-        and isinstance(op.name, str)  # `FuncOp` returns `StringAttr`.
-        and op.name.startswith('stablehlo.')
-        and op.name[len('stablehlo.') :] not in _XLA_NOISE_OPCODES
+        and isinstance(op_.name, str)  # `FuncOp` returns `StringAttr`.
+        and op_.name.startswith('stablehlo.')
+        and op_.name[len('stablehlo.') :]
+        not in hlo_utils_common.XLA_NOISE_OPCODES
         and (
-            any(_TOKAMAX_NAME in name for name in call_stack)
-            or _TOKAMAX_NAME in _get_op_name(op.location)
+            any(hlo_utils_common.TOKAMAX_NAME in name for name in call_stack)
+            or hlo_utils_common.TOKAMAX_NAME in _get_op_name(op_.location)
         )
     ):
-      infos.append(_get_tokamax_xla_kernel_info(op, call_stack))
+      infos.append(_get_tokamax_xla_kernel_info(op_, call_stack))
     return ir.WalkResult.ADVANCE
 
   x.operation.walk(handle_op, ir.WalkOrder.PRE_ORDER)
   return tuple(infos)
-
-
-def get_opspecs(
-    x: jax.stages.Lowered | ir.Module,
-    include_xla_kernels: bool = True,
-) -> tuple[op_lib.BoundArguments, ...]:
-  """Returns `BoundArguments` for all Tokamax ops in a lowered JAX function."""
-
-  op_specs = []
-  for kernel in get_kernel_info(x, include_xla_kernels=include_xla_kernels):
-    marker = _TOKAMAX_NAME + ':'
-    idx = kernel.op_name.find(marker)
-    # For XLA kernels, sometimes the op info is not present, eg.
-    # jit(tokamax_norm_and_glu)/convert_element_type.
-    if idx == -1:
-      continue
-    json_data = kernel.op_name[idx + len(marker) :]
-    count = 0
-    # A VJP op may have multiple op specs in the HLO. Find the position of the
-    # end brace for the first op spec. We only return the first op (the VJP), as
-    # the forward op will be present in the HLO elsewhere.
-    for i, c in enumerate(json_data):
-      if c == '{':
-        count += 1
-      elif c == '}':
-        count -= 1
-        if count < 1:
-          # This might mean that we have more end braces than opening braces,
-          # but in that case the `validate_json` call below will fail.
-          json_data = json_data[: i + 1]
-          break
-    op_specs.append(op_lib.BOUND_ARGS_ADAPTER.validate_json(json_data))
-
-  return tuple(op_specs)

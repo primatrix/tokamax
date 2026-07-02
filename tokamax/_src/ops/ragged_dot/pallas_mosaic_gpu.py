@@ -16,7 +16,7 @@
 
 import dataclasses
 from functools import partial  # pylint: disable=g-importing-member
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -33,8 +33,6 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant as sm90_quant
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_ws as sm90_quant_ws
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_ws_async_store as sm90_quant_ws_async_store
 from typing_extensions import override
 
 Config = common.Config
@@ -42,6 +40,11 @@ QArray = base.QArray
 AsQArray = base.AsQArray
 GroupSizes = base.GroupSizes
 
+# TODO: Directly import ManualAxisType JAX is upgraded.
+try:
+  from jax.sharding import ManualAxisType
+except ImportError:
+  ManualAxisType = Any
 
 # TODO: Natively support mk,ekn->mn.
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -74,8 +77,34 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       return_residuals: bool,
       config: Config,
       activation: base.ActivationFunction | None = None,
+      manual_axis_type: ManualAxisType | None = None,
+      group_offset: jax.Array | None = None,
+      rhs_scale: jax.Array | None = None,
+      rhs_bias: jax.Array | None = None,
+      maybe_quantize_lhs: bool = False,
+      zero_initialize: bool = True,
+      fuse_gateup_activation: str | None = None,
+      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
+      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
   ) -> tuple[jax.Array, base.Residuals]:
     # TODO: Support returning residuals from mosaic GPU kernel.
+
+    if (
+        group_offset is not None
+        or rhs_scale is not None
+        or rhs_bias is not None
+        or maybe_quantize_lhs
+        or not zero_initialize
+        or fuse_gateup_activation is not None
+        or lhs_quantization_dtype is not None
+        or rhs_quantization_dtype is not None
+    ):
+      raise NotImplementedError(
+          "The Pallas-Mosaic-GPU implementation does not support group_offset,"
+          " rhs_scale, rhs_bias, maybe_quantize_lhs, zero_initialize,"
+          " fuse_gateup_activation, lhs_quantization_dtype,"
+          " or rhs_quantization_dtype."
+      )
 
     if ragged_dot_dimension_numbers == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS:
       rhs = rhs.mT  # TODO: Fuse transpose into kernel.
@@ -97,12 +126,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
             raise NotImplementedError(f"{precision=} not supported.")
 
-          if config.async_store:
-            fn = sm90_quant_ws_async_store.ragged_dot_quantized_ws_async_store_kernel  # pylint: disable=line-too-long
-          elif config.warp_specialized:
-            fn = sm90_quant_ws.ragged_dot_quantized_ws_kernel
-          else:
-            fn = sm90_quant.ragged_dot_quantized_kernel
+          fn = sm90_quant.ragged_dot_quantized_kernel
         else:
           if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
             lhs = lhs.astype(jnp.bfloat16)
@@ -137,6 +161,10 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             fn = sm100_i8_quant.ragged_dot_gpu_i8_quant_blackwell_kernel
           elif lhs.qtype == jnp.float8_e4m3fn:
             fn = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
+            # make sure output is bfloat16 since we may want to store lhs.scale
+            # as float32 to avoid in-kernel conversion.
+            if preferred_element_type is None:
+              preferred_element_type = rhs.dtype
           else:
             # dequantize lhs to fallback to non-lhs-quantized kernel
             lhs = quantization.as_array(lhs)
@@ -176,6 +204,35 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
     return dot_out, residuals if return_residuals else None
 
+  # Because fp8 ragged dot kernel has special optimization to:
+  # 1. offload subchannel rowsum (used in debiasing) to preceding quant kernel;
+  # 2. pack rowsum to scale (to not break tokamax + qwix API);
+  # 3. pre-convert scale to f32 (since fp8 ragged dot is generally ALU bound).
+  # it will break autotuning cache lookup key because the special quant kernel
+  # is not exposed to Tokamax, which solely rely on qwix to perform quantization
+  # and dequantization. For example, autotuning will set the lookup key with
+  # "scale:bf16(4096,8)" but when fp8 ragged dot kernel is used with special
+  # quant kernel, the lookup key expects to be "scale:f32(4096,16)". This hack
+  # fixes the cache lookup.
+  @override
+  def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Any:
+    lhs = ba.arguments.get("lhs")
+    if isinstance(lhs, QArray) and lhs.qtype == jnp.float8_e4m3fn:
+      if lhs.scale.dtype == jnp.bfloat16:
+        new_scale = jax.ShapeDtypeStruct(
+            lhs.scale.shape[:-1] + (lhs.scale.shape[-1] * 2,), jnp.float32
+        )
+        new_lhs = QArray(
+            qvalue=lhs.qvalue,
+            scale=new_scale,
+            zero_point=lhs.zero_point,
+            qtype=lhs.qtype,
+        )
+        new_arguments = dict(ba.arguments)
+        new_arguments["lhs"] = new_lhs
+        ba = dataclasses.replace(ba, arguments=new_arguments)
+    return base.RaggedDot._get_autotuning_cache_key(self, ba)
+
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     lhs, rhs = ba.args
@@ -191,10 +248,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           block_k=block_k,
           num_stages=2,
           split_k=1,
-          grid_block_n=1,
-          warp_specialized=True,
-          persistent=False,
-          async_store=True,
+          persistent=isinstance(rhs, QArray),
           grid_minor_dim=common.MatmulDimension.M,
           grid_tile_width=1,
       )
@@ -208,16 +262,15 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                 block_k=block_k,
                 num_stages=2,
                 split_k=1,
-                grid_block_n=1,
             )
           elif lhs.qtype == jnp.float8_e4m3fn:
             return Config(
                 block_m=16,
                 block_n=128,
                 block_k=block_k,
+                collective=False,
                 num_stages=2,
                 split_k=1,
-                grid_block_n=1,
             )
         return Config(
             block_m=64,
@@ -225,7 +278,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             block_k=block_k,
             num_stages=2,
             split_k=1,
-            grid_block_n=1,
         )
       else:
         return Config(
@@ -234,8 +286,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             block_k=256,
             num_stages=2,
             split_k=1,
-            grid_block_n=1,
-            warp_specialized=True,
             persistent=False,
             collective=True,
             grid_minor_dim=common.MatmulDimension.M,
@@ -266,43 +316,34 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     out_dtype_bits = jnp.finfo(out_dtype).bits
     out_swizzle_elems = (128 * 8) // out_dtype_bits
 
-    if isinstance(rhs, QArray):
-      ws_async_store_options = ((False, False), (True, False), (True, True))
-    else:
-      ws_async_store_options = ((False, False),)
-
     configs = set()
     for persistent in [True, False]:
-      for warp_specialized, async_store in ws_async_store_options:
-        for block_k in [128, 256, 512]:
-          if (block_k * rhs_dtype_bits) % (128 * 8) or (
-              block_k * lhs_dtype_bits
-          ) % (128 * 8):
-            continue
-          if scale_tile_shape != 0 and scale_tile_shape % block_k != 0:
-            continue
-          for block_m in [128, 64, 32, 16]:
-            for num_stages in [4, 2]:
-              for grid_minor_dim in [
-                  common.MatmulDimension.M,
-                  common.MatmulDimension.N,
-              ]:
-                for grid_tile_width in [1, 2, 4, 8]:
-                  configs.add(
-                      Config(
-                          block_m=block_m,
-                          block_n=out_swizzle_elems,
-                          block_k=block_k,
-                          num_stages=num_stages,
-                          warp_specialized=warp_specialized,
-                          persistent=persistent,
-                          split_k=1,
-                          async_store=async_store,
-                          grid_block_n=grid_tile_width,
-                          grid_minor_dim=grid_minor_dim,
-                          grid_tile_width=grid_tile_width,
-                      )
-                  )
+      for block_k in [128, 256, 512]:
+        if (block_k * rhs_dtype_bits) % (128 * 8) or (
+            block_k * lhs_dtype_bits
+        ) % (128 * 8):
+          continue
+        if scale_tile_shape != 0 and scale_tile_shape % block_k != 0:
+          continue
+        for block_m in [128, 64, 32, 16]:
+          for num_stages in [4, 2]:
+            for grid_minor_dim in [
+                common.MatmulDimension.M,
+                common.MatmulDimension.N,
+            ]:
+              for grid_tile_width in [1, 2, 4, 8]:
+                configs.add(
+                    Config(
+                        block_m=block_m,
+                        block_n=out_swizzle_elems,
+                        block_k=block_k,
+                        num_stages=num_stages,
+                        persistent=persistent,
+                        split_k=1,
+                        grid_minor_dim=grid_minor_dim,
+                        grid_tile_width=grid_tile_width,
+                    )
+                )
     return configs
 
   def _get_sm100_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
@@ -358,8 +399,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                               block_k=block_k,
                               num_stages=num_stages,
                               split_k=1,
-                              grid_block_n=grid_tile_width,
-                              warp_specialized=True,
                               persistent=False,
                               collective=collective,
                               post_scale=post_scale,
@@ -376,11 +415,11 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             configs,
             block_m_choices=[8, 16, 32],
             block_k_choices=[128, 256, 512],
-            num_stages_choices=[2, 4],
+            num_stages_choices=[2],
             grid_minor_dim_choices=grid_minor_dim_choices,
             grid_tile_width_choices=grid_tile_width_choices,
             split_m_choices=[1],
-            collective_choices=[False],
+            collective_choices=[False, True],
             post_scale_choices=[False],
         )
     else:

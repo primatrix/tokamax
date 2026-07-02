@@ -25,6 +25,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -97,7 +98,7 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   q, k, _ = ba.args
   block_qs = set([
       min(x, pl.next_power_of_2(q.shape[-3] // 2))
-      for x in [64, 128, 256]
+      for x in [64, 128]
       if q.shape[-3] % (x * 2) == 0  # 2 * block_q must divide seq_len_q.
   ])
   block_kvs = set([
@@ -160,7 +161,7 @@ def flash_attention_kernel(
   num_q_tiles = pl.cdiv(q_seq_len, block_q * 2)
 
   epi_tile_q = 64
-  epi_tile_d = 1024 // common.num_bits(out_dtype)
+  epi_tile_d = 1024 // mgpu_lib.num_bits(out_dtype)
   assert block_q % epi_tile_q == 0
   if head_dim_out % epi_tile_d != 0:
     epi_tile_d = head_dim_out
@@ -256,10 +257,10 @@ def flash_attention_kernel(
 
       # MGPU uses the lower barrier IDs, so use barriers 8 and 9 for scheduling.
       schedule_barrier_arrive = functools.partial(
-          common.bar_arrive, barrier_id=9 - wg, num_threads=256
+          mgpu_lib.bar_arrive, barrier_id=9 - wg, num_threads=256
       )
       schedule_barrier_arrive_and_wait = functools.partial(
-          common.bar_sync, barrier_id=8 + wg, num_threads=256
+          mgpu_lib.bar_sync, barrier_id=8 + wg, num_threads=256
       )
 
       pl.when(wg == 1)(schedule_barrier_arrive_and_wait)
@@ -281,8 +282,8 @@ def flash_attention_kernel(
           elif bias_smem is None:
             bias = _load_bcast(bias_gmem, (hi, qs, ks), layout=_WGMMA)
           else:
-            plgpu.barrier_wait(bias_barrier.at[si])
-            bias = bias_smem[si, block.ds(wg, block_q)]
+            plgpu.barrier_wait(bias_barrier.at[wg * max_stages + si])
+            bias = bias_smem[wg, si]
           mask = (q_base + iota(0) >= k_base + iota(1)) if do_causal else None
           return acc[...], bias, mask
 
@@ -436,11 +437,15 @@ def flash_attention_kernel(
       plgpu.set_max_registers(40, action="decrease")
       hi_kv = lax.div(hi, q_heads_per_kv_head)
       qs = block.ds(qi, 2 * block_q)
+      qs_wg0 = block.ds(2 * qi, block_q)
+      qs_wg1 = block.ds(2 * qi + 1, block_q)
 
       if bias_smem is None:
         bias_gmem_ = None
       else:
-        bias_gmem_ = bias_gmem.at[0 if bias_gmem.shape[0] == 1 else hi, qs]
+        bias_gmem_ = bias_gmem.at[0 if bias_gmem.shape[0] == 1 else hi]
+        bias_barrier_wg0 = bias_barrier
+        bias_barrier_wg1 = bias_barrier.at[max_stages:]
 
       if mask_smem is None:
         mask_gmem_ = None
@@ -461,7 +466,8 @@ def flash_attention_kernel(
         ks = block.ds(ki, block_kv)
         cp(k_gmem.at[ks, hi_kv], k_smem, k_barrier, si)
         if bias_gmem_ is not None:
-          cp(bias_gmem_.at[:, ks], bias_smem, bias_barrier, si)
+          cp(bias_gmem_.at[qs_wg0, ks], bias_smem.at[0], bias_barrier_wg0, si)
+          cp(bias_gmem_.at[qs_wg1, ks], bias_smem.at[1], bias_barrier_wg1, si)
         if mask_gmem_ is not None:
           cp(mask_gmem_.at[..., ks], mask_smem, mask_barrier, si)
         cp(v_gmem.at[ks, hi_kv], v_smem, v_barrier, si)
@@ -473,7 +479,8 @@ def flash_attention_kernel(
         plgpu.barrier_wait(k_consumed_barrier.at[si])
         cp(k_gmem.at[ks, hi_kv], k_smem, k_barrier, si)
         if bias_gmem_ is not None:
-          cp(bias_gmem_.at[:, ks], bias_smem, bias_barrier, si)
+          cp(bias_gmem_.at[qs_wg0, ks], bias_smem.at[0], bias_barrier_wg0, si)
+          cp(bias_gmem_.at[qs_wg1, ks], bias_smem.at[1], bias_barrier_wg1, si)
         if mask_gmem_ is not None:
           plgpu.barrier_wait(mask_consumed_barrier.at[si])
           cp(mask_gmem_.at[..., ks], mask_smem, mask_barrier, si)
@@ -503,11 +510,8 @@ def flash_attention_kernel(
     residuals_shape = (num_q_heads, num_q_tiles * 2 * block_q)
     out_shape += [jax.ShapeDtypeStruct(residuals_shape, jnp.float32)] * 2
 
-  def tiled_smem(shape, dtype, what=""):
-    transforms = common.tile_swizzle_transforms(shape, dtype, what)
-    return plgpu.SMEM(shape, dtype, transforms=transforms)
-
   compute_wgs = 2
+  tiled_smem = mgpu_lib.tiled_swizzled_smem
   q_scratch = tiled_smem((compute_wgs, block_q, head_dim), q.dtype, "q")
   k_scratch = tiled_smem((max_stages, block_kv, head_dim), k.dtype, "k")
   v_scratch = tiled_smem((max_stages, block_kv, head_dim_out), v.dtype, "v")
@@ -520,11 +524,11 @@ def flash_attention_kernel(
       num_barriers=max_stages, num_arrivals=compute_wgs
   )
 
-  bias_mask_smem_shape = (max_stages, compute_wgs * block_q, block_kv)
   # bias doesn't need a consumed barrier as it is implied by k consumed.
   if bias is not None and bias.shape[-2] != 1 and bias.shape[-1] != 1:
-    bias_scratch = tiled_smem(bias_mask_smem_shape, bias.dtype, "bias")
-    bias_barrier = plgpu.Barrier(num_barriers=max_stages)
+    bias_scratch_shape = (compute_wgs, max_stages, block_q, block_kv)
+    bias_scratch = tiled_smem(bias_scratch_shape, bias.dtype, "bias")
+    bias_barrier = plgpu.Barrier(num_barriers=compute_wgs * max_stages)
   else:
     bias_scratch = bias_barrier = None
 
@@ -534,7 +538,8 @@ def flash_attention_kernel(
       if block_kv >= 128:  # Minimum transfer size is 128 bytes.
         mask_scratch = plgpu.SMEM((max_stages, block_kv), jnp.int8)
     else:
-      mask_scratch = tiled_smem(bias_mask_smem_shape, jnp.int8, "mask")
+      mask_scratch_shape = (max_stages, compute_wgs * block_q, block_kv)
+      mask_scratch = tiled_smem(mask_scratch_shape, jnp.int8, "mask")
 
     if mask_scratch is not None:
       mask_barrier = plgpu.Barrier(num_barriers=max_stages)
@@ -561,8 +566,8 @@ def flash_attention_kernel(
 
   out, *residuals = plgpu.kernel(
       kernel,
-      out_shape=out_shape,
-      scratch_shapes=scratch_shapes,
+      out_type=out_shape,
+      scratch_types=scratch_shapes,
       grid=(num_q_heads, num_q_tiles),
       grid_names=("heads", "q_tiles"),
       num_threads=3,
@@ -570,6 +575,7 @@ def flash_attention_kernel(
       compiler_params=plgpu.CompilerParams(
           approx_math=True, unsafe_no_auto_barriers=True
       ),
+      kernel_name="flash_attention_sm90",
   )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
 
   residuals = tuple(res[..., :q_seq_len] for res in residuals)

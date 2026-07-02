@@ -47,20 +47,28 @@ class _ConfigOption(Generic[_T]):
 
   flag: flags.FlagHolder[_T]
 
-  def __call__(self, value: _T) -> contextlib.AbstractContextManager[None]:
+  def __call__(
+      self, value: _T | str
+  ) -> contextlib.AbstractContextManager[None]:
     name = self.flag.name
     flag = self.flag._flagvalues[name]
+
     try:
-      value = flag.parser.parse(value)
+      value_ = flag.parser.parse(value) if isinstance(value, str) else value
     except ValueError as e:
       raise ValueError(f"Invalid value for config `{name}`: {value}") from e
 
-    return _option_override_scope(name, value)
+    return _option_override_scope(name, value_)
 
   @property
   def value(self) -> _T:
     if not flags.FLAGS.is_parsed():
-      flags.FLAGS(sys.argv)
+      # `known_only=True` parses the flags absl actually defines (so any
+      # `--tokamax_*` flags on the command line still take effect) and ignores
+      # the rest instead of raising `UnrecognizedFlagError`. Tokamax is a
+      # library, so `sys.argv` may carry flags owned by the host program
+      # (pytest's `-s`, vLLM's CLI args, etc.) that absl does not recognize.
+      flags.FLAGS(sys.argv, known_only=True)
     return getattr(_STATE, self.flag.name, self.flag.value)
 
 
@@ -87,5 +95,14 @@ cross_compile = _ConfigOption(
         " where kernels are lowered and compiled is not the same as the machine"
         " where they are run. `has_mosaic_gpu_support()` that check that the"
         " correct hardware is present.",
+    )
+)
+
+ignore_autotuning_cache = _ConfigOption(
+    flags.DEFINE_bool(
+        "tokamax_ignore_autotuning_cache",
+        False,
+        "If true, ignore the autotuning cache when looking for configs and"
+        " autotuning.",
     )
 )

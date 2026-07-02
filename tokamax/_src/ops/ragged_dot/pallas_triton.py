@@ -17,7 +17,7 @@
 import dataclasses
 import functools
 import math
-from typing import Callable, ClassVar
+from typing import Any, Callable, ClassVar
 
 import jax
 from jax import numpy as jnp
@@ -32,6 +32,11 @@ from tokamax._src.ops.ragged_dot import base
 from tokamax._src.pallas import block
 from typing_extensions import override
 
+# TODO: Directly import ManualAxisType JAX is upgraded.
+try:
+  from jax.sharding import ManualAxisType
+except ImportError:
+  ManualAxisType = Any
 
 Residuals = base.Residuals
 QArray = base.QArray
@@ -131,7 +136,9 @@ def _ragged_dot_kernel(
       dtype = jnp.result_type(a, b)
       a = a.astype(dtype)
       b = b.astype(dtype)
-      return acc + pl.dot(a, b, precision=dot_precision) * a_scales * b_scales
+      return (
+          acc + plgpu.dot(a, b, precision=dot_precision) * a_scales * b_scales
+      )
 
     acc = jax.lax.fori_loop(0, pl.cdiv(a_ref.shape[1], block_k), body, acc)
     mask = (start_m + jnp.arange(block_m)) < hi
@@ -263,7 +270,7 @@ def _ragged_contracting_dim_dot_kernel(
     dtype = jnp.result_type(a, b)
     a = a.astype(dtype)
     b = b.astype(dtype)
-    return acc + pl.dot(a.T, b, precision=precision)
+    return acc + plgpu.dot(a.T, b, precision=precision)
 
   num_iters = pl.cdiv(jnp.int32(hi - lo), block_k)
   acc = jnp.zeros((block_m, out_ref.shape[1]), dtype=jnp.float32)
@@ -360,7 +367,33 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       return_residuals: bool,
       config: Config,
       activation: Callable[[jax.Array], jax.Array] | None = None,
+      manual_axis_type: ManualAxisType | None = None,
+      group_offset: jax.Array | None = None,
+      rhs_scale: jax.Array | None = None,
+      rhs_bias: jax.Array | None = None,
+      maybe_quantize_lhs: bool = False,
+      zero_initialize: bool = True,
+      fuse_gateup_activation: str | None = None,
+      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
+      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
   ) -> tuple[jax.Array, base.Residuals]:
+    if (
+        group_offset is not None
+        or rhs_scale is not None
+        or rhs_bias is not None
+        or maybe_quantize_lhs
+        or not zero_initialize
+        or fuse_gateup_activation is not None
+        or lhs_quantization_dtype is not None
+        or rhs_quantization_dtype is not None
+    ):
+      raise NotImplementedError(
+          "The Pallas-Triton implementation does not support"
+          " group_offset, rhs_scale, rhs_bias, maybe_quantize_lhs,"
+          " zero_initialize, fuse_gateup_activation, lhs_quantization_dtype,"
+          " or rhs_quantization_dtype."
+      )
+
     lhs, rhs = map(quantization.as_array_or_qarray, (lhs, rhs))
 
     if preferred_element_type is None:

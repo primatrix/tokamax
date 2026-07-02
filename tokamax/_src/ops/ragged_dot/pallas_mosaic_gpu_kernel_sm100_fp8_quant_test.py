@@ -34,7 +34,6 @@ _CONFIG = pallas_mosaic_gpu.Config(
     block_k=128,
     num_stages=2,
     split_k=1,
-    grid_block_n=1,
     persistent=True,
     collective=False,
     grid_minor_dim=pallas_mosaic_gpu.common.MatmulDimension.M,
@@ -105,7 +104,13 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
       subchannels=(512, 256, 128),
       use_as_qarray=(True, False),
       activation=(None, test_base.relu, jax.nn.tanh),
-      task=((8, 512, 512, 512), (8, 512, 512, 512), (32, 4096, 4096, 4096)),
+      task=(
+          (8, 512, 512, 512),
+          (8, 512, 512, 512),
+          (32, 4096, 4096, 4096),
+          (32, 16384, 4096, 4096),
+          (16, 8192, 4096, 4096),
+      ),
       block_m=(16, 32),
       block_k=(512, 256, 128),
   )

@@ -17,6 +17,7 @@
 from collections.abc import Callable, Mapping
 import dataclasses
 import inspect
+import json
 from typing import Annotated, Any, Final, ParamSpec, Self, Sequence, TypeAlias
 
 from absl import logging
@@ -32,6 +33,8 @@ from tokamax._src.autotuning import cache as cache_lib
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
+from tokamax._src.ops.experimental.mla import api as mla_api
+from tokamax._src.ops.experimental.mla import base as mla_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.normalization import api as normalization_api
@@ -39,7 +42,6 @@ from tokamax._src.ops.normalization import base as normalization_base
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 import tqdm
-
 
 BoundArgsAutotuningData: TypeAlias = tuple[
     op_lib.BoundArguments, autotuner.AutotuningData[Any]
@@ -97,18 +99,28 @@ class AutotuningResult:
   # version of Tokamax was used to generate the serialized config.
   tokamax_version: str = version.TOKAMAX_VERSION
 
-  def dump(self, fp):
-    fp.write(self.dumps())
+  def dump(self, fp, *, prune_errors: bool = False):
+    fp.write(self.dumps(prune_errors=prune_errors))
 
-  def dumps(self) -> str:
-    return str(_AUTOTUNING_RESULT_ADAPTER.dump_json(self), "utf-8")
+  def dumps(self, *, prune_errors: bool = False) -> str:
+    if prune_errors:
+      data = tuple(
+          (ba, autotuner.AutotuningData(ba_data.prune_errors()))
+          for ba, ba_data in self.data
+      )
+      to_dump = dataclasses.replace(self, data=data)
+    else:
+      to_dump = self
+    return str(_AUTOTUNING_RESULT_ADAPTER.dump_json(to_dump), "utf-8")
 
   def dump_cache_str(self) -> str:
     cache_str = ""
     # Convert to a dictionary and serialize out the op.
     device_autotuning_dict = {}
     for ba, data in self.data:
-      device_autotuning_dict.setdefault(ba.op, {})[ba.arguments] = data
+      device_autotuning_dict.setdefault(ba.op, {})[
+          ba.arguments
+      ] = data.prune_errors()
 
     for op, cache in device_autotuning_dict.items():
       adapter = cache_lib._get_cache_adapter(op)  # pylint: disable=protected-access
@@ -181,7 +193,7 @@ _P = ParamSpec("_P")
 def get_bound_args(
     f: (
         Callable[_P, Any]
-        | jax.stages.Lowered
+        | hlo_utils.HloComputation
     ),
     *args: _P.args,
     **kwargs: _P.kwargs,
@@ -218,6 +230,48 @@ def get_bound_args(
   return tuple(unique_bound_args)
 
 
+def dump_bound_args_to_json(bound_args: Sequence[op_lib.BoundArguments]) -> str:
+  """Dumps a sequence of BoundArguments to a JSON string."""
+
+  def _strip_vjp_and_config(
+      bound_arg: op_lib.BoundArguments,
+  ) -> op_lib.BoundArguments:
+    """Strips the VJP and config from the BoundArguments."""
+    return bound_arg.replace(op=bound_arg.op.replace(vjp=None, config=None))
+
+  json_list = [
+      op_lib.BOUND_ARGS_ADAPTER.dump_python(bound_arg, mode="json")
+      for bound_arg in map(_strip_vjp_and_config, bound_args)
+  ]
+  return json.dumps(json_list, indent=2)
+
+
+def bound_args_to_json(
+    f: (
+        Callable[_P, Any]
+        | jax.stages.Lowered
+    ),
+    filename: str,
+) -> None:
+  """Dumps a sequence of BoundArguments to a JSON file."""
+  bound_args = get_bound_args(f)
+  json_string = dump_bound_args_to_json(bound_args)
+  with open(filename, "w") as f:
+    f.write(json_string)
+
+
+def bound_args_from_json(json_string: str) -> list[op_lib.BoundArguments]:
+  """Loads a sequence of BoundArguments from a JSON file."""
+  json_list = json.loads(json_string)
+  return [op_lib.BOUND_ARGS_ADAPTER.validate_python(item) for item in json_list]
+
+
+def bound_args_from_json_file(filename: str) -> list[op_lib.BoundArguments]:
+  """Loads a sequence of BoundArguments from a JSON file."""
+  with open(filename, "r") as f:
+    return bound_args_from_json(f.read())
+
+
 _API_IMPLEMENTATIONS: Final[
     Mapping[type[op_lib.Op], Mapping[str, Callable[..., Any]]]
 ] = immutabledict.immutabledict({
@@ -225,6 +279,7 @@ _API_IMPLEMENTATIONS: Final[
     glu_base.GatedLinearUnit: glu_api.IMPLEMENTATIONS,
     ragged_dot_base.RaggedDot: ragged_dot_api.IMPLEMENTATIONS,
     attention_base.DotProductAttention: attention_api.IMPLEMENTATIONS,
+    mla_base.MultiHeadLatentAttention: mla_api.IMPLEMENTATIONS,
 })
 
 
@@ -260,6 +315,7 @@ def autotune(
     ignore_cache: bool = False,
     all_implementations: bool = False,
     progress_bar: bool = True,
+    event_filter_regex: str | None = None,
 ) -> AutotuningResult:
   """Autotunes all captured ops in x.
 
@@ -268,17 +324,18 @@ def autotune(
     *args: Positional arguments to `f` (only valid if `f` is callable). NOTE -
       To autotune a callable with keyword arguments, pass the results of
       `tokamax.get_bound_args(f, *args, **kwargs)` to `autotune`.
-    ignore_cache: Whether to ignore the autotuningcache and re-autotune.
+    ignore_cache: . If `False` (default), only autotune ops that are not in the
+      autotuning cache. If `True` autotune all Tokamax ops found in `f`.
     all_implementations: Whether to autotune all implementations of the op that
       is tunable on the current device.
     progress_bar: Whether to show a progress bar (default: `True`).
+    event_filter_regex: Reported timing sums all XLA operations in `f` by
+      default. This regex enables filtering by specific event names to report
+      timing for just a subset of events that match the pattern.
 
   Returns:
-    An `AutotuningResult` of the autotuned ops.
+    An `AutotuningResult` object of the autotuned ops.
   """
-  # TODO: Implement `ignore_cache=True`.
-  if ignore_cache:
-    raise NotImplementedError("`ignore_cache=True` is not implemented.")
 
   if isinstance(f, (list, tuple)) and isinstance(f[0], op_lib.BoundArguments):
     if args:
@@ -286,6 +343,9 @@ def autotune(
     bound_args = tuple(f)
   else:
     bound_args = get_bound_args(f, *args)  # pytype: disable=paramspec-error
+
+  if not ignore_cache:
+    bound_args = [ba for ba in bound_args if ba.cached_autotuning_data is None]
 
   device_kinds = map(op_lib.infer_device_kind, bound_args)
   device_kinds = {k for k in device_kinds if k is not None}
@@ -318,7 +378,12 @@ def autotune(
 
   for bound_arg in bound_args:
     try:
-      data.append((bound_arg, bound_arg.autotune()))
+      data.append((
+          bound_arg,
+          bound_arg.autotune(
+              event_filter_regex=event_filter_regex, cache_results=False
+          ),
+      ))
     except Exception:  # pylint: disable=broad-exception-caught
       logging.exception("Failed to autotune for op %s", bound_arg.op)
 
