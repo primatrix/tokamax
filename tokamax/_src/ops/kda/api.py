@@ -23,10 +23,19 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops.kda import base
 
 
-Implementation: TypeAlias = Literal["xla"]
+Implementation: TypeAlias = Literal["xla", "xla_chunked"]
 
 IMPLEMENTATIONS = dict(xla=base.KimiDeltaAttention())
 _DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = ("xla",)
+
+try:
+  from tokamax._src.ops.kda import xla_chunked  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS["xla_chunked"] = (
+      xla_chunked.XlaChunkedKimiDeltaAttention()
+  )
+except ImportError:
+  pass
 
 
 @jaxtyping.jaxtyped
@@ -57,8 +66,9 @@ def kimi_delta_attention(
     scale: Query scale. Defaults to `K ** -0.5`.
     initial_state: Optional initial recurrent state, shape `[B, H, K, V]`.
     output_final_state: Whether to return the final recurrent state.
-    implementation: The implementation to use. Only `"xla"` is currently
-      supported.
+    implementation: The implementation to use. `"xla"` evaluates the recurrent
+      reference implementation. `"xla_chunked"` evaluates an equivalent
+      chunk-wise XLA implementation.
 
   Returns:
     A pair `(output, final_state)`. The output has shape `[B, T, H, V]`.
@@ -71,17 +81,25 @@ def kimi_delta_attention(
   elif not implementation:
     raise ValueError("`implementation` must not be an empty sequence.")
 
-  if tuple(implementation) != ("xla",):
-    raise NotImplementedError("Only XLA implementation is supported.")
+  errors = []
+  for impl in implementation:
+    if impl not in IMPLEMENTATIONS:
+      raise ValueError(f"Unknown implementation: {impl}")
 
-  return IMPLEMENTATIONS["xla"](
-      q=q,
-      k=k,
-      v=v,
-      g=g,
-      beta=beta,
-      scale=scale,
-      initial_state=initial_state,
-      output_final_state=output_final_state,
-  )
+    try:
+      return IMPLEMENTATIONS[impl](
+          q=q,
+          k=k,
+          v=v,
+          g=g,
+          beta=beta,
+          scale=scale,
+          initial_state=initial_state,
+          output_final_state=output_final_state,
+      )
+    except NotImplementedError as e:
+      if len(implementation) == 1:
+        raise
+      errors.append(e)
 
+  raise ExceptionGroup("all implementations failed", errors)

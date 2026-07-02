@@ -20,6 +20,7 @@ import jax.numpy as jnp
 from tokamax._src import jaxtyping
 from tokamax._src import numerics
 from tokamax._src.ops.kda import api
+from tokamax._src.ops.kda import xla_chunked
 
 
 def _accumulator_dtype(dtype):
@@ -142,6 +143,65 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(grad, ref_grad, atol=0.01, rtol=0.01)
 
+  @parameterized.parameters(jnp.float32, jnp.bfloat16)
+  def test_xla_chunked_matches_xla(self, dtype):
+    q, k, v, g, beta, initial_state = _make_inputs(dtype)
+    q = jnp.concatenate([q, q[:, :2]], axis=1)
+    k = jnp.concatenate([k, k[:, :2]], axis=1)
+    v = jnp.concatenate([v, v[:, :2]], axis=1)
+    g = jnp.concatenate([g, g[:, :2]], axis=1)
+    beta = jnp.concatenate([beta, beta[:, :2]], axis=1)
+
+    output, final_state = api.kimi_delta_attention(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=True,
+        implementation="xla_chunked",
+    )
+    ref_output, ref_final_state = api.kimi_delta_attention(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=True,
+        implementation="xla",
+    )
+
+    chex.assert_trees_all_close(output, ref_output, atol=0.02, rtol=0.02)
+    chex.assert_trees_all_close(
+        final_state, ref_final_state, atol=0.02, rtol=0.02
+    )
+
+  def test_xla_chunked_gradients_match_xla(self):
+    q, k, v, g, beta, _ = _make_inputs(jnp.float32)
+    q = (jnp.tile(q, (1, 3, 1, 1))[:, :16]) * 0.25
+    k = (jnp.tile(k, (1, 3, 1, 1))[:, :16]) * 0.25
+    v = (jnp.tile(v, (1, 3, 1, 1))[:, :16]) * 0.25
+    g = (jnp.tile(g, (1, 3, 1, 1))[:, :16]) * 0.25
+    beta = (jnp.tile(beta, (1, 3, 1))[:, :16]) * 0.25
+    chunked = xla_chunked.XlaChunkedKimiDeltaAttention(chunk_size=8)
+
+    def loss(fn, q, k, v, g, beta):
+      output, _ = fn(q, k, v, g, beta)
+      return jnp.mean(output * output)
+
+    grad = jax.grad(
+        lambda q, k, v, g, beta: loss(chunked, q, k, v, g, beta),
+        argnums=(0, 1, 2, 3, 4),
+    )(q, k, v, g, beta)
+    ref_grad = jax.grad(
+        lambda q, k, v, g, beta: loss(api.kimi_delta_attention, q, k, v, g, beta),
+        argnums=(0, 1, 2, 3, 4),
+    )(q, k, v, g, beta)
+
+    chex.assert_trees_all_close(grad, ref_grad, atol=0.02, rtol=0.02)
+
   def test_no_final_state_by_default(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)
     output, final_state = api.kimi_delta_attention(q, k, v, g, beta)
@@ -156,7 +216,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
 
   def test_unsupported_implementation(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)
-    with self.assertRaisesRegex(NotImplementedError, "Only XLA"):
+    with self.assertRaisesRegex(ValueError, "Unknown implementation"):
       with jaxtyping.disable_jaxtyping():
         api.kimi_delta_attention(
             q, k, v, g, beta, implementation="mosaic_tpu"
