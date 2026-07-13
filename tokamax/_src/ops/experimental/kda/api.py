@@ -63,9 +63,7 @@ def kimi_delta_attention(
     safe_gate: bool = True,
     lower_bound: float | None = None,
     disable_recompute: bool = True,
-    return_intermediate_states: bool = False,
     cp_context: Any | None = None,
-    transpose_state_layout: bool = False,
     chunk_size: int = 64,
     N_max: int | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
@@ -98,9 +96,7 @@ def kimi_delta_attention(
     lower_bound: Optional sigmoid-gate lower bound.
     disable_recompute: Pallas custom-VJP recompute policy. XLA reference
       implementations accept it but the mathematical result is unchanged.
-    return_intermediate_states: Reserved Pallas flag.
     cp_context: Optional context-parallel metadata.
-    transpose_state_layout: Reserved Pallas flag.
     chunk_size: Chunk size used by chunked/Pallas implementations and as the
       default static segment bound when `N_max` is omitted.
     N_max: Optional static upper bound for the number of varlen segments.
@@ -144,9 +140,7 @@ def kimi_delta_attention(
           safe_gate=safe_gate,
           lower_bound=lower_bound,
           disable_recompute=disable_recompute,
-          return_intermediate_states=return_intermediate_states,
           cp_context=cp_context,
-          transpose_state_layout=transpose_state_layout,
           chunk_size=chunk_size,
           N_max=N_max,
       )

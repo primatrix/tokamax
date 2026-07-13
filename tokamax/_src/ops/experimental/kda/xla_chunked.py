@@ -71,9 +71,7 @@ class XlaChunkedKimiDeltaAttention(base.KimiDeltaAttention):
       safe_gate: bool,
       lower_bound: float | None,
       disable_recompute: bool,
-      return_intermediate_states: bool,
       cp_context: object | None,
-      transpose_state_layout: bool,
       chunk_size: int,
       N_max: int | None,
       return_residuals: bool,
@@ -86,8 +84,6 @@ class XlaChunkedKimiDeltaAttention(base.KimiDeltaAttention):
         segment_ids is not None
         or use_qk_l2norm_in_kernel
         or use_gate_in_kernel
-        or return_intermediate_states
-        or transpose_state_layout
         or (cp_context is not None and getattr(cp_context, "is_cp_enabled", False))
         or (initial_state is not None and initial_state.shape[1] != 1)
     ):
@@ -108,9 +104,7 @@ class XlaChunkedKimiDeltaAttention(base.KimiDeltaAttention):
           safe_gate=safe_gate,
           lower_bound=lower_bound,
           disable_recompute=disable_recompute,
-          return_intermediate_states=return_intermediate_states,
           cp_context=cp_context,
-          transpose_state_layout=transpose_state_layout,
           chunk_size=chunk_size,
           N_max=N_max,
       )

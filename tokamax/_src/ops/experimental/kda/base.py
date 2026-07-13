@@ -144,9 +144,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       safe_gate: bool = True,
       lower_bound: float | None = None,
       disable_recompute: bool = True,
-      return_intermediate_states: bool = False,
       cp_context: Any | None = None,
-      transpose_state_layout: bool = False,
       chunk_size: int = 64,
       N_max: int | None = None,
       return_residuals: bool = False,
@@ -188,13 +186,6 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       raise ValueError(f"`chunk_size` must be positive, got {chunk_size}.")
     if N_max is not None and N_max <= 0:
       raise ValueError(f"`N_max` must be positive, got {N_max}.")
-    if transpose_state_layout:
-      raise NotImplementedError("`transpose_state_layout` is not supported.")
-    if return_intermediate_states:
-      raise NotImplementedError("`return_intermediate_states` is not supported.")
-    if cp_context is not None and getattr(cp_context, "is_cp_enabled", False):
-      raise NotImplementedError("CP is supported by the Pallas TPU backend.")
-
     _validate_gate_args(
         use_gate_in_kernel=use_gate_in_kernel,
         A_log=A_log,
@@ -225,9 +216,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         safe_gate=safe_gate,
         lower_bound=lower_bound,
         disable_recompute=disable_recompute,
-        return_intermediate_states=return_intermediate_states,
         cp_context=cp_context,
-        transpose_state_layout=transpose_state_layout,
         chunk_size=chunk_size,
         N_max=N_max,
         return_residuals=return_residuals,
@@ -254,9 +243,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       safe_gate: bool,
       lower_bound: float | None,
       disable_recompute: bool,
-      return_intermediate_states: bool,
       cp_context: Any | None,
-      transpose_state_layout: bool,
       chunk_size: int,
       N_max: int | None,
       return_residuals: bool,
@@ -264,12 +251,12 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
   ) -> tuple[Output, Residuals]:
     """Computes KDA with explicit Python loops."""
     del config, return_residuals, safe_gate, disable_recompute
-    del return_intermediate_states, cp_context, transpose_state_layout
 
     heads, batch, seq_len, key_dim = q.shape
     value_dim = v.shape[-1]
     acc_dtype = _accumulator_dtype(q.dtype)
     output_dtype = q.dtype
+    local_seq_len = seq_len
 
     if use_gate_in_kernel:
       g = _activate_gate(
@@ -286,6 +273,29 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
     v_h = v.astype(acc_dtype)
     g_h = g.astype(acc_dtype)
     beta_h = beta.astype(acc_dtype)
+    cp_enabled = cp_context is not None and getattr(
+        cp_context, "is_cp_enabled", False
+    )
+    if cp_enabled:
+      from tokamax._src.ops.experimental.kda.cp_utils import (  # pylint: disable=g-import-not-at-top
+          all_gather_into_tensor,
+      )
+
+      def gather_time_axis(x, axis: int):
+        x_all, _ = all_gather_into_tensor(x, cp_context.axis_name)
+        return jnp.concatenate(
+            [x_all[i] for i in range(x_all.shape[0])], axis=axis
+        )
+
+      q_h = gather_time_axis(q_h, 2)
+      k_h = gather_time_axis(k_h, 2)
+      v_h = gather_time_axis(v_h, 2)
+      g_h = gather_time_axis(g_h, 2)
+      beta_h = gather_time_axis(beta_h, 2)
+      if segment_ids is not None:
+        segment_ids = gather_time_axis(segment_ids, 1)
+      seq_len = q_h.shape[2]
+
     num_states = _state_count(
         segment_ids=segment_ids,
         initial_state=initial_state,
@@ -301,30 +311,55 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       states = states + initial_state.astype(acc_dtype)
 
     output_h = jnp.zeros((heads, batch, seq_len, value_dim), dtype=acc_dtype)
-    for h in range(heads):
-      for b in range(batch):
-        for t in range(seq_len):
-          if segment_ids is None:
-            state_idx = jnp.array(0, dtype=jnp.int32)
-            valid = jnp.array(True)
-          else:
-            seg_id = segment_ids[b, t].astype(jnp.int32)
-            state_idx = jnp.clip(seg_id - 1, 0, num_states - 1)
-            valid = (seg_id > 0) & (seg_id <= num_states)
 
-          state = states[b, state_idx, h]
-          state = state * jnp.exp(g_h[h, b, t])[:, None]
-          prediction = k_h[h, b, t] @ state
-          residual = v_h[h, b, t] - prediction
-          new_state = state + (
-              beta_h[h, b, t] * k_h[h, b, t]
-          )[:, None] * residual[None, :]
-          out_t = q_h[h, b, t] @ new_state
-          output_h = output_h.at[h, b, t].set(
-              jnp.where(valid, out_t, jnp.zeros_like(out_t))
-          )
-          updated_state = jnp.where(valid, new_state, state)
-          states = states.at[b, state_idx, h].set(updated_state)
+    def step_token(h, b, t, carry):
+      states, output_h = carry
+      if segment_ids is None:
+        state_idx = jnp.array(0, dtype=jnp.int32)
+        valid = jnp.array(True)
+      else:
+        seg_id = segment_ids[b, t].astype(jnp.int32)
+        state_idx = jnp.clip(seg_id - 1, 0, num_states - 1)
+        valid = (seg_id > 0) & (seg_id <= num_states)
+
+      state = states[b, state_idx, h]
+      state = state * jnp.exp(g_h[h, b, t])[:, None]
+      prediction = k_h[h, b, t] @ state
+      residual = v_h[h, b, t] - prediction
+      new_state = state + (
+          beta_h[h, b, t] * k_h[h, b, t]
+      )[:, None] * residual[None, :]
+      out_t = q_h[h, b, t] @ new_state
+      output_h = output_h.at[h, b, t].set(
+          jnp.where(valid, out_t, jnp.zeros_like(out_t))
+      )
+      updated_state = jnp.where(valid, new_state, state)
+      states = states.at[b, state_idx, h].set(updated_state)
+      return states, output_h
+
+    def step_head(h, carry):
+      states, output_h = carry
+
+      def body_b(b, b_carry):
+        def body_t(t, t_carry):
+          return step_token(h, b, t, t_carry)
+
+        return jax.lax.fori_loop(0, seq_len, body_t, b_carry)
+
+      states, output_h = jax.lax.fori_loop(
+          0, batch, body_b, (states, output_h)
+      )
+      return states, output_h
+
+    states, output_h = jax.lax.fori_loop(
+        0, heads, step_head, (states, output_h)
+    )
+
+    if cp_enabled:
+      rank = jax.lax.axis_index(cp_context.axis_name)
+      output_h = jax.lax.dynamic_slice_in_dim(
+          output_h, rank * local_seq_len, local_seq_len, axis=2
+      )
 
     output = output_h.astype(output_dtype)
     final_state = states if output_final_state else None

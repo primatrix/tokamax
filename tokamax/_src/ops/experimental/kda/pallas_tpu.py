@@ -44,7 +44,7 @@ from tokamax._src.ops.experimental.kda.utils import (
 from typing_extensions import override
 
 
-_NONDIFF_ARGNUMS = (7, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20)
+_NONDIFF_ARGNUMS = (7, 9, 10, 11, 13, 14, 15, 16, 17, 18)
 
 
 def _l2norm_fwd(x: jax.Array, eps: float = 1e-6):
@@ -187,9 +187,7 @@ def chunk_kda(
     safe_gate: bool = True,
     lower_bound: float | None = None,
     disable_recompute: bool = True,
-    return_intermediate_states: bool = False,
     cp_context: CPContext | None = None,
-    transpose_state_layout: bool = False,
     chunk_size: int = 64,
     N_max: int | None = None,
 ):
@@ -239,9 +237,7 @@ def chunk_kda(
       safe_gate=safe_gate,
       lower_bound=lower_bound,
       disable_recompute=disable_recompute,
-      return_intermediate_states=return_intermediate_states,
       cp_context=cp_context,
-      transpose_state_layout=transpose_state_layout,
       chunk_size=chunk_size,
       cu_seqlens=cu_seqlens,
   )
@@ -267,9 +263,7 @@ def _chunk_kda_fwd_custom(
     safe_gate=True,
     lower_bound=None,
     disable_recompute=True,
-    return_intermediate_states=False,
     cp_context=None,
-    transpose_state_layout=False,
     chunk_size=64,
     N_max=None,
 ):
@@ -371,9 +365,7 @@ def _chunk_kda_fwd_custom(
       safe_gate=safe_gate,
       lower_bound=lower_bound,
       disable_recompute=disable_recompute,
-      return_intermediate_states=return_intermediate_states,
       cp_context=cp_context,
-      transpose_state_layout=transpose_state_layout,
       chunk_size=chunk_size,
       _skip_align=True,
   )
@@ -424,15 +416,13 @@ def _chunk_kda_bwd_custom(
     safe_gate,
     lower_bound,
     disable_recompute,
-    return_intermediate_states,
     cp_context,
-    transpose_state_layout,
     chunk_size,
     N_max,
     residuals,
     grad_outputs,
 ):
-  del output_final_state, return_intermediate_states
+  del output_final_state
   do, dht = grad_outputs
   (
       q,
@@ -504,7 +494,6 @@ def _chunk_kda_bwd_custom(
       dt_bias=dt_bias,
       disable_recompute=disable_recompute,
       cp_context=cp_context,
-      transpose_state_layout=transpose_state_layout,
       segment_ids=segment_ids_aligned if segment_ids_aligned is not None else segment_ids,
   )
   if disable_recompute and h is not None:
@@ -591,9 +580,7 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
       safe_gate: bool,
       lower_bound: float | None,
       disable_recompute: bool,
-      return_intermediate_states: bool,
       cp_context: object | None,
-      transpose_state_layout: bool,
       chunk_size: int,
       N_max: int | None,
       return_residuals: bool,
@@ -631,9 +618,7 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
         safe_gate,
         lower_bound,
         disable_recompute,
-        return_intermediate_states,
         cp_context,
-        transpose_state_layout,
         chunk_size,
         N_max,
     )

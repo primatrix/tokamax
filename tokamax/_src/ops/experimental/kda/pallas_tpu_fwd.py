@@ -7970,9 +7970,7 @@ def chunk_kda_fwd(
   A_log: jax.Array | None = None,
   dt_bias: jax.Array | None = None,
   disable_recompute: bool = False,
-  return_intermediate_states: bool = False,
   cp_context: CPContext | None = None,
-  transpose_state_layout: bool = False,
   _skip_align: bool = False,
   segment_ids: jax.Array | None = None,
 ):
@@ -8015,10 +8013,7 @@ def chunk_kda_fwd(
       dt_bias: [H*K] or None  -- bias added to g before gate activation.
       disable_recompute: bool -- True: keep intermediates (w, u, kg, etc.).
                                  False: release them to save memory.
-      return_intermediate_states: bool -- whether to keep per-chunk h.
       cp_context: CPContext or None -- context parallelism metadata.
-      transpose_state_layout: bool -- whether to transpose hidden state
-                                      layout. Not yet supported in Pallas.
 
   Returns:
       12-tuple matching FLA's ``chunk_kda_fwd``:
@@ -8051,12 +8046,6 @@ def chunk_kda_fwd(
   # --- Unsupported parameters ---
   assert use_qk_l2norm_in_kernel is False, (
     "use_qk_l2norm_in_kernel not yet supported in Pallas"
-  )
-  assert not transpose_state_layout, (
-    "transpose_state_layout not yet supported in Pallas"
-  )
-  assert not return_intermediate_states, (
-    "return_intermediate_states not yet supported in Pallas"
   )
 
   # Context Parallel (CP) dispatch flag. The actual constraints
@@ -8271,7 +8260,7 @@ def chunk_kda_fwd(
   # the intermediate h [B,NT,H,K,V] and v_new [B,T,H,V] HBM tensors.
   # When disable_recompute=True we additionally spill h/v_new for bwd reuse.
   # Non-varlen path keeps the unfused two-kernel chain.
-  if cu_seqlens is not None and not return_intermediate_states:
+  if cu_seqlens is not None:
     o, final_state, h_fused, v_new_fused = chunk_kda_fwd_h_o_varlen(
       w=w,
       u=u,
@@ -8347,11 +8336,7 @@ def chunk_kda_fwd(
   # ------------------------------------------------------------------
   if not disable_recompute:
     w, u, qg, kg, v_new = None, None, None, None, None
-    # Keep ``h`` only when downstream consumer needs it:
-    #   - return_intermediate_states (public API knob)
-    #   - disable_recompute=True is already handled above
-    if not return_intermediate_states:
-      h = None
+    h = None
     if use_gate_in_kernel:
       g_cumsum = None
 

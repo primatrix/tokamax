@@ -7049,7 +7049,6 @@ def chunk_gated_delta_rule_bwd_dhu_kernel(
     "safe_gate",
     "lower_bound",
     "use_gate_in_kernel",
-    "transpose_state_layout",
     "disable_recompute",
     "cp_context",
     "N_max",
@@ -7078,7 +7077,6 @@ def chunk_kda_bwd(
   dt_bias: jax.Array | None = None,
   disable_recompute: bool = False,
   cp_context: CPContext | None = None,
-  transpose_state_layout: bool = False,
   N_max: int | None = None,
   **kwargs,
 ):
@@ -7167,7 +7165,6 @@ def chunk_kda_bwd(
     assert_shape(g, (H, B, T, K), "g")
   assert T % BT == 0, f"T={T} must be divisible by chunk_size={BT}"
   _cp_active = cp_context is not None and cp_context.is_cp_enabled
-  assert transpose_state_layout is False, "not support transpose_state_layout yet"
 
   # ============= assert input shapes and static properties =============
   # initial_state/dht: [B, H, K, V] (non-varlen) or [N, H, K, V] (varlen)
