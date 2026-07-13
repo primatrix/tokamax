@@ -27,7 +27,7 @@ from typing_extensions import override
 _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
 Output: TypeAlias = tuple[jax.Array, jax.Array | None]
-Residuals: TypeAlias = None
+Residuals: TypeAlias = Any
 
 
 def _accumulator_dtype(dtype: jax.typing.DTypeLike) -> jnp.dtype:

@@ -84,8 +84,10 @@ variable-length inputs use a Pallas kernel with vectorised Hillis-Steele
 prefix scan.
 """
 
+import dataclasses
 import functools
 import math
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -93,6 +95,7 @@ import jax.experimental.pallas as pl
 from jax.experimental.pallas import dslice
 from jax.experimental.pallas import tpu as pltpu
 
+from tokamax._src.ops import op
 from tokamax._src.ops.experimental.kda.utils import (
     export_public,
     get_interpret,
@@ -7529,3 +7532,88 @@ def chunk_kda_bwd_custom(
       dh0,
       None,
   )
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PallasTpuKimiDeltaAttentionVjp(op.Op[Any, dict[str, Any], None, Any, Any]):
+  """Tokamax Op VJP wrapper for the Pallas TPU KDA backward path."""
+
+  def _fwd(
+      self,
+      residuals,
+      out,
+      dout,
+      q,
+      k,
+      v,
+      g,
+      beta,
+      *,
+      A_log,
+      dt_bias,
+      scale,
+      initial_state,
+      output_final_state,
+      use_qk_l2norm_in_kernel,
+      use_gate_in_kernel,
+      segment_ids,
+      safe_gate,
+      lower_bound,
+      disable_recompute,
+      cp_context,
+      chunk_size,
+      N_max,
+      return_residuals,
+      config,
+  ):
+    del self, out, q, k, v, g, beta, return_residuals, config
+
+    (
+        dq,
+        dk,
+        dv,
+        dg,
+        db,
+        dA,
+        dbias,
+        dh0,
+        dsegment_ids,
+    ) = chunk_kda_bwd_custom(
+        scale,
+        output_final_state,
+        use_qk_l2norm_in_kernel,
+        use_gate_in_kernel,
+        safe_gate,
+        lower_bound,
+        disable_recompute,
+        cp_context,
+        chunk_size,
+        N_max,
+        residuals,
+        dout,
+    )
+
+    grads = {
+        "q": dq,
+        "k": dk,
+        "v": dv,
+        "g": dg,
+        "beta": db,
+    }
+    if A_log is not None:
+      grads["A_log"] = dA if dA is not None else jnp.zeros_like(A_log)
+    if dt_bias is not None:
+      grads["dt_bias"] = (
+          dbias if dbias is not None else jnp.zeros_like(dt_bias)
+      )
+    if initial_state is not None:
+      grads["initial_state"] = (
+          dh0 if dh0 is not None else jnp.zeros_like(initial_state)
+      )
+    if segment_ids is not None:
+      grads["segment_ids"] = (
+          dsegment_ids
+          if dsegment_ids is not None
+          else jnp.zeros_like(segment_ids)
+      )
+    return grads, None

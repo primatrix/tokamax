@@ -7232,7 +7232,6 @@ Mirrors the four-stage pipeline of FLA's ``chunk_kda_fwd`` from
 
 import functools
 import math
-import os
 
 import jax
 import jax.numpy as jnp
@@ -7240,7 +7239,9 @@ import numpy as np
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 
+from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.kda.utils import get_tpu_config
 from tokamax._src.ops.experimental.kda.cp_utils import (
   CPContext,
@@ -7265,54 +7266,6 @@ from tokamax._src.ops.experimental.kda.utils import (
 )
 
 _RCP_LN2 = 1.0 / math.log(2)
-
-
-# =====================================================================
-# === DEBUG: KDA NaN/Inf probe — default OFF, opt-in via env var ======
-# Enable with KDA_DEBUG_NAN=1. When disabled, _probe() is a no-op and
-# adds zero runtime cost (no jax.debug.print dispatches).
-# Probes are inserted ONLY at HBM tensor boundaries in chunk_kda_fwd
-# (kernel inputs/outputs). They do NOT modify any computation, do NOT
-# enter Pallas kernel bodies.
-# =====================================================================
-_KDA_DEBUG_NAN = os.environ.get("KDA_DEBUG_NAN", "0") == "1"
-
-
-def _probe(name: str, x):
-  """Print NaN/Inf summary statistics of an HBM tensor at runtime.
-
-  Uses jax.debug.print so it works inside jit / custom_vjp without
-  breaking lowering. Must NEVER be called from inside a Pallas kernel
-  body (TPU lowering does not support host callbacks).
-
-  Args:
-      name: Short label printed alongside the stats (≤30 chars recommended).
-      x:    A JAX array on HBM, or None (in which case probe is skipped).
-  """
-  if not _KDA_DEBUG_NAN or x is None:
-    return
-  x_f32 = x.astype(jnp.float32)
-  is_nan = jnp.isnan(x_f32)
-  is_inf = jnp.isinf(x_f32)
-  is_fin = jnp.isfinite(x_f32)
-  n_nan = is_nan.sum()
-  n_inf = is_inf.sum()
-  finite = jnp.where(is_fin, x_f32, 0.0)
-  f_min = jnp.where(is_fin, x_f32, jnp.inf).min()
-  f_max = jnp.where(is_fin, x_f32, -jnp.inf).max()
-  abs_max = jnp.abs(finite).max()
-  jax.debug.print(
-    "[KDA-PROBE] {n:32s} shape={s} dtype={d} | nan={nn} inf={ni} | "
-    "fin_min={mn:.4e} fin_max={mx:.4e} abs_max={am:.4e}",
-    n=name,
-    s=x.shape,
-    d=x.dtype.name,
-    nn=n_nan,
-    ni=n_inf,
-    mn=f_min,
-    mx=f_max,
-    am=abs_max,
-  )
 
 
 def pallas_kda_gate_cumsum(
@@ -7959,28 +7912,29 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
   return o[:, :, gather_idx]
 
 
+@jaxtyping.jaxtyped
 def chunk_kda_fwd(
-  q: jax.Array,
-  k: jax.Array,
-  v: jax.Array,
-  g: jax.Array,
-  beta: jax.Array,
+  q: Float[Array, "H B T K"],
+  k: Float[Array, "H B T K"],
+  v: Float[Array, "H B T V"],
+  g: Float[Array, "H B T K"],
+  beta: Float[Array, "H B T"],
   scale: float,
-  initial_state: jax.Array,
+  initial_state: Float[Array, "B N H K V"] | None,
   output_final_state: bool,
   use_qk_l2norm_in_kernel: bool = False,
-  cu_seqlens: jax.Array | None = None,
-  chunk_indices: jax.Array | None = None,
+  cu_seqlens: Int[Array, "B N_MAX"] | None = None,
+  chunk_indices: Int[Array, "B NT 2"] | None = None,
   chunk_size: int = 64,
   safe_gate: bool = True,
   lower_bound: float | None = None,
   use_gate_in_kernel: bool = False,
-  A_log: jax.Array | None = None,
-  dt_bias: jax.Array | None = None,
+  A_log: Float[Array, "H"] | None = None,
+  dt_bias: Float[Array, "H*K"] | None = None,
   disable_recompute: bool = False,
   cp_context: CPContext | None = None,
   _skip_align: bool = False,
-  segment_ids: jax.Array | None = None,
+  segment_ids: Int[Array, "B T"] | None = None,
 ):
   """KDA chunked forward pass using Neumann intra-chunk approximation.
 
@@ -8035,26 +7989,9 @@ def chunk_kda_fwd(
   V = v.shape[-1]
   BT = chunk_size
 
-  # === DEBUG: Stage 0 — input tensors ===========================
-  _probe("0a.in.q", q)
-  _probe("0b.in.k", k)
-  _probe("0c.in.v", v)
-  _probe("0d.in.g_raw", g)
-  _probe("0e.in.beta", beta)
-  if A_log is not None:
-    _probe("0f.in.A_log", A_log)
-    # Critical: exp(A_log) overflow risk (issue #1 in NaN report)
-    _probe("0g.in.exp(A_log)", jnp.exp(A_log.astype(jnp.float32)))
-  if dt_bias is not None:
-    _probe("0h.in.dt_bias", dt_bias)
-  if initial_state is not None:
-    _probe("0i.in.initial_state", initial_state)
-  # === END DEBUG ===============================================
-
-  # --- Unsupported parameters ---
-  assert use_qk_l2norm_in_kernel is False, (
-    "use_qk_l2norm_in_kernel not yet supported in Pallas"
-  )
+  if use_qk_l2norm_in_kernel:
+    q, _ = l2norm_fwd(q)
+    k, _ = l2norm_fwd(k)
 
   # Context Parallel (CP) dispatch flag. The actual constraints
   # (initial_state / output_final_state / cu_seqlens) are enforced at the
@@ -8070,11 +8007,6 @@ def chunk_kda_fwd(
       _seg1d = segment_ids[0] if segment_ids.ndim == 2 else segment_ids
       cu_seqlens = segment_ids_to_seqlens(_seg1d, max_segs=cdiv(T, BT))
 
-  assert_shape(q, (H, B, T, K), "q")
-  assert_shape(k, (H, B, T, K), "k")
-  assert_shape(v, (H, B, T, V), "v")
-  assert_shape(g, (H, B, T, K), "g")
-  assert_shape(beta, (H, B, T), "beta")
   N = cu_seqlens.shape[-1] - 1 if cu_seqlens is not None else B
   # When segment_ids produces cu_seqlens padded to max_segs, N_padded may
   # exceed the actual number of segments in initial_state.  Pad with zeros
@@ -8162,18 +8094,6 @@ def chunk_kda_fwd(
     use_gate_in_kernel=use_gate_in_kernel,
     lower_bound=lower_bound,
   )
-
-  # === DEBUG: Stage 1+2 — fused gate cumsum + intra-chunk solve ==
-  _probe("1a.s12.g_cumsum", g_cumsum)
-  _g_step = g_cumsum[:, 1:] - g_cumsum[:, :-1]
-  _probe("1b.s12.g_cumsum.step_diff", _g_step)
-  _probe("2a.s12.w", w)
-  _probe("2b.s12.u", u)
-  _probe("2c.s12.qg", qg)
-  _probe("2d.s12.kg", kg)
-  _probe("2e.s12.Aqk", Aqk)
-  _probe("2f.s12.Akk", Akk)
-  # === END DEBUG ===============================================
 
   # ------------------------------------------------------------------
   # Stage CP (between Stage 1+2 and Stage 3): pre-process + all-gather +
@@ -8291,11 +8211,6 @@ def chunk_kda_fwd(
     h = h_fused
     v_new = v_new_fused
 
-    # === DEBUG: Stage 3+4 — fused output =========================
-    _probe("4.s4.o", o)
-    if final_state is not None:
-      _probe("3c.s3.final_state", final_state)
-    # === END DEBUG ===============================================
   else:
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
       k=kg,
@@ -8310,13 +8225,6 @@ def chunk_kda_fwd(
       _chunk_indices=chunk_indices if cu_seqlens is not None else None,
     )
 
-    # === DEBUG: Stage 3 — inter-chunk state ======================
-    _probe("3a.s3.h", h)
-    _probe("3b.s3.v_new", v_new)
-    if final_state is not None:
-      _probe("3c.s3.final_state", final_state)
-    # === END DEBUG ===============================================
-
     o = chunk_gla_fwd_o_gk(
       q=q,
       v=v_new,
@@ -8329,10 +8237,6 @@ def chunk_kda_fwd(
       _cu_seqlens=cu_seqlens,
       _chunk_indices=chunk_indices if cu_seqlens is not None else None,
     )
-
-    # === DEBUG: Stage 4 — output =================================
-    _probe("4.s4.o", o)
-    # === END DEBUG ===============================================
 
   # Unalign output (input was padded by _align_seqs; scatter wrote to
   # aligned positions, now map back to original cu_seqlens layout).

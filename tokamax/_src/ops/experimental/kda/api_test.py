@@ -241,7 +241,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
   def test_pallas_tpu_registered_and_falls_back_to_xla(self):
     q, k, v, g, beta, initial_state = _make_inputs(jnp.float32)
     self.assertIn("pallas_tpu", api.IMPLEMENTATIONS)
-    self.assertIsNone(api.IMPLEMENTATIONS["pallas_tpu"].vjp)
+    self.assertIsNotNone(api.IMPLEMENTATIONS["pallas_tpu"].vjp)
 
     output, final_state = api.kimi_delta_attention(
         q,

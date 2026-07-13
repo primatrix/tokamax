@@ -46,45 +46,6 @@ def l2norm_bwd(y: jax.Array, rstd: jax.Array, dy: jax.Array):
   dx = dy_f * rstd_f[..., None] - dot_dy_y[..., None] * y_f * rstd_f[..., None]
   return dx.astype(y.dtype)
 
-def normalize_initial_state(
-    initial_state: jax.Array | None,
-    *,
-    batch: int,
-    heads: int,
-    key_dim: int,
-    value_dim: int,
-) -> jax.Array | None:
-  if initial_state is None:
-    return None
-  if initial_state.ndim != 5:
-    raise ValueError(
-        "`initial_state` must have shape [B, N, H, K, V]; got "
-        f"{initial_state.shape}."
-    )
-  if initial_state.shape[0] != batch:
-    raise ValueError(
-        f"`initial_state` batch dimension must be {batch}; got {initial_state.shape}."
-    )
-  if initial_state.shape[2:] != (heads, key_dim, value_dim):
-    raise ValueError(
-        "`initial_state` trailing dimensions must be "
-        f"{(heads, key_dim, value_dim)}; got {initial_state.shape[2:]}."
-    )
-  return initial_state
-
-
-def as_public_final_state(
-    final_state: jax.Array | None,
-    *,
-    segment_ids: jax.Array | None,
-) -> jax.Array | None:
-  if final_state is None:
-    return None
-  if final_state.ndim == 4 and segment_ids is None:
-    return final_state[:, None]
-  return final_state
-
-
 def derive_cp_context(
     *,
     q: jax.Array,

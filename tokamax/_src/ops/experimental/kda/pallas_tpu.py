@@ -15,7 +15,6 @@
 """Experimental Pallas TPU implementation of Kimi Delta Attention."""
 
 import dataclasses
-import functools
 from typing import Any
 
 import jax
@@ -23,9 +22,8 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.kda import base
-from tokamax._src.ops.experimental.kda.cp_utils import CPContext
 from tokamax._src.ops.experimental.kda.pallas_tpu_bwd import (
-    chunk_kda_bwd_custom,
+    PallasTpuKimiDeltaAttentionVjp,
 )
 from tokamax._src.ops.experimental.kda.pallas_tpu_fwd import (
     chunk_kda_fwd_custom,
@@ -34,44 +32,34 @@ from tokamax._src.ops.experimental.kda.pallas_tpu_fwd import (
 from tokamax._src.ops.experimental.kda.utils import (
     as_public_final_state,
     derive_cp_context,
-    l2norm_fwd,
-    normalize_initial_state,
     segment_ids_to_cu_seqlens,
 )
 from typing_extensions import override
 
 
-_NONDIFF_ARGNUMS = (7, 9, 10, 11, 13, 14, 15, 16, 17, 18)
-
-
-@functools.partial(jax.custom_vjp, nondiff_argnums=_NONDIFF_ARGNUMS)
-def chunk_kda(
+def _chunk_kda_fwd_no_residuals(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
     g: jax.Array,
     beta: jax.Array,
-    A_log: jax.Array | None = None,
-    dt_bias: jax.Array | None = None,
-    scale: float | None = None,
-    initial_state: jax.Array | None = None,
-    output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = False,
-    use_gate_in_kernel: bool = False,
-    segment_ids: jax.Array | None = None,
-    safe_gate: bool = True,
-    lower_bound: float | None = None,
-    disable_recompute: bool = True,
-    cp_context: CPContext | None = None,
-    chunk_size: int = 64,
-    N_max: int | None = None,
-):
-  """Head-first chunk KDA with pallas-kernel custom VJP."""
-  H, B, T, K = q.shape
-  V = v.shape[-1]
-  initial_state = normalize_initial_state(
-      initial_state, batch=B, heads=H, key_dim=K, value_dim=V
-  )
+    *,
+    A_log: jax.Array | None,
+    dt_bias: jax.Array | None,
+    scale: float,
+    initial_state: jax.Array | None,
+    output_final_state: bool,
+    use_qk_l2norm_in_kernel: bool,
+    use_gate_in_kernel: bool,
+    segment_ids: jax.Array | None,
+    safe_gate: bool,
+    lower_bound: float | None,
+    disable_recompute: bool,
+    cp_context: object | None,
+    chunk_size: int,
+    N_max: int | None,
+) -> base.Output:
+  """Runs Pallas forward without materialising Tokamax VJP residuals."""
   cp_context, cu_seqlens = derive_cp_context(
       q=q,
       segment_ids=segment_ids,
@@ -87,12 +75,8 @@ def chunk_kda(
         initial_state=initial_state,
         chunk_size=chunk_size,
         N_max=N_max,
-        seq_len=T,
+        seq_len=q.shape[2],
   )
-  actual_scale = scale if scale is not None else K**-0.5
-  if use_qk_l2norm_in_kernel:
-    q, _ = l2norm_fwd(q)
-    k, _ = l2norm_fwd(k)
 
   output, final_state, *_ = chunk_kda_fwd(
       q,
@@ -102,10 +86,10 @@ def chunk_kda(
       beta,
       A_log=A_log,
       dt_bias=dt_bias,
-      scale=actual_scale,
+      scale=scale,
       initial_state=initial_state,
       output_final_state=output_final_state,
-      use_qk_l2norm_in_kernel=False,
+      use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,  # chunk_kda_fwd_custom need
       use_gate_in_kernel=use_gate_in_kernel,
       segment_ids=segment_ids,
       safe_gate=safe_gate,
@@ -120,9 +104,6 @@ def chunk_kda(
   )
 
 
-chunk_kda.defvjp(chunk_kda_fwd_custom, chunk_kda_bwd_custom)
-
-
 @dataclasses.dataclass(frozen=True)
 class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
   """Pallas TPU KDA backend.
@@ -132,6 +113,10 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
   """
 
   chunk_size: int = 64
+
+  def __post_init__(self):
+    if self.vjp is None:
+      object.__setattr__(self, "vjp", PallasTpuKimiDeltaAttentionVjp())
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
@@ -164,7 +149,7 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
       return_residuals: bool,
       config: Any,
   ) -> tuple[base.Output, base.Residuals]:
-    del config, return_residuals  # Unused.
+    del config
 
     if q.dtype not in (jnp.bfloat16, jnp.float32):
       raise NotImplementedError(
@@ -179,26 +164,49 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
           f"`chunk_size`; got T={q.shape[2]}, chunk_size={chunk_size}."
       )
 
-    output, final_state = chunk_kda(
+    if return_residuals:
+      return chunk_kda_fwd_custom(
+          q,
+          k,
+          v,
+          g,
+          beta,
+          A_log=A_log,
+          dt_bias=dt_bias,
+          scale=scale,
+          initial_state=initial_state,
+          output_final_state=output_final_state,
+          use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+          use_gate_in_kernel=use_gate_in_kernel,
+          segment_ids=segment_ids,
+          safe_gate=safe_gate,
+          lower_bound=lower_bound,
+          disable_recompute=disable_recompute,
+          cp_context=cp_context,
+          chunk_size=chunk_size,
+          N_max=N_max,
+      )
+
+    output, final_state = _chunk_kda_fwd_no_residuals(
         q,
         k,
         v,
         g,
         beta,
-        A_log,
-        dt_bias,
-        scale,
-        initial_state,
-        output_final_state,
-        use_qk_l2norm_in_kernel,
-        use_gate_in_kernel,
-        segment_ids,
-        safe_gate,
-        lower_bound,
-        disable_recompute,
-        cp_context,
-        chunk_size,
-        N_max,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        segment_ids=segment_ids,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+        disable_recompute=disable_recompute,
+        cp_context=cp_context,
+        chunk_size=chunk_size,
+        N_max=N_max,
     )
 
     return (output.astype(q.dtype), final_state), None
