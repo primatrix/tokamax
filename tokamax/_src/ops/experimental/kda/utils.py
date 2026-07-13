@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 import os
 
 import jax
 import jax.numpy as jnp
+from tokamax._src.ops.experimental.kda.cp_utils import (
+    CPContext,
+    _derive_cp_metadata_from_segment_ids,
+)
 
 
 def exp(x):
@@ -25,6 +30,121 @@ def get_interpret() -> bool:
 
 def cdiv(x, y: int):
   return (x + y - 1) // y
+
+
+def l2norm_fwd(x: jax.Array, eps: float = 1e-6):
+  x_f = x.astype(jnp.float32)
+  rstd = jax.lax.rsqrt(jnp.sum(x_f * x_f, axis=-1) + eps)
+  return (x_f * rstd[..., None]).astype(x.dtype), rstd.astype(jnp.float32)
+
+
+def l2norm_bwd(y: jax.Array, rstd: jax.Array, dy: jax.Array):
+  y_f = y.astype(jnp.float32)
+  dy_f = dy.astype(jnp.float32)
+  rstd_f = rstd.astype(jnp.float32)
+  dot_dy_y = jnp.sum(dy_f * y_f, axis=-1)
+  dx = dy_f * rstd_f[..., None] - dot_dy_y[..., None] * y_f * rstd_f[..., None]
+  return dx.astype(y.dtype)
+
+def normalize_initial_state(
+    initial_state: jax.Array | None,
+    *,
+    batch: int,
+    heads: int,
+    key_dim: int,
+    value_dim: int,
+) -> jax.Array | None:
+  if initial_state is None:
+    return None
+  if initial_state.ndim != 5:
+    raise ValueError(
+        "`initial_state` must have shape [B, N, H, K, V]; got "
+        f"{initial_state.shape}."
+    )
+  if initial_state.shape[0] != batch:
+    raise ValueError(
+        f"`initial_state` batch dimension must be {batch}; got {initial_state.shape}."
+    )
+  if initial_state.shape[2:] != (heads, key_dim, value_dim):
+    raise ValueError(
+        "`initial_state` trailing dimensions must be "
+        f"{(heads, key_dim, value_dim)}; got {initial_state.shape[2:]}."
+    )
+  return initial_state
+
+
+def as_public_final_state(
+    final_state: jax.Array | None,
+    *,
+    segment_ids: jax.Array | None,
+) -> jax.Array | None:
+  if final_state is None:
+    return None
+  if final_state.ndim == 4 and segment_ids is None:
+    return final_state[:, None]
+  return final_state
+
+
+def derive_cp_context(
+    *,
+    q: jax.Array,
+    segment_ids: jax.Array | None,
+    initial_state: jax.Array | None,
+    output_final_state: bool,
+    cp_context: CPContext | None,
+    chunk_size: int,
+    N_max: int | None,
+) -> tuple[CPContext | None, jax.Array | None]:
+  cu_seqlens = None
+  if cp_context is None or not cp_context.is_cp_enabled:
+    return cp_context, cu_seqlens
+
+  if initial_state is not None:
+    raise ValueError("`initial_state` is not supported when CP is enabled.")
+  if output_final_state:
+    raise ValueError("`output_final_state` is not supported when CP is enabled.")
+  if segment_ids is None:
+    raise ValueError("CP requires rank-local `segment_ids` with shape [B, T].")
+
+  n_max = N_max if N_max is not None else cdiv(q.shape[2], chunk_size)
+  cu_locals, chain_metas = [], []
+  for b in range(segment_ids.shape[0]):
+    cu_b, meta_b = _derive_cp_metadata_from_segment_ids(
+        segment_ids[b],
+        cp_context.axis_name,
+        n_max=n_max,
+    )
+    cu_locals.append(cu_b)
+    chain_metas.append(meta_b)
+  cu_seqlens = jnp.stack(cu_locals, axis=0)
+  chain_meta = {k: jnp.stack([m[k] for m in chain_metas]) for k in chain_metas[0]}
+  cp_context = dataclasses.replace(
+      cp_context,
+      is_first_rank=chain_meta["is_first_rank"],
+      is_last_rank=chain_meta["is_last_rank"],
+      pre_num_ranks=chain_meta["pre_num_ranks"],
+      post_num_ranks=chain_meta["post_num_ranks"],
+  )
+  return cp_context, cu_seqlens
+
+
+def segment_ids_to_cu_seqlens(
+    segment_ids: jax.Array | None,
+    *,
+    initial_state: jax.Array | None,
+    chunk_size: int,
+    N_max: int | None,
+    seq_len: int,
+) -> tuple[jax.Array | None, int | None]:
+  if segment_ids is None:
+    return None, N_max
+  if N_max is None:
+    N_max = (
+        initial_state.shape[1]
+        if initial_state is not None
+        else cdiv(seq_len, chunk_size)
+    )
+  return segment_ids_to_seqlens(segment_ids, max_segs=N_max), N_max
 
 
 def align_up(x, align: int):

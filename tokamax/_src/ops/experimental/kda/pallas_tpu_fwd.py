@@ -1751,7 +1751,7 @@ def chunk_fwd_h_kernel_varlen(
         in_specs.append(pl.BlockSpec((1, BT, BK), gk_index_map))
     else:
         in_specs.append(None)
-    
+
     if g_gamma is not None:
         in_specs.append(pl.BlockSpec(memory_space=pltpu.SMEM))
     else:
@@ -7237,6 +7237,7 @@ import os
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -7247,12 +7248,19 @@ from tokamax._src.ops.experimental.kda.cp_utils import (
   all_gather_into_tensor,
 )
 from tokamax._src.ops.experimental.kda.utils import (
+  align_segment_ids,
   align_up,
+  as_public_final_state,
   assert_shape,
   assert_shape_or_none,
   cdiv,
+  compute_padded_cu_seqlens,
+  derive_cp_context,
   get_interpret,
+  l2norm_fwd,
+  normalize_initial_state,
   prepare_chunk_indices,
+  segment_ids_to_cu_seqlens,
   segment_ids_to_seqlens,
 )
 
@@ -8341,3 +8349,164 @@ def chunk_kda_fwd(
       g_cumsum = None
 
   return o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h, initial_state
+
+
+def chunk_kda_fwd_custom(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    A_log=None,
+    dt_bias=None,
+    scale=None,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    use_gate_in_kernel=False,
+    segment_ids=None,
+    safe_gate=True,
+    lower_bound=None,
+    disable_recompute=True,
+    cp_context=None,
+    chunk_size=64,
+    N_max=None,
+):
+  H, B, T, K = q.shape
+  V = v.shape[-1]
+  initial_state = normalize_initial_state(
+      initial_state, batch=B, heads=H, key_dim=K, value_dim=V
+  )
+
+  cp_context, cu_seqlens = derive_cp_context(
+      q=q,
+      segment_ids=segment_ids,
+      initial_state=initial_state,
+      output_final_state=output_final_state,
+      cp_context=cp_context,
+      chunk_size=chunk_size,
+      N_max=N_max,
+  )
+  if cu_seqlens is None:
+    cu_seqlens, N_max = segment_ids_to_cu_seqlens(
+        segment_ids,
+        initial_state=initial_state,
+        chunk_size=chunk_size,
+        N_max=N_max,
+        seq_len=T,
+    )
+  actual_scale = scale if scale is not None else K**-0.5
+
+  ori_cu_seqlens = cu_seqlens
+  aligned_cu = None
+  if cu_seqlens is not None:
+    [q_a, k_a, v_a, g_a], [beta_a], aligned_cu, _ = _align_seqs(
+        [q, k, v, g],
+        [beta],
+        cu_seqlens,
+        align=chunk_size,
+    )
+    aligned_cu = compute_padded_cu_seqlens(ori_cu_seqlens, chunk_size)
+    if use_gate_in_kernel:
+      T_a = g_a.shape[2]
+      orig_lens = jnp.diff(cu_seqlens, axis=-1)
+      aligned_starts = aligned_cu[..., :-1]
+      pos = jnp.arange(T_a)
+      for b in range(cu_seqlens.shape[0]):
+        in_range = (pos[None, :] >= aligned_starts[b, :, None]) & (
+            pos[None, :] < (aligned_starts[b] + orig_lens[b])[:, None]
+        )
+        valid_mask = in_range.any(axis=0)
+        g_a = g_a.at[:, b].set(
+            jnp.where(valid_mask[None, :, None], g_a[:, b], -1e4)
+        )
+  else:
+    q_a, k_a, v_a, g_a, beta_a = q, k, v, g, beta
+
+  segment_ids_aligned = None
+  if cu_seqlens is not None and segment_ids is not None:
+    segment_ids_aligned = jnp.stack(
+        [
+            align_segment_ids(segment_ids[b], N_max, chunk_size)
+            for b in range(segment_ids.shape[0])
+        ]
+    )
+
+  if use_qk_l2norm_in_kernel:
+    q_hat, rstd_q = l2norm_fwd(q_a)
+    k_hat, rstd_k = l2norm_fwd(k_a)
+  else:
+    q_hat, k_hat = q_a, k_a
+    rstd_q = rstd_k = None
+
+  (
+      output,
+      final_state,
+      g_cumsum,
+      Aqk,
+      Akk,
+      _w,
+      _u,
+      _qg,
+      _kg,
+      _v_new,
+      h,
+      initial_state,
+  ) = chunk_kda_fwd(
+      q_hat,
+      k_hat,
+      v_a,
+      g_a,
+      beta_a,
+      A_log=A_log,
+      dt_bias=dt_bias,
+      scale=actual_scale,
+      initial_state=initial_state,
+      output_final_state=output_final_state,
+      use_qk_l2norm_in_kernel=False,
+      use_gate_in_kernel=use_gate_in_kernel,
+      cu_seqlens=aligned_cu,
+      safe_gate=safe_gate,
+      lower_bound=lower_bound,
+      disable_recompute=disable_recompute,
+      cp_context=cp_context,
+      chunk_size=chunk_size,
+      _skip_align=True,
+  )
+
+  if aligned_cu is not None:
+    output = _unalign_output(output, ori_cu_seqlens, aligned_cu, T)
+
+  g_org = g_a if use_gate_in_kernel else None
+  g_cumsum = checkpoint_name(g_cumsum, "kda_residuals")
+  Aqk = checkpoint_name(Aqk, "kda_residuals")
+  Akk = checkpoint_name(Akk, "kda_residuals")
+  if disable_recompute and h is not None:
+    h = checkpoint_name(h, "kda_residuals")
+
+  residuals = (
+      q_hat,
+      k_hat,
+      v_a,
+      beta_a,
+      g_cumsum,
+      Aqk,
+      Akk,
+      initial_state,
+      g_org,
+      A_log,
+      dt_bias,
+      h,
+      jnp.zeros((), dtype=g.dtype),
+      rstd_q,
+      rstd_k,
+      ori_cu_seqlens,
+      aligned_cu,
+      segment_ids_aligned,
+      segment_ids,
+      initial_state is not None,
+  )
+  return (
+      output.astype(q.dtype),
+      as_public_final_state(final_state, segment_ids=segment_ids),
+  ), residuals

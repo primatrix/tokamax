@@ -1751,7 +1751,7 @@ def chunk_fwd_h_kernel_varlen(
         in_specs.append(pl.BlockSpec((1, BT, BK), gk_index_map))
     else:
         in_specs.append(None)
-    
+
     if g_gamma is not None:
         in_specs.append(pl.BlockSpec(memory_space=pltpu.SMEM))
     else:
@@ -5930,6 +5930,7 @@ def fused_dhu_wy_intra_cumsum_pallas(
 # KDA chunked backward orchestrator
 # =============================================================================
 
+import dataclasses
 import math
 import jax.numpy as jnp
 import jax
@@ -5947,10 +5948,22 @@ from tokamax._src.ops.experimental.kda.utils import (
     align_up,
     assert_shape_or_none,
     cdiv,
+    compute_padded_cu_seqlens,
     get_interpret,
+    l2norm_bwd,
+    prepare_chunk_indices,
     segment_ids_to_seqlens,
 )
-from tokamax._src.ops.experimental.kda.cp_utils import CPContext, _merge_dht, all_gather_into_tensor
+from tokamax._src.ops.experimental.kda.cp_utils import (
+    CPContext,
+    _derive_cp_metadata_from_segment_ids,
+    _merge_dht,
+    all_gather_into_tensor,
+)
+from tokamax._src.ops.experimental.kda.pallas_tpu_fwd import (
+    _align_seqs,
+    _unalign_output,
+)
 from jax.experimental.pallas import tpu as pltpu
 import functools
 
@@ -7382,3 +7395,137 @@ def chunk_kda_bwd(
     dh0 = dh0[:, 0]
 
   return dq, dk, dv, db, dg, dh0, dA, dbias
+
+
+def chunk_kda_bwd_custom(
+    scale,
+    output_final_state,
+    use_qk_l2norm_in_kernel,
+    use_gate_in_kernel,
+    safe_gate,
+    lower_bound,
+    disable_recompute,
+    cp_context,
+    chunk_size,
+    N_max,
+    residuals,
+    grad_outputs,
+):
+  del output_final_state
+  do, dht = grad_outputs
+  (
+      q,
+      k,
+      v,
+      beta,
+      g_cumsum,
+      Aqk,
+      Akk,
+      initial_state,
+      g_org,
+      A_log,
+      dt_bias,
+      h,
+      g_dtype_marker,
+      rstd_q,
+      rstd_k,
+      ori_cu_seqlens,
+      aligned_cu,
+      segment_ids_aligned,
+      segment_ids,
+      has_initial_state,
+  ) = residuals
+
+  cu_seqlens_bwd = None
+  chunk_indices_bwd = None
+  T_orig = None
+  if ori_cu_seqlens is not None:
+    T_orig = do.shape[2]
+    [do], [], _, _ = _align_seqs([do], [], ori_cu_seqlens, align=chunk_size)
+    cu_seqlens_bwd = compute_padded_cu_seqlens(ori_cu_seqlens, chunk_size)
+    chunk_indices_bwd = prepare_chunk_indices(
+        cu_seqlens_bwd, chunk_size, max_T=q.shape[2]
+    )
+
+  if cp_context is not None and cp_context.is_cp_enabled:
+    if segment_ids is None:
+      raise ValueError("backward CP requires rank-local `segment_ids`.")
+    n_max = N_max if N_max is not None else cdiv(q.shape[2], chunk_size)
+    chain_metas = []
+    for b in range(segment_ids.shape[0]):
+      _, meta_b = _derive_cp_metadata_from_segment_ids(
+          segment_ids[b],
+          cp_context.axis_name,
+          n_max=n_max,
+      )
+      chain_metas.append(meta_b)
+    chain_meta = {k: jnp.stack([m[k] for m in chain_metas]) for k in chain_metas[0]}
+    needed = ("post_num_ranks", "is_last_rank", "pre_num_ranks", "is_first_rank")
+    if any(getattr(cp_context, name) is None for name in needed):
+      cp_fields = {field.name for field in dataclasses.fields(cp_context)}
+      updates = {
+          key: value
+          for key, value in chain_meta.items()
+          if key in cp_fields and getattr(cp_context, key) is None
+      }
+      cp_context = dataclasses.replace(cp_context, **updates)
+
+  bwd_kwargs = dict(
+      g=g_cumsum,
+      g_org=g_org,
+      cu_seqlens=cu_seqlens_bwd,
+      chunk_indices=chunk_indices_bwd,
+      chunk_size=chunk_size,
+      safe_gate=safe_gate,
+      lower_bound=lower_bound,
+      use_gate_in_kernel=use_gate_in_kernel,
+      A_log=A_log,
+      dt_bias=dt_bias,
+      disable_recompute=disable_recompute,
+      cp_context=cp_context,
+      segment_ids=segment_ids_aligned if segment_ids_aligned is not None else segment_ids,
+  )
+  if disable_recompute and h is not None:
+    bwd_kwargs["h"] = h
+
+  actual_scale = scale if scale is not None else q.shape[-1] ** -0.5
+  dq, dk, dv, db, dg, dh0, dA, dbias = chunk_kda_bwd(
+      q,
+      k,
+      v,
+      beta,
+      Aqk,
+      Akk,
+      actual_scale,
+      initial_state,
+      do,
+      dht,
+      N_max=N_max,
+      **bwd_kwargs,
+  )
+
+  if use_qk_l2norm_in_kernel:
+    dq = l2norm_bwd(q, rstd_q, dq)
+    dk = l2norm_bwd(k, rstd_k, dk)
+
+  if ori_cu_seqlens is not None:
+    dq = _unalign_output(dq, ori_cu_seqlens, aligned_cu, T_orig)
+    dk = _unalign_output(dk, ori_cu_seqlens, aligned_cu, T_orig)
+    dv = _unalign_output(dv, ori_cu_seqlens, aligned_cu, T_orig)
+    dg = _unalign_output(dg, ori_cu_seqlens, aligned_cu, T_orig)
+    db = _unalign_output(db, ori_cu_seqlens, aligned_cu, T_orig)
+
+  if dh0 is not None and dh0.ndim == 4 and has_initial_state:
+    dh0 = dh0[:, None]
+
+  return (
+      dq.astype(q.dtype),
+      dk.astype(k.dtype),
+      dv.astype(v.dtype),
+      dg.astype(g_dtype_marker.dtype),
+      db.astype(beta.dtype),
+      dA,
+      dbias,
+      dh0,
+      None,
+  )
