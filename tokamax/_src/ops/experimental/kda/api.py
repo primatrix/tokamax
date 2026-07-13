@@ -22,19 +22,10 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.kda import base
 
 
-Implementation: TypeAlias = Literal["xla", "xla_chunked", "pallas_tpu"]
+Implementation: TypeAlias = Literal["xla", "pallas_tpu"]
 
 IMPLEMENTATIONS = dict(xla=base.KimiDeltaAttention())
 _DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = ("xla",)
-
-try:
-  from tokamax._src.ops.experimental.kda import xla_chunked  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
-
-  IMPLEMENTATIONS["xla_chunked"] = (
-      xla_chunked.XlaChunkedKimiDeltaAttention()
-  )
-except ImportError:
-  pass
 
 try:
   from tokamax._src.ops.experimental.kda import pallas_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
@@ -97,13 +88,12 @@ def kimi_delta_attention(
     disable_recompute: Pallas custom-VJP recompute policy. XLA reference
       implementations accept it but the mathematical result is unchanged.
     cp_context: Optional context-parallel metadata.
-    chunk_size: Chunk size used by chunked/Pallas implementations and as the
-      default static segment bound when `N_max` is omitted.
+    chunk_size: Chunk size used by Pallas and as the default static segment
+      bound when `N_max` is omitted.
     N_max: Optional static upper bound for the number of varlen segments.
     implementation: The implementation to use. `"xla"` evaluates the recurrent
-      reference implementation. `"xla_chunked"` evaluates an equivalent
-      chunk-wise XLA implementation. `"pallas_tpu"` uses the experimental
-      Pallas TPU forward and custom VJP implementation from pallas-kernel.
+      reference implementation. `"pallas_tpu"` uses the experimental Pallas TPU
+      forward and custom VJP implementation from pallas-kernel.
 
   Returns:
     A pair `(output, final_state)`. The output has shape `[H, B, T, V]`.
