@@ -455,8 +455,8 @@ Under CP, one logical sequence can continue from an upstream rank onto the curre
 | `kg`, `w` | `[H, B, T_local_aligned, K]` |
 | `u` | `[H, B, T_local_aligned, V]` |
 | `gk` (`g_cumsum` at the call site) | `[H, B, T_local_aligned, K]` |
-| `cu_seqlens` | `[N_local+1]` or `[B, N_local+1]` |
-| `chunk_indices` | `[N_T,2]` or `[B,N_T,2]` |
+| `cu_seqlens` | `[B,N_local+1]` |
+| `chunk_indices` | `[B,N_T,2]` |
 | `cp_context` | CP axis name and rank-chain metadata |
 | `chunk_size` | Compile-time chunk size `C` |
 
@@ -465,6 +465,8 @@ It returns one tensor:
 | Tensor | Shape | Meaning |
 |---|---:|---|
 | `initial_state` | `[B,N_local,H,K,V]`, float32 | Rank-local segment initial states; only segment slot 0 can contain an upstream state |
+
+The batch dimension is mandatory for both metadata tensors, including when `B=1`. `_prepare_cp_initial_state` rejects unbatched `[N_local+1]` or `[N_T,2]` inputs rather than implicitly sharing one mapping across batch elements. The lower `_pre_process_pallas` launcher may slice the batched metadata to its internal single-batch form after this interface contract has been validated.
 
 As its first step, `_prepare_cp_initial_state` calls `chunk_gated_delta_rule_fwd_h_pre_process`. This lower-level summary function processes only the final real local segment of each batch element and returns:
 

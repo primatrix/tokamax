@@ -360,8 +360,8 @@ def _prepare_cp_initial_state(
     w: Float[Array, "H B T_LOCAL K"],
     u: Float[Array, "H B T_LOCAL V"],
     gk: Float[Array, "H B T_LOCAL K"],
-    cu_seqlens: Int[Array, "B N_CU"] | Int[Array, "N_CU"],
-    chunk_indices: Int[Array, "B NT 2"] | Int[Array, "NT 2"],
+    cu_seqlens: Int[Array, "B N_CU"],
+    chunk_indices: Int[Array, "B NT 2"],
     cp_context: CPContext,
     chunk_size: int,
 ) -> jax.Array:
@@ -377,8 +377,8 @@ def _prepare_cp_initial_state(
     w: Chunk-aligned delta-rule weights.
     u: Chunk-aligned delta-rule values.
     gk: Chunk-aligned cumulative gates in log2 space.
-    cu_seqlens: Chunk-aligned rank-local sequence boundaries.
-    chunk_indices: Chunk mapping derived from ``cu_seqlens``.
+    cu_seqlens: Batched chunk-aligned rank-local sequence boundaries.
+    chunk_indices: Batched chunk mapping derived from ``cu_seqlens``.
     cp_context: CP axis and derived rank-chain metadata.
     chunk_size: Kernel chunk size.
 
@@ -387,6 +387,20 @@ def _prepare_cp_initial_state(
   """
   H, B, _, K = kg.shape
   V = u.shape[-1]
+  if cu_seqlens.ndim != 2 or cu_seqlens.shape[0] != B:
+    raise ValueError(
+        "cu_seqlens must have shape [B, N_CU] matching the input batch; "
+        f"got {cu_seqlens.shape} for B={B}."
+    )
+  if (
+      chunk_indices.ndim != 3
+      or chunk_indices.shape[0] != B
+      or chunk_indices.shape[-1] != 2
+  ):
+    raise ValueError(
+        "chunk_indices must have shape [B, NT, 2] matching the input batch; "
+        f"got {chunk_indices.shape} for B={B}."
+    )
   N = cu_seqlens.shape[-1] - 1
 
   S_ext_local, M_local = chunk_gated_delta_rule_fwd_h_pre_process(
