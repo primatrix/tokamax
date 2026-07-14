@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import types
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -131,6 +133,32 @@ def _make_inputs(dtype):
   g = -0.1 * jax.nn.softplus(g)
   beta = jax.nn.sigmoid(beta)
   return q, k, v, g, beta, initial_state
+
+
+def _call_pallas_fwd_direct(q, k, v, g, beta, **overrides):
+  kwargs = dict(
+      A_log=None,
+      dt_bias=None,
+      scale=q.shape[-1] ** -0.5 if q.shape[-1] else 1.0,
+      initial_state=None,
+      output_final_state=False,
+      use_qk_l2norm_in_kernel=False,
+      use_gate_in_kernel=False,
+      segment_ids=None,
+      safe_gate=True,
+      lower_bound=None,
+      disable_recompute=True,
+      cp_context=None,
+      chunk_size=64,
+      N_max=None,
+      return_residuals=False,
+      config=None,
+  )
+  kwargs.update(overrides)
+  pallas_op = api.IMPLEMENTATIONS["pallas_tpu"]
+  return pallas_op._fwd(  # pylint: disable=protected-access
+      q, k, v, g, beta, **kwargs
+  )
 
 
 class KimiDeltaAttentionTest(parameterized.TestCase):
@@ -284,32 +312,107 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
     q = k = g = jnp.ones((1, 1, 64, 257), dtype=jnp.float32)
     v = jnp.ones((1, 1, 64, 1), dtype=jnp.float32)
     beta = jnp.ones((1, 1, 64), dtype=jnp.float32)
-    pallas_op = api.IMPLEMENTATIONS["pallas_tpu"]
 
     with self.assertRaisesRegex(NotImplementedError, "up to 256"):
-      pallas_op._fwd(  # pylint: disable=protected-access
+      _call_pallas_fwd_direct(q, k, v, g, beta)
+
+  @parameterized.parameters((0, 1), (1, 0))
+  def test_pallas_tpu_rejects_empty_kv_dimension_before_kernel(
+      self, key_dim, value_dim
+  ):
+    q = k = g = jnp.ones((1, 1, 64, key_dim), dtype=jnp.float32)
+    v = jnp.ones((1, 1, 64, value_dim), dtype=jnp.float32)
+    beta = jnp.ones((1, 1, 64), dtype=jnp.float32)
+
+    with self.assertRaisesRegex(NotImplementedError, "positive key and value"):
+      _call_pallas_fwd_direct(q, k, v, g, beta)
+
+  @parameterized.parameters((0, 1, 64), (1, 0, 64), (1, 1, 0))
+  def test_pallas_tpu_rejects_empty_grid_dimension_before_kernel(
+      self, heads, batch, seq_len
+  ):
+    q = k = g = jnp.ones(
+        (heads, batch, seq_len, 1), dtype=jnp.float32
+    )
+    v = jnp.ones((heads, batch, seq_len, 1), dtype=jnp.float32)
+    beta = jnp.ones((heads, batch, seq_len), dtype=jnp.float32)
+
+    with self.assertRaisesRegex(NotImplementedError, "positive head, batch"):
+      _call_pallas_fwd_direct(q, k, v, g, beta)
+
+  def test_pallas_tpu_rejects_multiple_fixed_states_before_kernel(self):
+    q = k = g = jnp.ones((1, 1, 64, 1), dtype=jnp.float32)
+    v = jnp.ones((1, 1, 64, 1), dtype=jnp.float32)
+    beta = jnp.ones((1, 1, 64), dtype=jnp.float32)
+    initial_state = jnp.zeros((1, 2, 1, 1, 1), dtype=jnp.float32)
+
+    with self.assertRaisesRegex(NotImplementedError, "exactly one"):
+      _call_pallas_fwd_direct(
+          q, k, v, g, beta, initial_state=initial_state
+      )
+
+  @parameterized.parameters((64, 128), (128, 64))
+  def test_pallas_tpu_rejects_unaligned_cp_dimensions_before_kernel(
+      self, key_dim, value_dim
+  ):
+    q = k = g = jnp.ones((1, 1, 64, key_dim), dtype=jnp.float32)
+    v = jnp.ones((1, 1, 64, value_dim), dtype=jnp.float32)
+    beta = jnp.ones((1, 1, 64), dtype=jnp.float32)
+    segment_ids = jnp.ones((1, 64), dtype=jnp.int32)
+    cp_context = CPContext(mesh=types.SimpleNamespace(shape={"context": 2}))
+
+    with self.assertRaisesRegex(NotImplementedError, "multiples of 128"):
+      _call_pallas_fwd_direct(
           q,
           k,
           v,
           g,
           beta,
-          A_log=None,
-          dt_bias=None,
-          scale=257**-0.5,
-          initial_state=None,
-          output_final_state=False,
-          use_qk_l2norm_in_kernel=False,
-          use_gate_in_kernel=False,
-          segment_ids=None,
-          safe_gate=True,
-          lower_bound=None,
-          disable_recompute=True,
-          cp_context=None,
-          chunk_size=64,
-          N_max=None,
-          return_residuals=False,
-          config=None,
+          segment_ids=segment_ids,
+          cp_context=cp_context,
+          N_max=1,
       )
+
+  def test_pallas_tpu_rejects_cp_contract_gaps_before_kernel(self):
+    q = k = g = jnp.ones((1, 1, 64, 128), dtype=jnp.float32)
+    v = jnp.ones((1, 1, 64, 128), dtype=jnp.float32)
+    beta = jnp.ones((1, 1, 64), dtype=jnp.float32)
+    segment_ids = jnp.ones((1, 64), dtype=jnp.int32)
+    initial_state = jnp.zeros((1, 1, 1, 128, 128), dtype=jnp.float32)
+    cp_context = CPContext(mesh=types.SimpleNamespace(shape={"context": 2}))
+    cases = (
+        (
+            "initial_state",
+            dict(
+                initial_state=initial_state,
+                segment_ids=segment_ids,
+                N_max=1,
+            ),
+        ),
+        (
+            "output_final_state",
+            dict(
+                output_final_state=True,
+                segment_ids=segment_ids,
+                N_max=1,
+            ),
+        ),
+        ("segment_ids", dict(N_max=1)),
+        ("N_max", dict(segment_ids=segment_ids)),
+    )
+
+    for error_fragment, overrides in cases:
+      with self.subTest(error_fragment=error_fragment):
+        with self.assertRaisesRegex(NotImplementedError, error_fragment):
+          _call_pallas_fwd_direct(
+              q,
+              k,
+              v,
+              g,
+              beta,
+              cp_context=cp_context,
+              **overrides,
+          )
 
   def test_no_final_state_by_default(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)

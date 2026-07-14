@@ -184,13 +184,20 @@ _CASES = (
         disable_recompute=False,
     ),
     _Case(
+        name="fixed_unaligned_kv",
+        seq_len=64,
+        heads=1,
+        key_dim=129,
+        value_dim=127,
+    ),
+    _Case(
         name="cp2",
         seq_len=128,
         heads=2,
         seq_lens=(128,),
         cp_size=2,
-        key_dim=64,
-        value_dim=64,
+        key_dim=128,
+        value_dim=128,
         dtype=jnp.float32,
     ),
 )
@@ -281,7 +288,7 @@ def _make_inputs(case: _Case) -> _Inputs:
     ).astype(case.dtype)
 
   segment_ids = (
-      _make_segment_ids(case.seq_lens, case.seq_len)
+      _make_segment_ids(case.seq_lens, real_seq_len)
       if case.seq_lens is not None
       else None
   )
@@ -296,7 +303,7 @@ def _make_inputs(case: _Case) -> _Inputs:
 
   dout = 0.1 * jax.random.normal(
       keys[8],
-      (case.heads, 1, case.seq_len, case.value_dim),
+      (case.heads, 1, real_seq_len, case.value_dim),
       dtype=jnp.float32,
   )
   dfinal_state = None
