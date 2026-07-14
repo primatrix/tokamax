@@ -35,7 +35,7 @@ from tokamax._src.ops.experimental.kda.utils import (
   get_tpu_config,
   pad_to_multiple,
 )
-
+RCP_LN2 = 1.0 / math.log(2)
 
 # =============================================================================
 # Mini-batch sizing and shared forward recurrence

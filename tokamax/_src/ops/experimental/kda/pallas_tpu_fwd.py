@@ -31,6 +31,7 @@ from tokamax._src.ops.experimental.kda.common import (
   chunk_local_cumsum_vector,
   estimate_mini_batch,
   kda_gate_chunk_cumsum,
+  RCP_LN2
 )
 from tokamax._src.ops.experimental.kda.cp_utils import (
   CPContext,
@@ -1275,7 +1276,7 @@ def pallas_kda_fwd_intra_fused(
   chunk_size: int = 64,
   safe_gate: bool = True,
   disable_recompute: bool = False,
-  cumsum_scale: float = _RCP_LN2,
+  cumsum_scale: float = RCP_LN2,
   A_log: Float[Array, "H"] | None = None,
   dt_bias: Float[Array, "H*K"] | None = None,
   use_gate_in_kernel: bool = False,
@@ -1417,7 +1418,7 @@ def kda_fwd_intra_fused(
   chunk_indices: jax.Array | None = None,
   safe_gate: bool = True,
   disable_recompute: bool = False,
-  cumsum_scale: float = _RCP_LN2,
+  cumsum_scale: float = RCP_LN2,
   A_log: jax.Array | None = None,
   dt_bias: jax.Array | None = None,
   use_gate_in_kernel: bool = False,
@@ -1445,14 +1446,14 @@ def kda_fwd_intra_fused(
         g=g,
         A_log=A_log,
         chunk_size=chunk_size,
-        scale=_RCP_LN2,
+        scale=RCP_LN2,
         dt_bias=dt_bias,
         lower_bound=lower_bound,
       )
     else:
       g_cumsum = kda_gate_cumsum(
         g=g,
-        scale=_RCP_LN2,
+        scale=RCP_LN2,
         chunk_size=chunk_size,
         head_first=True,
       )
@@ -1487,7 +1488,7 @@ def kda_gate_cumsum(
   g: jax.Array,
   chunk_size: int,
   reverse: bool = False,
-  scale: float = _RCP_LN2,
+  scale: float = RCP_LN2,
   head_first: bool = True,
   output_dtype: jnp.dtype | None = jnp.float32,
 ) -> jax.Array:
@@ -2041,7 +2042,7 @@ def chunk_kda_fwd_custom(
     chunk_indices=chunk_indices,
     safe_gate=safe_gate,
     disable_recompute=save_for_backward,
-    cumsum_scale=_RCP_LN2,
+    cumsum_scale=RCP_LN2,
     A_log=A_log,
     dt_bias=dt_bias,
     use_gate_in_kernel=use_gate_in_kernel,
