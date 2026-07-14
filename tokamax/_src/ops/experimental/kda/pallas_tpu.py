@@ -53,6 +53,7 @@ class _PreparedKdaInputs:
   v: jax.Array
   g: jax.Array
   beta: jax.Array
+  initial_state: jax.Array | None
   cp_context: CPContext | None
   cu_seqlens: jax.Array | None
   aligned_cu_seqlens: jax.Array | None
@@ -167,6 +168,31 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
               )
           )
 
+    initial_state_prepared = initial_state
+    if initial_state is not None:
+      if aligned_cu_seqlens is None:
+        # Fixed-length execution has one recurrent state per batch item.
+        if initial_state.ndim == 5:
+          initial_state_prepared = initial_state[:, 0]
+      else:
+        state_count = aligned_cu_seqlens.shape[-1] - 1
+        if initial_state.shape[1] < state_count:
+          initial_state_prepared = jnp.pad(
+              initial_state,
+              (
+                  (0, 0),
+                  (0, state_count - initial_state.shape[1]),
+                  (0, 0),
+                  (0, 0),
+                  (0, 0),
+              ),
+          )
+        if initial_state_prepared.shape[1] != state_count:
+          raise ValueError(
+              "`initial_state` state count must match aligned segment "
+              f"count {state_count}; got {initial_state.shape[1]}."
+          )
+
     aligned_segment_ids = None
     if aligned_cu_seqlens is not None and segment_ids is not None:
       effective_n_max = (
@@ -215,6 +241,7 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
         v=v_aligned,
         g=g_aligned,
         beta=beta_aligned,
+        initial_state=initial_state_prepared,
         cp_context=cp_context,
         cu_seqlens=cu_seqlens,
         aligned_cu_seqlens=aligned_cu_seqlens,
@@ -291,7 +318,7 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
         A_log=A_log,
         dt_bias=dt_bias,
         scale=scale,
-        initial_state=initial_state,
+        initial_state=prepared.initial_state,
         output_final_state=output_final_state,
         use_gate_in_kernel=use_gate_in_kernel,
         segment_ids=segment_ids,

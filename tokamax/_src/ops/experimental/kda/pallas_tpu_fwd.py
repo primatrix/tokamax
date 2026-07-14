@@ -307,8 +307,10 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
   w: Float[Array, "H B T_LOCAL K"],
   u: Float[Array, "H B T_LOCAL V"],
   gk: Float[Array, "H B T_LOCAL K"],
-  cu_seqlens: Int[Array, "N_CU"],
-  chunk_indices: Int[Array, "NT 2"] | None = None,
+  cu_seqlens: Int[Array, "B N_CU"] | Int[Array, "N_CU"],
+  chunk_indices: (
+      Int[Array, "B NT 2"] | Int[Array, "NT 2"] | None
+  ) = None,
   chunk_size: int = 64,
   use_exp2: bool = True,
 ) -> tuple[Float[Array, "H B K V"], Float[Array, "H B K K"]]:
@@ -349,6 +351,90 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
   assert S_ext.dtype == jnp.float32, f"S_ext must be fp32, got {S_ext.dtype}"
   assert M.dtype == jnp.float32, f"M must remain fp32, got {M.dtype}"
   return S_ext, M
+
+
+@jaxtyping.jaxtyped
+def _prepare_cp_initial_state(
+    *,
+    kg: Float[Array, "H B T_LOCAL K"],
+    w: Float[Array, "H B T_LOCAL K"],
+    u: Float[Array, "H B T_LOCAL V"],
+    gk: Float[Array, "H B T_LOCAL K"],
+    cu_seqlens: Int[Array, "B N_CU"] | Int[Array, "N_CU"],
+    chunk_indices: Int[Array, "B NT 2"] | Int[Array, "NT 2"],
+    cp_context: CPContext,
+    chunk_size: int,
+) -> jax.Array:
+  """Builds the rank-local initial state for context parallel forward.
+
+  Each rank summarizes its last local segment as an affine state transform,
+  gathers those summaries across the CP axis, and merges the upstream ranks
+  that continue into this rank's first segment. Only that first segment gets
+  the merged state; all other rank-local segments start from zero.
+
+  Args:
+    kg: Chunk-aligned gated keys in log2 gate space.
+    w: Chunk-aligned delta-rule weights.
+    u: Chunk-aligned delta-rule values.
+    gk: Chunk-aligned cumulative gates in log2 space.
+    cu_seqlens: Chunk-aligned rank-local sequence boundaries.
+    chunk_indices: Chunk mapping derived from ``cu_seqlens``.
+    cp_context: CP axis and derived rank-chain metadata.
+    chunk_size: Kernel chunk size.
+
+  Returns:
+    Initial states with shape ``[B, N, H, K, V]`` in fp32.
+  """
+  H, B, _, K = kg.shape
+  V = u.shape[-1]
+  N = cu_seqlens.shape[-1] - 1
+
+  S_ext_local, M_local = chunk_gated_delta_rule_fwd_h_pre_process(
+      k=kg,
+      w=w,
+      u=u,
+      gk=gk,
+      cu_seqlens=cu_seqlens,
+      chunk_indices=chunk_indices,
+      chunk_size=chunk_size,
+      use_exp2=True,
+  )
+  S_ext_all, _ = all_gather_into_tensor(
+      S_ext_local, cp_context.axis_name
+  )
+  M_all, _ = all_gather_into_tensor(M_local, cp_context.axis_name)
+  rank = jax.lax.axis_index(cp_context.axis_name)
+
+  pre_num = cp_context.pre_num_ranks
+  is_first = cp_context.is_first_rank
+  if B > 1 and hasattr(pre_num, "ndim") and pre_num.ndim > 0:
+    s_in_list = []
+    for batch_index in range(B):
+      s_in_list.append(
+          _merge_initial_state(
+              S_ext_all[:, :, batch_index : batch_index + 1],
+              M_all[:, :, batch_index : batch_index + 1],
+              rank,
+              pre_num[batch_index],
+              is_first[batch_index],
+          )
+      )
+    s_in_first = jnp.concatenate(s_in_list, axis=1)
+  else:
+    s_in_first = _merge_initial_state(
+        S_ext_all,
+        M_all,
+        rank,
+        pre_num,
+        is_first,
+    )
+
+  s_in_first = jnp.transpose(s_in_first, (1, 0, 2, 3))
+  return (
+      jnp.zeros((B, N, H, K, V), dtype=jnp.float32)
+      .at[:, 0]
+      .set(s_in_first)
+  )
 
 
 # =============================================================================
@@ -1964,7 +2050,9 @@ def chunk_kda_fwd_custom(
     A_log: Float[Array, "H"] | None = None,
     dt_bias: Float[Array, "H*K"] | None = None,
     scale: float | None = None,
-    initial_state: Float[Array, "B N H K V"] | None = None,
+    initial_state: (
+        Float[Array, "B H K V"] | Float[Array, "B N H K V"] | None
+    ) = None,
     output_final_state: bool = False,
     use_gate_in_kernel: bool = False,
     segment_ids: Int[Array, "B T"] | None = None,
@@ -2001,32 +2089,7 @@ def chunk_kda_fwd_custom(
 
   _cp_active = cp_context is not None and cp_context.is_cp_enabled
 
-  N = cu_seqlens.shape[-1] - 1 if cu_seqlens is not None else B
   _is_varlen = cu_seqlens is not None
-  if initial_state is not None:
-    if _is_varlen:
-      if initial_state.shape[1] < N:
-        pad_n = N - initial_state.shape[1]
-        initial_state = jnp.pad(initial_state, ((0, 0), (0, pad_n), (0, 0), (0, 0), (0, 0)))
-      if initial_state.shape[1] != N:
-        raise ValueError(
-            f"initial_state has N={initial_state.shape[1]}, expected {N}"
-        )
-    else:
-      # Non-varlen: initial_state is 4D (B, H, K, V) or 5D (B, 1, H, K, V)
-      if initial_state.ndim == 5:
-        initial_state = initial_state[:, 0]
-      if initial_state.shape[0] < N:
-        pad_n = N - initial_state.shape[0]
-        initial_state = jnp.pad(initial_state, ((0, pad_n), (0, 0), (0, 0), (0, 0)))
-
-  if cu_seqlens is not None and chunk_indices is None:
-    chunk_indices = prepare_chunk_indices(cu_seqlens, BT, max_T=T)
-
-  if T % BT != 0:
-    raise ValueError(
-        f"Sequence length T={T} must be divisible by chunk_size={BT}"
-    )
   # ------------------------------------------------------------------
   # Step 1 + 2 (Fused): Gate cumsum + Intra-chunk solve
   # ------------------------------------------------------------------
@@ -2049,69 +2112,16 @@ def chunk_kda_fwd_custom(
     lower_bound=lower_bound,
   )
 
-  # ------------------------------------------------------------------
-  # Stage CP (between Stage 1+2 and Stage 3): pre-process + all-gather +
-  # merge to recover the rank-local initial_state from upstream ranks.
-  #
-  # Algorithm:
-  #   1. Pre-process: each rank assumes S_in = 0 and computes (S_ext, M)
-  #      for its LAST segment only (segments fully within a rank start
-  #      fresh and need no merge).
-  #   2. All-gather both tensors across the CP axis in fp32.
-  #   3. Locally merge upstream (S_ext, M) into S_in for THIS rank's
-  #      first segment via M_j @ S_in + S_ext_j.
-  #   4. Construct initial_state = [N_local, H, K, V] with [0] = S_in
-  #      and the rest zero (intermediate segments start fresh).
-  #
-  # The recovered initial_state is fed into the fused Stage 3+4 path
-  # (chunk_kda_fwd_h_o_varlen) — it accepts h0 via USE_INITIAL_STATE.
-  # ------------------------------------------------------------------
   if _cp_active:
-    # cu_seqlens here is the BT-aligned version produced by _align_seqs
-    # above. pre-process is fully device-side and accepts traced
-    # cu_seqlens — no host-side cu_seqlens_cpu needed. Reuse the
-    # chunk_indices already computed above so pre-process doesn't redo
-    # the prepare_chunk_indices work.
-    S_ext_local, M_local = chunk_gated_delta_rule_fwd_h_pre_process(
-      k=kg,
-      w=w,
-      u=u,
-      gk=g_cumsum,
-      cu_seqlens=cu_seqlens,
-      chunk_indices=chunk_indices,
-      chunk_size=BT,
-      use_exp2=True,
-    )
-    S_ext_all, _ = all_gather_into_tensor(S_ext_local, cp_context.axis_name)
-    M_all, _ = all_gather_into_tensor(M_local, cp_context.axis_name)
-    rank = jax.lax.axis_index(cp_context.axis_name)
-
-    pre_num = cp_context.pre_num_ranks
-    is_first = cp_context.is_first_rank
-    if B > 1 and hasattr(pre_num, 'ndim') and pre_num.ndim > 0:
-      # Per-batch chain metadata: loop over B, call merge per batch element
-      s_in_list = []
-      for b in range(B):
-        s_b = _merge_initial_state(
-          S_ext_all[:, :, b:b+1],  # [cp, H, 1, K, V]
-          M_all[:, :, b:b+1],      # [cp, H, 1, K, K]
-          rank,
-          pre_num[b],
-          is_first[b],
-        )
-        s_in_list.append(s_b)  # [H, 1, K, V]
-      S_in_first = jnp.concatenate(s_in_list, axis=1)  # [H, B, K, V]
-    else:
-      S_in_first = _merge_initial_state(
-        S_ext_all, M_all, rank, pre_num, is_first,
-      )
-    # Build per-segment initial_state: only the FIRST segment inherits
-    # state from upstream ranks; the rest start at zero.
-    # S_in_first: [H, B, K, V] fp32 → transpose to [B, H, K, V]
-    S_in_first_bhkv = jnp.transpose(S_in_first, (1, 0, 2, 3))  # [B, H, K, V]
-    initial_state = (
-      jnp.zeros((B, N, H, K, V), dtype=jnp.float32)
-      .at[:, 0].set(S_in_first_bhkv)
+    initial_state = _prepare_cp_initial_state(
+        kg=kg,
+        w=w,
+        u=u,
+        gk=g_cumsum,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        cp_context=cp_context,
+        chunk_size=BT,
     )
 
   # ------------------------------------------------------------------
