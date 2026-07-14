@@ -8,15 +8,16 @@ Aligned with ``flash-linear-attention/fla/ops/cp/`` (context.py, comm.py).
 The torch ``ProcessGroup`` field is replaced by ``mesh + axis_name`` so the
 context can be constructed in JAX without a torch.distributed dependency.
 
-Algorithm: All-Gather + Transition-Matrix merge. See
-``docs/design-docs/ops/kda/global_cp.aligned.zh.md`` §1.2 / §1.5 / §2.3.
+Algorithm: all-gather each rank's local state and transition matrix, then
+merge the contributions in sequence order.
 
 Each rank computes ``(S_ext, M)`` locally assuming ``S_in = 0`` (FWD) or
 ``dS_out = 0`` (BWD), all-gathers both tensors, and then rebuilds its true
 boundary state ``S_in_r = sum_j (prod_{j' > j} M_{j'}) @ S_ext,j`` from
 upstream ranks (forward) or downstream ranks (backward).
 
-This module covers FORWARD only. Backward CP is design-doc milestone M5.
+The forward and backward paths share the collectives and state-merge helpers
+defined here.
 
 **Entry form.** The framework (e.g. MaxText) shards ``segment_ids`` along
 T and feeds the rank-local slice into ``chunk_kda``; the caller passes a
@@ -300,7 +301,7 @@ def _merge_initial_state(
 ) -> jax.Array:
   """Rebuild the current rank's ``S_in`` from all-gathered ``(S_ext, M)``.
 
-  Implements design-doc §2.3 ``Merge (forward direction)``::
+  Applies the forward merge recurrence::
 
     S_in = 0
     for j in [rank - pre_num_ranks, rank):
@@ -309,9 +310,8 @@ def _merge_initial_state(
   Implementation uses a fixed-trip ``lax.fori_loop`` of ``cp_size - 1``
   iterations with a per-iter mask. This lets ``rank``, ``pre_num_ranks``,
   and ``is_first_rank`` be either Python static values OR traced jnp
-  scalars — required so all SPMD ranks share one trace inside
-  ``shard_map``. The chain runs entirely in fp32 (design-doc §2.5 red
-  line).
+  scalars, so all SPMD ranks share one trace inside ``shard_map``. The chain
+  runs entirely in fp32 to avoid precision loss across ranks.
 
   Iteration order matches the Python reference: furthest upstream first
   (``j = rank - pre_num_ranks``), closest upstream last

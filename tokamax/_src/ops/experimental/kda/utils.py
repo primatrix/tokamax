@@ -135,17 +135,159 @@ def prepare_lens(cu_seqlens: jax.Array) -> jax.Array:
   return cu_seqlens[1:] - cu_seqlens[:-1]
 
 
-def compute_padded_cu_seqlens(cu_seqlens: jax.Array, chunk_size: int):
-  """Round each sequence length up to `chunk_size` in a cu_seqlens array."""
+def _align_seqs(
+    tensors_4d,
+    tensors_3d,
+    cu_seqlens,
+    align,
+    aligned_cu_seqlens=None,
+):
+  """Align (pad) each variable-length sequence to a multiple of ``align``.
+
+  Supports both single-batch (cu_seqlens [N+1]) and batched
+  (cu_seqlens [B, N+1]) modes.  In batched mode, each batch element is
+  aligned independently and all results are padded to the maximum
+  aligned T across batches.
+  """
   if cu_seqlens.ndim == 2:
-    rows = [compute_padded_cu_seqlens(cu_seqlens[b], chunk_size) for b in range(cu_seqlens.shape[0])]
-    return jnp.stack(rows, axis=0)
-  lens = jnp.diff(cu_seqlens)
-  padded_lens = cdiv(lens, chunk_size) * chunk_size
-  return jnp.concatenate([
-      jnp.zeros(1, dtype=cu_seqlens.dtype),
-      jnp.cumsum(padded_lens),
-  ])
+    # Batched: loop over B (values are concrete at trace time).
+    B = cu_seqlens.shape[0]
+    per_batch_4d = [[] for _ in tensors_4d]
+    per_batch_3d = [[] for _ in tensors_3d]
+    padded_cus = []
+    t_aligned_sizes = []
+    for b in range(B):
+      t4 = [t[:, b:b+1, :, :] for t in tensors_4d]
+      t3 = [t[:, b:b+1, :] for t in tensors_3d]
+      aligned_cu_b = (
+          None
+          if aligned_cu_seqlens is None
+          else aligned_cu_seqlens[b]
+      )
+      aligned_4d, aligned_3d, padded_cu_b, _ = _align_seqs(
+        t4,
+        t3,
+        cu_seqlens[b],
+        align,
+        aligned_cu_seqlens=aligned_cu_b,
+      )
+      for idx, a in enumerate(aligned_4d):
+        per_batch_4d[idx].append(a)
+      for idx, a in enumerate(aligned_3d):
+        per_batch_3d[idx].append(a)
+      padded_cus.append(padded_cu_b)
+      t_aligned_sizes.append(aligned_4d[0].shape[2])
+
+    T_max = max(t_aligned_sizes)
+    # Pad each batch element to T_max and concatenate along B.
+    def _pad_and_cat_4d(tensors_per_batch):
+      padded = []
+      for t in tensors_per_batch:
+        pad_len = T_max - t.shape[2]
+        if pad_len > 0:
+          t = jnp.pad(t, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
+        padded.append(t)
+      return jnp.concatenate(padded, axis=1)
+
+    def _pad_and_cat_3d(tensors_per_batch):
+      padded = []
+      for t in tensors_per_batch:
+        pad_len = T_max - t.shape[2]
+        if pad_len > 0:
+          t = jnp.pad(t, ((0, 0), (0, 0), (0, pad_len)))
+        padded.append(t)
+      return jnp.concatenate(padded, axis=1)
+
+    out_4d = [_pad_and_cat_4d(per_batch_4d[i]) for i in range(len(tensors_4d))]
+    out_3d = [_pad_and_cat_3d(per_batch_3d[i]) for i in range(len(tensors_3d))]
+    stacked_cu = jnp.stack(padded_cus, axis=0)
+    return out_4d, out_3d, stacked_cu, cu_seqlens
+
+  # --- Single-batch path (original) ---
+  N = cu_seqlens.shape[0] - 1
+  T_old = tensors_4d[0].shape[2]
+
+  seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+  if aligned_cu_seqlens is None:
+    padded_lens = ((seg_lens + align - 1) // align) * align
+    padded_cu = jnp.concatenate(
+        [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(padded_lens)]
+    )
+  else:
+    padded_cu = aligned_cu_seqlens
+  T_new = ((T_old + N * (align - 1) + align - 1) // align) * align
+
+  def _build_gather(i, gather_idx):
+    old_start = cu_seqlens[i]
+    new_start = padded_cu[i]
+    sl = seg_lens[i]
+    j = jnp.arange(T_new)
+    in_seg = (j >= new_start) & (j < new_start + sl)
+    src = old_start + (j - new_start)
+    return jnp.where(in_seg, src, gather_idx)
+
+  gather_idx = jnp.full(T_new, T_old, dtype=jnp.int32)
+  gather_idx = jax.lax.fori_loop(0, N, _build_gather, gather_idx)
+
+  def repack_4d(t):
+    # t: [H, B, T, K] — gather along axis 2 (T dimension)
+    return jnp.pad(t, ((0, 0), (0, 0), (0, T_new - T_old), (0, 0)))[:, :, gather_idx]
+
+  def repack_3d(t):
+    # t: [H, B, T] — gather along axis 2 (T dimension)
+    return jnp.pad(t, ((0, 0), (0, 0), (0, T_new - T_old)))[:, :, gather_idx]
+
+  return (
+    [repack_4d(t) for t in tensors_4d],
+    [repack_3d(t) for t in tensors_3d],
+    padded_cu,
+    cu_seqlens,
+  )
+
+
+
+def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
+  """Reverse _align_seqs: scatter aligned output back to original positions.
+
+  Supports batched cu_seqlens [B, N+1] — processes each batch element
+  independently.
+  """
+  if orig_cu_seqlens.ndim == 2:
+    B = orig_cu_seqlens.shape[0]
+    per_batch = []
+    for b in range(B):
+      # Use slicing that works for both 3D [H,B,T] and 4D [H,B,T,X]
+      ob_slice = jax.lax.dynamic_slice_in_dim(o, b, 1, axis=1)
+      ob = _unalign_output(
+        ob_slice,
+        orig_cu_seqlens[b],
+        aligned_cu_seqlens[b],
+        T_out,
+      )
+      per_batch.append(ob)
+    return jnp.concatenate(per_batch, axis=1)
+
+  # --- Single-batch path (original) ---
+  N = orig_cu_seqlens.shape[0] - 1
+  orig_seg_lens = orig_cu_seqlens[1:] - orig_cu_seqlens[:-1]
+
+  def _build_gather(i, gather_idx):
+    orig_start = orig_cu_seqlens[i]
+    aligned_start = aligned_cu_seqlens[i]
+    sl = orig_seg_lens[i]
+    j = jnp.arange(T_out)
+    in_seg = (j >= orig_start) & (j < orig_start + sl)
+    src = aligned_start + (j - orig_start)
+    return jnp.where(in_seg, src, gather_idx)
+
+  # Default to aligned_cu_seqlens[-1] — a known-zero padding position.
+  # After the _align_seqs fix above, T_aligned > padded_cu[-1], so this
+  # index is always valid and always reads padding (zero).
+  safe_default = aligned_cu_seqlens[-1]
+  gather_idx = jnp.full(T_out, safe_default, dtype=jnp.int32)
+  gather_idx = jax.lax.fori_loop(0, N, _build_gather, gather_idx)
+  return o[:, :, gather_idx]
+
 
 
 def align_segment_ids(
@@ -267,53 +409,6 @@ def prepare_chunk_indices(
   return jnp.stack([seq_ids, block_ids], axis=1)
 
 
-def assert_shape_or_none(
-    x: jax.Array | list[jax.Array | None] | tuple[jax.Array | None, ...] | None,
-    expected_shape: list[int] | tuple[int, ...],
-    name: str | list[str] | tuple[str, ...] = "tensor",
-):
-  if x is None:
-    return
-  if isinstance(x, (list, tuple)):
-    has_names = isinstance(name, (list, tuple)) and len(name) == len(x)
-    for i, tensor in enumerate(x):
-      if tensor is not None:
-        curr_name = name[i] if has_names else f"{name}_{i}"
-        assert tensor.shape == expected_shape, (
-            f"[{curr_name}] Expected shape {expected_shape}, got {tensor.shape}"
-        )
-    return
-  assert x.shape == expected_shape, (
-      f"[{name}] Expected shape {expected_shape}, got {x.shape}"
-  )
-
-
-def assert_shape(
-    x: jax.Array | list[jax.Array] | tuple[jax.Array, ...],
-    expected_shape: list[int] | tuple[int, ...],
-    name: str | list[str] | tuple[str, ...] = "tensor",
-):
-  if isinstance(x, (list, tuple)):
-    has_names = isinstance(name, (list, tuple)) and len(name) == len(x)
-    for i, tensor in enumerate(x):
-      curr_name = name[i] if has_names else f"{name}_{i}"
-      assert tensor.shape == expected_shape, (
-          f"[{curr_name}] Expected shape {expected_shape}, got {tensor.shape}"
-      )
-    return
-  assert x.shape == expected_shape, (
-      f"[{name}] Expected shape {expected_shape}, got {x.shape}"
-  )
-
-
-def export_public(current_globals):
-  return [
-      name
-      for name, value in current_globals.items()
-      if not name.startswith("_") and callable(value)
-  ]
-
-
 @dataclass(frozen=True)
 class TpuConfig:
   generation: str
@@ -409,11 +504,6 @@ def _detect_tpu_config() -> TpuConfig:
       if needle in device_kind:
         return _PRESETS[key]
   return TPU_V6E
-
-
-def set_tpu_config(config: TpuConfig) -> None:
-  global _current_config
-  _current_config = config
 
 
 def get_tpu_config() -> TpuConfig:

@@ -18,90 +18,49 @@ import dataclasses
 from typing import Any
 
 import jax
+import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src.ops import op
 from tokamax._src.ops.experimental.kda import base
+from tokamax._src.ops.experimental.kda.cp_utils import CPContext
 from tokamax._src.ops.experimental.kda.pallas_tpu_bwd import (
-    PallasTpuKimiDeltaAttentionVjp,
+    chunk_kda_bwd_custom,
 )
 from tokamax._src.ops.experimental.kda.pallas_tpu_fwd import (
     chunk_kda_fwd_custom,
-    chunk_kda_fwd,
+)
+from tokamax._src.ops.experimental.kda.pallas_tpu_types import (
+    CpMetadata,
+    KdaResiduals,
 )
 from tokamax._src.ops.experimental.kda.utils import (
-    as_public_final_state,
+    _align_seqs,
+    align_segment_ids,
     derive_cp_context,
+    l2norm_fwd,
+    prepare_chunk_indices,
     segment_ids_to_cu_seqlens,
 )
 from typing_extensions import override
 
 
-def _chunk_kda_fwd_no_residuals(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    g: jax.Array,
-    beta: jax.Array,
-    *,
-    A_log: jax.Array | None,
-    dt_bias: jax.Array | None,
-    scale: float,
-    initial_state: jax.Array | None,
-    output_final_state: bool,
-    use_qk_l2norm_in_kernel: bool,
-    use_gate_in_kernel: bool,
-    segment_ids: jax.Array | None,
-    safe_gate: bool,
-    lower_bound: float | None,
-    disable_recompute: bool,
-    cp_context: object | None,
-    chunk_size: int,
-    N_max: int | None,
-) -> base.Output:
-  """Runs Pallas forward without materialising Tokamax VJP residuals."""
-  cp_context, cu_seqlens = derive_cp_context(
-      q=q,
-      segment_ids=segment_ids,
-      initial_state=initial_state,
-      output_final_state=output_final_state,
-      cp_context=cp_context,
-      chunk_size=chunk_size,
-      N_max=N_max,
-  )
-  if cu_seqlens is None:
-    cu_seqlens, _ = segment_ids_to_cu_seqlens(
-        segment_ids,
-        initial_state=initial_state,
-        chunk_size=chunk_size,
-        N_max=N_max,
-        seq_len=q.shape[2],
-  )
-
-  output, final_state, *_ = chunk_kda_fwd(
-      q,
-      k,
-      v,
-      g,
-      beta,
-      A_log=A_log,
-      dt_bias=dt_bias,
-      scale=scale,
-      initial_state=initial_state,
-      output_final_state=output_final_state,
-      use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,  # chunk_kda_fwd_custom need
-      use_gate_in_kernel=use_gate_in_kernel,
-      segment_ids=segment_ids,
-      safe_gate=safe_gate,
-      lower_bound=lower_bound,
-      disable_recompute=disable_recompute,
-      cp_context=cp_context,
-      chunk_size=chunk_size,
-      cu_seqlens=cu_seqlens,
-  )
-  return output.astype(q.dtype), as_public_final_state(
-      final_state, segment_ids=segment_ids
-  )
+@dataclasses.dataclass(frozen=True)
+class _PreparedKdaInputs:
+  q: jax.Array
+  k: jax.Array
+  v: jax.Array
+  g: jax.Array
+  beta: jax.Array
+  cp_context: CPContext | None
+  cu_seqlens: jax.Array | None
+  aligned_cu_seqlens: jax.Array | None
+  chunk_indices: jax.Array | None
+  aligned_segment_ids: jax.Array | None
+  q_rstd: jax.Array | None
+  k_rstd: jax.Array | None
+  cp_metadata: CpMetadata
 
 
 @dataclasses.dataclass(frozen=True)
@@ -115,12 +74,156 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
   chunk_size: int = 64
 
   def __post_init__(self):
+    if self.chunk_size != 64:
+      raise ValueError("`pallas_tpu` only supports chunk_size=64.")
     if self.vjp is None:
       object.__setattr__(self, "vjp", PallasTpuKimiDeltaAttentionVjp())
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu"
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 6
+
+  @staticmethod
+  def _preprocess_inputs(
+      q: jax.Array,
+      k: jax.Array,
+      v: jax.Array,
+      g: jax.Array,
+      beta: jax.Array,
+      *,
+      initial_state: jax.Array | None,
+      output_final_state: bool,
+      use_qk_l2norm_in_kernel: bool,
+      use_gate_in_kernel: bool,
+      segment_ids: jax.Array | None,
+      cp_context: CPContext | None,
+      chunk_size: int,
+      N_max: int | None,
+  ) -> _PreparedKdaInputs:
+    """Canonicalizes inputs shared by the forward and backward kernels."""
+    cp_context, cu_seqlens = derive_cp_context(
+        q=q,
+        segment_ids=segment_ids,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cp_context=cp_context,
+        chunk_size=chunk_size,
+        N_max=N_max,
+    )
+    if cu_seqlens is None:
+      cu_seqlens, N_max = segment_ids_to_cu_seqlens(
+          segment_ids,
+          initial_state=initial_state,
+          chunk_size=chunk_size,
+          N_max=N_max,
+          seq_len=q.shape[2],
+      )
+
+    aligned_cu_seqlens = None
+    chunk_indices = None
+    if cu_seqlens is None:
+      q_aligned, k_aligned, v_aligned = q, k, v
+      g_aligned, beta_aligned = g, beta
+    else:
+      (
+          [q_aligned, k_aligned, v_aligned, g_aligned],
+          [beta_aligned],
+          aligned_cu_seqlens,
+          _,
+      ) = _align_seqs(
+          [q, k, v, g],
+          [beta],
+          cu_seqlens,
+          align=chunk_size,
+      )
+      chunk_indices = prepare_chunk_indices(
+          aligned_cu_seqlens,
+          chunk_size,
+          max_T=q_aligned.shape[2],
+      )
+
+      if use_gate_in_kernel:
+        aligned_seq_len = g_aligned.shape[2]
+        original_lengths = jnp.diff(cu_seqlens, axis=-1)
+        aligned_starts = aligned_cu_seqlens[..., :-1]
+        positions = jnp.arange(aligned_seq_len)
+        for batch_index in range(cu_seqlens.shape[0]):
+          in_range = (
+              positions[None, :]
+              >= aligned_starts[batch_index, :, None]
+          ) & (
+              positions[None, :]
+              < (
+                  aligned_starts[batch_index]
+                  + original_lengths[batch_index]
+              )[:, None]
+          )
+          valid_mask = in_range.any(axis=0)
+          g_aligned = g_aligned.at[:, batch_index].set(
+              jnp.where(
+                  valid_mask[None, :, None],
+                  g_aligned[:, batch_index],
+                  -1e4,
+              )
+          )
+
+    aligned_segment_ids = None
+    if aligned_cu_seqlens is not None and segment_ids is not None:
+      effective_n_max = (
+          N_max
+          if N_max is not None
+          else aligned_cu_seqlens.shape[-1] - 1
+      )
+      aligned_segment_ids = jnp.stack(
+          [
+              align_segment_ids(
+                  segment_ids[batch_index], effective_n_max, chunk_size
+              )
+              for batch_index in range(segment_ids.shape[0])
+          ]
+      )
+
+    if use_qk_l2norm_in_kernel:
+      q_prepared, q_rstd = l2norm_fwd(q_aligned)
+      k_prepared, k_rstd = l2norm_fwd(k_aligned)
+    else:
+      q_prepared, k_prepared = q_aligned, k_aligned
+      q_rstd = k_rstd = None
+
+    cp_metadata = None
+    if cp_context is not None and cp_context.is_cp_enabled:
+      if any(
+          value is None
+          for value in (
+              cp_context.is_first_rank,
+              cp_context.is_last_rank,
+              cp_context.pre_num_ranks,
+              cp_context.post_num_ranks,
+          )
+      ):
+        raise ValueError("Enabled CP context is missing derived rank metadata.")
+      cp_metadata = (
+          cp_context.is_first_rank,
+          cp_context.is_last_rank,
+          cp_context.pre_num_ranks,
+          cp_context.post_num_ranks,
+      )
+
+    return _PreparedKdaInputs(
+        q=q_prepared,
+        k=k_prepared,
+        v=v_aligned,
+        g=g_aligned,
+        beta=beta_aligned,
+        cp_context=cp_context,
+        cu_seqlens=cu_seqlens,
+        aligned_cu_seqlens=aligned_cu_seqlens,
+        chunk_indices=chunk_indices,
+        aligned_segment_ids=aligned_segment_ids,
+        q_rstd=q_rstd,
+        k_rstd=k_rstd,
+        cp_metadata=cp_metadata,
+    )
 
   @jaxtyping.jaxtyped
   @override
@@ -143,7 +246,7 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
       safe_gate: bool,
       lower_bound: float | None,
       disable_recompute: bool,
-      cp_context: object | None,
+      cp_context: CPContext | None,
       chunk_size: int,
       N_max: int | None,
       return_residuals: bool,
@@ -155,7 +258,6 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
       raise NotImplementedError(
           "`pallas_tpu` currently supports bfloat16 and float32 inputs only."
       )
-    del self
     if chunk_size != 64:
       raise NotImplementedError("`pallas_tpu` currently supports chunk_size=64.")
     if segment_ids is None and q.shape[2] % chunk_size != 0:
@@ -164,49 +266,149 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
           f"`chunk_size`; got T={q.shape[2]}, chunk_size={chunk_size}."
       )
 
-    if return_residuals:
-      return chunk_kda_fwd_custom(
-          q,
-          k,
-          v,
-          g,
-          beta,
-          A_log=A_log,
-          dt_bias=dt_bias,
-          scale=scale,
-          initial_state=initial_state,
-          output_final_state=output_final_state,
-          use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-          use_gate_in_kernel=use_gate_in_kernel,
-          segment_ids=segment_ids,
-          safe_gate=safe_gate,
-          lower_bound=lower_bound,
-          disable_recompute=disable_recompute,
-          cp_context=cp_context,
-          chunk_size=chunk_size,
-          N_max=N_max,
-      )
-
-    output, final_state = _chunk_kda_fwd_no_residuals(
+    prepared = self._preprocess_inputs(
         q,
         k,
         v,
         g,
         beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=use_gate_in_kernel,
         segment_ids=segment_ids,
-        safe_gate=safe_gate,
-        lower_bound=lower_bound,
-        disable_recompute=disable_recompute,
         cp_context=cp_context,
         chunk_size=chunk_size,
         N_max=N_max,
     )
 
-    return (output.astype(q.dtype), final_state), None
+    output, residuals = chunk_kda_fwd_custom(
+        prepared.q,
+        prepared.k,
+        prepared.v,
+        prepared.g,
+        prepared.beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_gate_in_kernel=use_gate_in_kernel,
+        segment_ids=segment_ids,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+        disable_recompute=disable_recompute,
+        cp_context=prepared.cp_context,
+        chunk_size=chunk_size,
+        return_residuals=return_residuals,
+        cu_seqlens=prepared.cu_seqlens,
+        aligned_cu_seqlens=prepared.aligned_cu_seqlens,
+        chunk_indices=prepared.chunk_indices,
+        aligned_segment_ids=prepared.aligned_segment_ids,
+        q_rstd=prepared.q_rstd,
+        k_rstd=prepared.k_rstd,
+        cp_metadata=prepared.cp_metadata,
+    )
+    value, final_state = output
+    if final_state is not None and final_state.ndim == 4:
+      final_state = final_state[:, None]
+    return (value, final_state), residuals
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PallasTpuKimiDeltaAttentionVjp(
+    op.Op[Any, dict[str, Any], None, Any, Any]
+):
+  """Tokamax Op VJP wrapper for the Pallas TPU KDA backward path."""
+
+  def _fwd(
+      self,
+      residuals: KdaResiduals,
+      out: base.Output,
+      dout: base.Output,
+      q: jax.Array,
+      k: jax.Array,
+      v: jax.Array,
+      g: jax.Array,
+      beta: jax.Array,
+      *,
+      A_log: jax.Array | None,
+      dt_bias: jax.Array | None,
+      scale: float,
+      initial_state: jax.Array | None,
+      output_final_state: bool,
+      use_qk_l2norm_in_kernel: bool,
+      use_gate_in_kernel: bool,
+      segment_ids: jax.Array | None,
+      safe_gate: bool,
+      lower_bound: float | None,
+      disable_recompute: bool,
+      cp_context: CPContext | None,
+      chunk_size: int,
+      N_max: int | None,
+      return_residuals: bool,
+      config: Any,
+  ) -> tuple[dict[str, jax.Array], None]:
+    # Tokamax's VJP contract replays the original inputs here, but the backward
+    # kernel consumes the aligned and optionally L2-normalized copies retained
+    # in `residuals`. Reusing these arguments would skip that preprocessing.
+    del (
+        out,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        output_final_state,
+        return_residuals,
+        safe_gate,
+        config,
+    )
+
+    (
+        dq,
+        dk,
+        dv,
+        dg,
+        db,
+        dA,
+        dbias,
+        dh0,
+        dsegment_ids,
+    ) = chunk_kda_bwd_custom(
+        scale,
+        use_qk_l2norm_in_kernel,
+        use_gate_in_kernel,
+        lower_bound,
+        disable_recompute,
+        cp_context,
+        chunk_size,
+        N_max,
+        initial_state is not None,
+        residuals,
+        dout,
+    )
+
+    grads = {
+        "q": dq,
+        "k": dk,
+        "v": dv,
+        "g": dg,
+        "beta": db,
+    }
+    if A_log is not None:
+      grads["A_log"] = dA if dA is not None else jnp.zeros_like(A_log)
+    if dt_bias is not None:
+      grads["dt_bias"] = (
+          dbias if dbias is not None else jnp.zeros_like(dt_bias)
+      )
+    if initial_state is not None:
+      grads["initial_state"] = (
+          dh0 if dh0 is not None else jnp.zeros_like(initial_state)
+      )
+    if segment_ids is not None:
+      grads["segment_ids"] = (
+          dsegment_ids
+          if dsegment_ids is not None
+          else jnp.zeros_like(segment_ids)
+      )
+    return grads, None
