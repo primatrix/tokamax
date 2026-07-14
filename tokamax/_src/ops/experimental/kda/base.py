@@ -179,6 +179,18 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
             "`initial_state` trailing dimensions must be "
             f"{expected_tail}; got {initial_state.shape[2:]}."
         )
+      state_count = initial_state.shape[1]
+      if state_count <= 0:
+        raise ValueError(
+            "`initial_state` must contain at least one recurrent state."
+        )
+      if N_max is None:
+        N_max = state_count
+      elif N_max != state_count:
+        raise ValueError(
+            "`N_max` must match the `initial_state` segment dimension; got "
+            f"N_max={N_max}, N={state_count}."
+        )
     if segment_ids is not None and segment_ids.shape != (batch, seq_len):
       raise ValueError(
           f"`segment_ids` shape {segment_ids.shape} must be {(batch, seq_len)}."

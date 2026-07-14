@@ -15,17 +15,17 @@
 """Experimental Kimi Delta Attention API."""
 
 from collections.abc import Sequence
-from typing import Any, Final, Literal, TypeAlias
+from typing import Final, Literal, TypeAlias
 
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.kda import base
+from tokamax._src.ops.experimental.kda.cp_utils import CPContext
 
 
 Implementation: TypeAlias = Literal["xla", "pallas_tpu"]
 
 IMPLEMENTATIONS = dict(xla=base.KimiDeltaAttention())
-_DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = ("xla",)
 
 try:
   from tokamax._src.ops.experimental.kda import pallas_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
@@ -33,6 +33,12 @@ try:
   IMPLEMENTATIONS["pallas_tpu"] = pallas_tpu.PallasTpuKimiDeltaAttention()
 except ImportError:
   pass
+
+_DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = (
+    ("pallas_tpu", "xla")
+    if "pallas_tpu" in IMPLEMENTATIONS
+    else ("xla",)
+)
 
 
 @jaxtyping.jaxtyped
@@ -54,7 +60,7 @@ def kimi_delta_attention(
     safe_gate: bool = True,
     lower_bound: float | None = None,
     disable_recompute: bool = True,
-    cp_context: Any | None = None,
+    cp_context: CPContext | None = None,
     chunk_size: int = 64,
     N_max: int | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
@@ -76,6 +82,7 @@ def kimi_delta_attention(
     dt_bias: Optional gate bias, shape `[H * K]`.
     scale: Query scale. Defaults to `K ** -0.5`.
     initial_state: Optional initial recurrent state, shape `[B, N, H, K, V]`.
+      Its segment dimension `N` determines `N_max` when the latter is omitted.
     output_final_state: Whether to return the final recurrent state.
     use_qk_l2norm_in_kernel: Whether to normalize q/k on the last dimension
       before running KDA.
@@ -87,11 +94,13 @@ def kimi_delta_attention(
     lower_bound: Optional sigmoid-gate lower bound.
     disable_recompute: Pallas custom-VJP recompute policy. XLA reference
       implementations accept it but the mathematical result is unchanged.
-    cp_context: Optional context-parallel metadata.
+    cp_context: Optional context-parallel metadata. Construct it with
+      `kda.CPContext(mesh, axis_name)`.
     chunk_size: Chunk size used by Pallas.
     N_max: Static upper bound for the number of varlen segments. Required when
-      `segment_ids` is provided without `initial_state`; otherwise inferred
-      from the initial state's segment dimension.
+      `segment_ids` is provided without `initial_state`. When `initial_state`
+      is provided, `N_max` defaults to its segment dimension `N`; an explicitly
+      supplied value must equal `N`.
     implementation: The implementation to use. `"xla"` evaluates the recurrent
       reference implementation. `"pallas_tpu"` uses the experimental Pallas TPU
       forward and custom VJP implementation from pallas-kernel.

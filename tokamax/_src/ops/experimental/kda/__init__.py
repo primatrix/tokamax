@@ -13,3 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 """Experimental Kimi Delta Attention ops."""
+
+from tokamax._src.ops.experimental.kda.cp_utils import CPContext as CPContext
+
+
+__all__ = ("CPContext",)

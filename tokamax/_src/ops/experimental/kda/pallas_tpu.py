@@ -67,6 +67,82 @@ class _PreparedKdaInputs:
   cp_metadata: CpMetadata
 
 
+def check_inputs_support(
+    q: jax.Array,
+    v: jax.Array,
+    *,
+    initial_state: jax.Array | None,
+    output_final_state: bool,
+    segment_ids: jax.Array | None,
+    cp_context: CPContext | None,
+    chunk_size: int,
+    N_max: int | None,
+) -> None:
+  """Checks whether the Pallas TPU backend supports the static inputs."""
+  if q.dtype not in (jnp.bfloat16, jnp.float32):
+    raise NotImplementedError(
+        "`pallas_tpu` currently supports bfloat16 and float32 inputs only."
+    )
+  heads, batch, seq_len, key_dim = q.shape
+  value_dim = v.shape[-1]
+  if heads < 1 or batch < 1 or seq_len < 1:
+    raise NotImplementedError(
+        "`pallas_tpu` requires positive head, batch, and sequence "
+        f"dimensions; got H={heads}, B={batch}, T={seq_len}."
+    )
+  if key_dim < 1 or value_dim < 1:
+    raise NotImplementedError(
+        "`pallas_tpu` requires positive key and value dimensions; got "
+        f"K={key_dim}, V={value_dim}."
+    )
+  if key_dim > 256:
+    raise NotImplementedError(
+        "`pallas_tpu` currently supports key dimensions up to 256; got "
+        f"K={key_dim}."
+    )
+  cp_enabled = cp_context is not None and cp_context.is_cp_enabled
+  if cp_enabled:
+    if initial_state is not None:
+      raise NotImplementedError(
+          "`pallas_tpu` context-parallel execution does not support "
+          "`initial_state`."
+      )
+    if output_final_state:
+      raise NotImplementedError(
+          "`pallas_tpu` context-parallel execution does not support "
+          "`output_final_state=True`."
+      )
+    if segment_ids is None:
+      raise NotImplementedError(
+          "`pallas_tpu` context-parallel execution requires rank-local "
+          "`segment_ids`."
+      )
+    if N_max is None:
+      raise NotImplementedError(
+          "`pallas_tpu` context-parallel execution requires `N_max`."
+      )
+    if key_dim % 128 != 0 or value_dim % 128 != 0:
+      raise NotImplementedError(
+          "`pallas_tpu` context-parallel execution requires key and value "
+          "dimensions to be multiples of 128; got "
+          f"K={key_dim}, V={value_dim}."
+      )
+  if initial_state is not None and segment_ids is None:
+    if initial_state.shape[1] != 1:
+      raise NotImplementedError(
+          "`pallas_tpu` fixed-length execution requires exactly one "
+          "recurrent state per batch item; got "
+          f"N={initial_state.shape[1]}."
+      )
+  if chunk_size != 64:
+    raise NotImplementedError("`pallas_tpu` currently supports chunk_size=64.")
+  if segment_ids is None and seq_len % chunk_size != 0:
+    raise NotImplementedError(
+        "`pallas_tpu` requires the sequence length to be divisible by "
+        f"`chunk_size`; got T={seq_len}, chunk_size={chunk_size}."
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
   """Pallas TPU KDA backend.
@@ -280,70 +356,18 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
   ) -> tuple[base.Output, base.Residuals]:
     del config
 
-    # Keep every static kernel constraint here so unsupported calls can fall
-    # through to another implementation before any Pallas kernel is traced.
-    if q.dtype not in (jnp.bfloat16, jnp.float32):
-      raise NotImplementedError(
-          "`pallas_tpu` currently supports bfloat16 and float32 inputs only."
-      )
-    heads, batch, seq_len, key_dim = q.shape
-    value_dim = v.shape[-1]
-    if heads < 1 or batch < 1 or seq_len < 1:
-      raise NotImplementedError(
-          "`pallas_tpu` requires positive head, batch, and sequence "
-          f"dimensions; got H={heads}, B={batch}, T={seq_len}."
-      )
-    if key_dim < 1 or value_dim < 1:
-      raise NotImplementedError(
-          "`pallas_tpu` requires positive key and value dimensions; got "
-          f"K={key_dim}, V={value_dim}."
-      )
-    if key_dim > 256:
-      raise NotImplementedError(
-          "`pallas_tpu` currently supports key dimensions up to 256; got "
-          f"K={key_dim}."
-      )
-    cp_enabled = cp_context is not None and cp_context.is_cp_enabled
-    if cp_enabled:
-      if initial_state is not None:
-        raise NotImplementedError(
-            "`pallas_tpu` context-parallel execution does not support "
-            "`initial_state`."
-        )
-      if output_final_state:
-        raise NotImplementedError(
-            "`pallas_tpu` context-parallel execution does not support "
-            "`output_final_state=True`."
-        )
-      if segment_ids is None:
-        raise NotImplementedError(
-            "`pallas_tpu` context-parallel execution requires rank-local "
-            "`segment_ids`."
-        )
-      if N_max is None:
-        raise NotImplementedError(
-            "`pallas_tpu` context-parallel execution requires `N_max`."
-        )
-      if key_dim % 128 != 0 or value_dim % 128 != 0:
-        raise NotImplementedError(
-            "`pallas_tpu` context-parallel execution requires key and value "
-            "dimensions to be multiples of 128; got "
-            f"K={key_dim}, V={value_dim}."
-        )
-    if initial_state is not None and segment_ids is None:
-      if initial_state.shape[1] != 1:
-        raise NotImplementedError(
-            "`pallas_tpu` fixed-length execution requires exactly one "
-            "recurrent state per batch item; got "
-            f"N={initial_state.shape[1]}."
-        )
-    if chunk_size != 64:
-      raise NotImplementedError("`pallas_tpu` currently supports chunk_size=64.")
-    if segment_ids is None and seq_len % chunk_size != 0:
-      raise NotImplementedError(
-          "`pallas_tpu` requires the sequence length to be divisible by "
-          f"`chunk_size`; got T={seq_len}, chunk_size={chunk_size}."
-      )
+    # Reject unsupported calls before preprocessing or tracing a Pallas kernel,
+    # so API dispatch can fall through to the next implementation.
+    check_inputs_support(
+        q,
+        v,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        segment_ids=segment_ids,
+        cp_context=cp_context,
+        chunk_size=chunk_size,
+        N_max=N_max,
+    )
 
     prepared = self._preprocess_inputs(
         q,
