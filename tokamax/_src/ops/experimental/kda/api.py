@@ -88,9 +88,10 @@ def kimi_delta_attention(
     disable_recompute: Pallas custom-VJP recompute policy. XLA reference
       implementations accept it but the mathematical result is unchanged.
     cp_context: Optional context-parallel metadata.
-    chunk_size: Chunk size used by Pallas and as the default static segment
-      bound when `N_max` is omitted.
-    N_max: Optional static upper bound for the number of varlen segments.
+    chunk_size: Chunk size used by Pallas.
+    N_max: Static upper bound for the number of varlen segments. Required when
+      `segment_ids` is provided without `initial_state`; otherwise inferred
+      from the initial state's segment dimension.
     implementation: The implementation to use. `"xla"` evaluates the recurrent
       reference implementation. `"pallas_tpu"` uses the experimental Pallas TPU
       forward and custom VJP implementation from pallas-kernel.

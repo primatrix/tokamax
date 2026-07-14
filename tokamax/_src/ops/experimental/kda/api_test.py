@@ -18,9 +18,11 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src import numerics
 from tokamax._src.ops.experimental.kda import api
+from tokamax._src.ops.experimental.kda.cp_utils import CPContext
 
 
 def _accumulator_dtype(dtype):
@@ -96,8 +98,8 @@ def _reference_kda(
           seg = segment_ids[b, t].astype(jnp.int32)
           idx = jnp.clip(seg - 1, 0, num_states - 1)
           valid = (seg > 0) & (seg <= num_states)
-        state = states[b, idx, h]
-        state = state * jnp.exp(g_h[h, b, t])[:, None]
+        previous_state = states[b, idx, h]
+        state = previous_state * jnp.exp(g_h[h, b, t])[:, None]
         prediction = k_h[h, b, t] @ state
         residual = v_h[h, b, t] - prediction
         new_state = state + (
@@ -107,7 +109,9 @@ def _reference_kda(
         output = output.at[h, b, t].set(
             jnp.where(valid, out, jnp.zeros_like(out))
         )
-        states = states.at[b, idx, h].set(jnp.where(valid, new_state, state))
+        states = states.at[b, idx, h].set(
+            jnp.where(valid, new_state, previous_state)
+        )
 
   return output.astype(q.dtype), states if output_final_state else None
 
@@ -276,11 +280,114 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
     ):
       api.kimi_delta_attention(q, k, v, g, beta, implementation="pallas_tpu")
 
+  def test_pallas_tpu_rejects_large_key_dimension_before_kernel(self):
+    q = k = g = jnp.ones((1, 1, 64, 257), dtype=jnp.float32)
+    v = jnp.ones((1, 1, 64, 1), dtype=jnp.float32)
+    beta = jnp.ones((1, 1, 64), dtype=jnp.float32)
+    pallas_op = api.IMPLEMENTATIONS["pallas_tpu"]
+
+    with self.assertRaisesRegex(NotImplementedError, "up to 256"):
+      pallas_op._fwd(  # pylint: disable=protected-access
+          q,
+          k,
+          v,
+          g,
+          beta,
+          A_log=None,
+          dt_bias=None,
+          scale=257**-0.5,
+          initial_state=None,
+          output_final_state=False,
+          use_qk_l2norm_in_kernel=False,
+          use_gate_in_kernel=False,
+          segment_ids=None,
+          safe_gate=True,
+          lower_bound=None,
+          disable_recompute=True,
+          cp_context=None,
+          chunk_size=64,
+          N_max=None,
+          return_residuals=False,
+          config=None,
+      )
+
   def test_no_final_state_by_default(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)
     output, final_state = api.kimi_delta_attention(q, k, v, g, beta)
     self.assertEqual(output.shape, v.shape)
     self.assertIsNone(final_state)
+
+  def test_varlen_requires_n_max_without_initial_state(self):
+    shape = (1, 1, 65, 1)
+    q = k = v = beta_4d = jnp.ones(shape, dtype=jnp.float32)
+    g = jnp.zeros_like(q)
+    beta = beta_4d[..., 0]
+    segment_ids = jnp.concatenate([
+        jnp.ones((1, 20), dtype=jnp.int32),
+        jnp.full((1, 20), 2, dtype=jnp.int32),
+        jnp.full((1, 25), 3, dtype=jnp.int32),
+    ], axis=1)
+
+    with self.assertRaisesRegex(ValueError, "`N_max` is required"):
+      api.kimi_delta_attention(
+          q,
+          k,
+          v,
+          g,
+          beta,
+          segment_ids=segment_ids,
+          implementation="xla",
+      )
+
+  def test_padding_preserves_final_state(self):
+    q = k = v = jnp.ones((1, 1, 3, 1), dtype=jnp.float32)
+    g = jnp.full_like(q, jnp.log(0.5))
+    beta = jnp.ones((1, 1, 3), dtype=jnp.float32)
+    segment_ids = jnp.array([[1, 0, 0]], dtype=jnp.int32)
+
+    output, final_state = api.kimi_delta_attention(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        segment_ids=segment_ids,
+        output_final_state=True,
+        N_max=1,
+        implementation="xla",
+    )
+    _, unpadded_final_state = api.kimi_delta_attention(
+        q[:, :, :1],
+        k[:, :, :1],
+        v[:, :, :1],
+        g[:, :, :1],
+        beta[:, :, :1],
+        segment_ids=segment_ids[:, :1],
+        output_final_state=True,
+        N_max=1,
+        implementation="xla",
+    )
+
+    chex.assert_trees_all_close(final_state, unpadded_final_state)
+    chex.assert_trees_all_close(
+        output[:, :, 1:], jnp.zeros_like(output[:, :, 1:])
+    )
+
+  def test_cp_context_does_not_break_public_op_metadata(self):
+    q, k, v, g, beta, _ = _make_inputs(jnp.float32)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ("context",))
+
+    output, _ = api.kimi_delta_attention(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cp_context=CPContext(mesh=mesh),
+        implementation="xla",
+    )
+
+    self.assertEqual(output.shape, v.shape)
 
   def test_invalid_shape(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)

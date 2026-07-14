@@ -24,7 +24,10 @@ from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-i
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.kda import base
-from tokamax._src.ops.experimental.kda.cp_utils import CPContext
+from tokamax._src.ops.experimental.kda.cp_utils import (
+    CPContext,
+    CPContextArg,
+)
 from tokamax._src.ops.experimental.kda.pallas_tpu_bwd import (
     chunk_kda_bwd_custom,
 )
@@ -103,21 +106,17 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
   ) -> _PreparedKdaInputs:
     """Canonicalizes inputs shared by the forward and backward kernels."""
     cp_context, cu_seqlens = derive_cp_context(
-        q=q,
         segment_ids=segment_ids,
         initial_state=initial_state,
         output_final_state=output_final_state,
         cp_context=cp_context,
-        chunk_size=chunk_size,
         N_max=N_max,
     )
     if cu_seqlens is None:
       cu_seqlens, N_max = segment_ids_to_cu_seqlens(
           segment_ids,
           initial_state=initial_state,
-          chunk_size=chunk_size,
           N_max=N_max,
-          seq_len=q.shape[2],
       )
 
     aligned_cu_seqlens = None
@@ -273,7 +272,7 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
       safe_gate: bool,
       lower_bound: float | None,
       disable_recompute: bool,
-      cp_context: CPContext | None,
+      cp_context: CPContextArg,
       chunk_size: int,
       N_max: int | None,
       return_residuals: bool,
@@ -284,6 +283,11 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
     if q.dtype not in (jnp.bfloat16, jnp.float32):
       raise NotImplementedError(
           "`pallas_tpu` currently supports bfloat16 and float32 inputs only."
+      )
+    if q.shape[-1] > 256:
+      raise NotImplementedError(
+          "`pallas_tpu` currently supports key dimensions up to 256; got "
+          f"K={q.shape[-1]}."
       )
     if chunk_size != 64:
       raise NotImplementedError("`pallas_tpu` currently supports chunk_size=64.")
@@ -369,7 +373,7 @@ class PallasTpuKimiDeltaAttentionVjp(
       safe_gate: bool,
       lower_bound: float | None,
       disable_recompute: bool,
-      cp_context: CPContext | None,
+      cp_context: CPContextArg,
       chunk_size: int,
       N_max: int | None,
       return_residuals: bool,

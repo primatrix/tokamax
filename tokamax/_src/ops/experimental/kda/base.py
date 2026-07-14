@@ -21,6 +21,10 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
+from tokamax._src.ops.experimental.kda.cp_utils import (
+    CPContext,
+    CPContextArg,
+)
 from typing_extensions import override
 
 
@@ -38,10 +42,6 @@ def _accumulator_dtype(dtype: jax.typing.DTypeLike) -> jnp.dtype:
 def _check_array_rank(x: jax.Array, rank: int, name: str):
   if x.ndim != rank:
     raise ValueError(f"`{name}` must be rank {rank}, got shape {x.shape}.")
-
-
-def _cdiv(x: int, y: int) -> int:
-  return (x + y - 1) // y
 
 
 def _l2_normalize(x: jax.Array, acc_dtype: jnp.dtype) -> jax.Array:
@@ -102,8 +102,6 @@ def _state_count(
     *,
     segment_ids: jax.Array | None,
     initial_state: jax.Array | None,
-    chunk_size: int,
-    seq_len: int,
     N_max: int | None,
 ) -> int:
   if initial_state is not None:
@@ -112,7 +110,10 @@ def _state_count(
     return 1
   if N_max is not None:
     return N_max
-  return _cdiv(seq_len, chunk_size)
+  raise ValueError(
+      "`N_max` is required when `segment_ids` is provided without "
+      "`initial_state`."
+  )
 
 
 class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
@@ -144,7 +145,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       safe_gate: bool = True,
       lower_bound: float | None = None,
       disable_recompute: bool = True,
-      cp_context: Any | None = None,
+      cp_context: CPContext | None = None,
       chunk_size: int = 64,
       N_max: int | None = None,
       return_residuals: bool = False,
@@ -186,6 +187,11 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       raise ValueError(f"`chunk_size` must be positive, got {chunk_size}.")
     if N_max is not None and N_max <= 0:
       raise ValueError(f"`N_max` must be positive, got {N_max}.")
+    if segment_ids is not None and initial_state is None and N_max is None:
+      raise ValueError(
+          "`N_max` is required when `segment_ids` is provided without "
+          "`initial_state`."
+      )
     _validate_gate_args(
         use_gate_in_kernel=use_gate_in_kernel,
         A_log=A_log,
@@ -243,14 +249,14 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       safe_gate: bool,
       lower_bound: float | None,
       disable_recompute: bool,
-      cp_context: Any | None,
+      cp_context: CPContextArg,
       chunk_size: int,
       N_max: int | None,
       return_residuals: bool,
       config: _Config,
   ) -> tuple[Output, Residuals]:
     """Computes KDA with explicit Python loops."""
-    del config, return_residuals, safe_gate, disable_recompute
+    del config, return_residuals, safe_gate, disable_recompute, chunk_size
 
     heads, batch, seq_len, key_dim = q.shape
     value_dim = v.shape[-1]
@@ -299,8 +305,6 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
     num_states = _state_count(
         segment_ids=segment_ids,
         initial_state=initial_state,
-        chunk_size=chunk_size,
-        seq_len=seq_len,
         N_max=N_max,
     )
 
@@ -322,8 +326,8 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         state_idx = jnp.clip(seg_id - 1, 0, num_states - 1)
         valid = (seg_id > 0) & (seg_id <= num_states)
 
-      state = states[b, state_idx, h]
-      state = state * jnp.exp(g_h[h, b, t])[:, None]
+      previous_state = states[b, state_idx, h]
+      state = previous_state * jnp.exp(g_h[h, b, t])[:, None]
       prediction = k_h[h, b, t] @ state
       residual = v_h[h, b, t] - prediction
       new_state = state + (
@@ -333,7 +337,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       output_h = output_h.at[h, b, t].set(
           jnp.where(valid, out_t, jnp.zeros_like(out_t))
       )
-      updated_state = jnp.where(valid, new_state, state)
+      updated_state = jnp.where(valid, new_state, previous_state)
       states = states.at[b, state_idx, h].set(updated_state)
       return states, output_h
 

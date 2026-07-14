@@ -1450,6 +1450,8 @@ def chunk_kda_bwd_custom(
 ]:
   """Runs the full KDA backward pipeline from forward residuals."""
   do, dht = grad_outputs
+  # JAX cotangents match the bf16 output dtype; backward accumulates in fp32.
+  do = do.astype(jnp.float32)
   q = residuals.q
   k = residuals.k
   v = residuals.v
@@ -1525,10 +1527,13 @@ def chunk_kda_bwd_custom(
     if caller_N_max is not None:
       N_max = caller_N_max
     else:
-      N_max = cdiv(T, BT)
-      if initial_state is not None:
-        # Varlen: (B, N, H, K, V)
-        N_max = initial_state.shape[1]
+      if initial_state is None:
+        raise ValueError(
+            "`N_max` is required when `segment_ids` is provided without "
+            "`initial_state`."
+        )
+      # Varlen: (B, N, H, K, V)
+      N_max = initial_state.shape[1]
     cu_seqlens = segment_ids_to_seqlens(segment_ids, max_segs=N_max)
 
   # "N_max must be provided when segment_ids are used" — unless cu_seqlens

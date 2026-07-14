@@ -149,7 +149,7 @@ def chunk_local_cumsum_vector(
   chunk_size: int,
   reverse: bool = False,
   scale: float | None = None,
-  output_dtype = jnp.float32,
+  output_dtype: jax.typing.DTypeLike = jnp.float32,
 ) -> Float[Array, "H B T K"]:
   """Computes prefix or suffix sums independently within each chunk."""
   assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
@@ -932,7 +932,7 @@ def kda_gate_chunk_cumsum(
   chunk_size: int,
   scale: float | None = None,
   dt_bias: Float[Array, "H*K"] | None = None,
-  output_dtype = jnp.float32,
+  output_dtype: jax.typing.DTypeLike = jnp.float32,
   lower_bound: float | None = None,
 ) -> Float[Array, "H B T K"]:
   """Applies the KDA gate activation and its chunk-local cumulative sum."""

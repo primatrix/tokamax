@@ -48,12 +48,10 @@ def l2norm_bwd(y: jax.Array, rstd: jax.Array, dy: jax.Array):
 
 def derive_cp_context(
     *,
-    q: jax.Array,
     segment_ids: jax.Array | None,
     initial_state: jax.Array | None,
     output_final_state: bool,
     cp_context: CPContext | None,
-    chunk_size: int,
     N_max: int | None,
 ) -> tuple[CPContext | None, jax.Array | None]:
   cu_seqlens = None
@@ -67,7 +65,9 @@ def derive_cp_context(
   if segment_ids is None:
     raise ValueError("CP requires rank-local `segment_ids` with shape [B, T].")
 
-  n_max = N_max if N_max is not None else cdiv(q.shape[2], chunk_size)
+  if N_max is None:
+    raise ValueError("`N_max` is required when CP uses `segment_ids`.")
+  n_max = N_max
   cu_locals, chain_metas = [], []
   for b in range(segment_ids.shape[0]):
     cu_b, meta_b = _derive_cp_metadata_from_segment_ids(
@@ -93,18 +93,17 @@ def segment_ids_to_cu_seqlens(
     segment_ids: jax.Array | None,
     *,
     initial_state: jax.Array | None,
-    chunk_size: int,
     N_max: int | None,
-    seq_len: int,
 ) -> tuple[jax.Array | None, int | None]:
   if segment_ids is None:
     return None, N_max
   if N_max is None:
-    N_max = (
-        initial_state.shape[1]
-        if initial_state is not None
-        else cdiv(seq_len, chunk_size)
-    )
+    if initial_state is None:
+      raise ValueError(
+          "`N_max` is required when `segment_ids` is provided without "
+          "`initial_state`."
+      )
+    N_max = initial_state.shape[1]
   return segment_ids_to_seqlens(segment_ids, max_segs=N_max), N_max
 
 

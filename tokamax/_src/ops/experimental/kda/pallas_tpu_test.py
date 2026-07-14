@@ -15,8 +15,8 @@
 """Numerical tests for the experimental Pallas TPU KDA implementation."""
 
 import dataclasses
+import math
 
-import chex
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
@@ -24,9 +24,103 @@ from jax.sharding import PartitionSpec as P
 import numpy as np
 import pytest
 from tokamax._src import jaxtyping
-from tokamax._src.ops.experimental.kda import base
-from tokamax._src.ops.experimental.kda import pallas_tpu
+from tokamax._src.ops.experimental.kda import api
 from tokamax._src.ops.experimental.kda.cp_utils import CPContext
+
+
+def _compute_ulp(
+    x: np.ndarray, dtype: jax.typing.DTypeLike
+) -> np.ndarray:
+  """Computes one unit in the last place for `dtype` at each value in `x`."""
+  finfo = jnp.finfo(dtype)
+  mantissa_bits = round(-math.log2(float(finfo.eps)))
+  min_ulp = float(finfo.tiny) * float(finfo.eps)
+
+  abs_x = np.abs(x).astype(np.float64)
+  _, exponent = np.frexp(abs_x)
+  ulp = np.ldexp(1.0, exponent.astype(np.int32) - mantissa_bits - 1)
+  ulp = np.maximum(ulp, min_ulp)
+  return np.where(abs_x == 0, min_ulp, ulp)
+
+
+def compare_tensor(
+    name: str,
+    expected: jax.Array | np.ndarray | None,
+    actual: jax.Array | np.ndarray | None,
+    atol: float = 1e-5,
+    rtol: float = 1e-5,
+    max_ulp: int = 1,
+    dtype: jax.typing.DTypeLike = jnp.bfloat16,
+    compare_dtype: jax.typing.DTypeLike = np.float64,
+) -> bool:
+  """Compares two tensors and prints focused numerical diagnostics."""
+  if expected is None and actual is None:
+    print(f"[{name}] Both are None. PASS.")
+    return True
+  if expected is None or actual is None:
+    print(f"[{name}] One is None. FAIL.")
+    return False
+
+  expected_dtype = np.dtype(expected.dtype).name
+  actual_dtype = np.dtype(actual.dtype).name
+  if expected_dtype != actual_dtype:
+    print(
+        f"[{name}] Dtype mismatch: Left {expected.dtype} vs "
+        f"Right {actual.dtype}. FAIL."
+    )
+    return False
+
+  expected_np = np.asarray(expected).astype(compare_dtype)
+  actual_np = np.asarray(actual).astype(compare_dtype)
+  if expected_np.shape != actual_np.shape:
+    print(
+        f"[{name}] Shape mismatch: Left {expected_np.shape} vs "
+        f"Right {actual_np.shape}. FAIL."
+    )
+    if expected_np.squeeze().shape != actual_np.squeeze().shape:
+      return False
+    expected_np = expected_np.squeeze()
+    actual_np = actual_np.squeeze()
+    print(f"  Comparing squeezed shape: {expected_np.shape}")
+
+  diff = np.abs(expected_np - actual_np)
+  max_diff = np.max(diff)
+  max_value = np.max(np.abs(actual_np))
+  max_relative_diff = np.max(diff / (np.abs(actual_np) + 1e-12))
+  is_close = np.allclose(
+      expected_np,
+      actual_np,
+      atol=atol,
+      rtol=rtol,
+      equal_nan=True,
+  )
+
+  if not is_close:
+    ulp = _compute_ulp(
+        np.maximum(np.abs(expected_np), np.abs(actual_np)), dtype
+    )
+    tolerance = np.maximum(
+        atol + rtol * np.abs(actual_np), max_ulp * ulp
+    )
+    is_close = bool(np.all(diff <= tolerance))
+
+  print(f"[{name}] {'PASS' if is_close else 'FAIL'}")
+  print(f"  Max Value        : {max_value:.6e}")
+  print(f"  Max Abs Diff     : {max_diff:.6e}")
+  print(f"  Max Rel Diff     : {max_relative_diff:.6e}")
+
+  if not is_close:
+    error_ratio = diff / (tolerance + 1e-12)
+    index = np.unravel_index(np.argmax(error_ratio), error_ratio.shape)
+    print(f"  Max Mismatch details at index {index}:")
+    print(f"    Left (expected) = {expected_np[index]}")
+    print(f"    Right (actual)  = {actual_np[index]}")
+    print(f"    Diff            = {diff[index]}")
+    print(f"    Tolerance       = {tolerance[index]}")
+    print(f"    ULP diff        = {diff[index] / ulp[index]:.2f}")
+    print(f"    Ratio           = {error_ratio[index]}")
+
+  return is_close
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,12 +189,11 @@ _CASES = (
         heads=2,
         seq_lens=(128,),
         cp_size=2,
+        key_dim=64,
+        value_dim=64,
+        dtype=jnp.float32,
     ),
 )
-
-_PALLAS = pallas_tpu.PallasTpuKimiDeltaAttention()
-_PALLAS_VJP = pallas_tpu.PallasTpuKimiDeltaAttentionVjp()
-_REFERENCE = base.KimiDeltaAttention()
 
 
 def _case_params():
@@ -127,13 +220,6 @@ def _make_segment_ids(seq_lens: tuple[int, ...], seq_len: int) -> jax.Array:
     ids[0, offset : offset + length] = segment_id
     offset += length
   return jnp.asarray(ids)
-
-
-def _pad_sequence(x: jax.Array, seq_len: int) -> jax.Array:
-  pad_len = seq_len - x.shape[2]
-  if x.ndim == 4:
-    return jnp.pad(x, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
-  return jnp.pad(x, ((0, 0), (0, 0), (0, pad_len)))
 
 
 def _make_inputs(case: _Case) -> _Inputs:
@@ -194,12 +280,6 @@ def _make_inputs(case: _Case) -> _Inputs:
         * jax.nn.softplus(gate_input)
     ).astype(case.dtype)
 
-  q = _pad_sequence(q, case.seq_len)
-  k = _pad_sequence(k, case.seq_len)
-  v = _pad_sequence(v, case.seq_len)
-  g = _pad_sequence(g, case.seq_len)
-  beta = _pad_sequence(beta, case.seq_len)
-
   segment_ids = (
       _make_segment_ids(case.seq_lens, case.seq_len)
       if case.seq_lens is not None
@@ -259,15 +339,14 @@ def _attention_kwargs(case: _Case, inputs: _Inputs) -> dict[str, object]:
   )
 
 
-def _call_forward(
-    op: base.KimiDeltaAttention,
+def _call_attention(
+    implementation: api.Implementation,
     case: _Case,
     inputs: _Inputs,
     *,
     cp_context: CPContext | None = None,
-    return_residuals: bool = False,
 ):
-  return op._fwd(  # pylint: disable=protected-access
+  return api.kimi_delta_attention(
       inputs.q,
       inputs.k,
       inputs.v,
@@ -275,8 +354,7 @@ def _call_forward(
       inputs.beta,
       segment_ids=inputs.segment_ids,
       cp_context=cp_context,
-      return_residuals=return_residuals,
-      config=None,
+      implementation=implementation,
       **_attention_kwargs(case, inputs),
   )
 
@@ -300,13 +378,13 @@ def _cp_forward(case: _Case, inputs: _Inputs) -> tuple[jax.Array, None]:
         beta=beta,
         segment_ids=segment_ids,
     )
-    output, _ = _call_forward(
-        _PALLAS,
+    output, _ = _call_attention(
+        "pallas_tpu",
         case,
         local_inputs,
         cp_context=cp_context,
     )
-    return output[0]
+    return output
 
   # The CP pre-process accepts batched cu_seqlens, but its runtime annotation
   # currently describes only the unbatched fast path.
@@ -335,52 +413,9 @@ def _cp_forward(case: _Case, inputs: _Inputs) -> tuple[jax.Array, None]:
 def _forward(case: _Case, inputs: _Inputs, *, reference: bool = False):
   if not reference and case.cp_size > 1:
     return _cp_forward(case, inputs)
-  output, _ = _call_forward(
-      _REFERENCE if reference else _PALLAS, case, inputs
+  return _call_attention(
+      "xla" if reference else "pallas_tpu", case, inputs
   )
-  return output
-
-
-def _select_input_grads(
-    case: _Case, grads: dict[str, jax.Array]
-) -> tuple[jax.Array, ...]:
-  names = ("q", "k", "v", "g", "beta")
-  if case.use_initial_state:
-    names += ("initial_state",)
-  return tuple(grads[name] for name in names)
-
-
-def _pallas_backward(
-    case: _Case,
-    inputs: _Inputs,
-    *,
-    cp_context: CPContext | None = None,
-) -> tuple[jax.Array, ...]:
-  output, residuals = _call_forward(
-      _PALLAS,
-      case,
-      inputs,
-      cp_context=cp_context,
-      return_residuals=True,
-  )
-  if residuals is None:
-    raise ValueError("Pallas forward did not return backward residuals.")
-  grads, _ = _PALLAS_VJP._fwd(  # pylint: disable=protected-access
-      residuals,
-      output,
-      (inputs.dout, inputs.dfinal_state),
-      inputs.q,
-      inputs.k,
-      inputs.v,
-      inputs.g,
-      inputs.beta,
-      segment_ids=inputs.segment_ids,
-      cp_context=cp_context,
-      return_residuals=True,
-      config=None,
-      **_attention_kwargs(case, inputs),
-  )
-  return _select_input_grads(case, grads)
 
 
 def _cp_backward(case: _Case, inputs: _Inputs) -> tuple[jax.Array, ...]:
@@ -397,7 +432,18 @@ def _cp_backward(case: _Case, inputs: _Inputs) -> tuple[jax.Array, ...]:
         segment_ids=segment_ids,
         dout=dout,
     )
-    return _pallas_backward(case, local_inputs, cp_context=cp_context)
+
+    def local_forward(q, k, v, g, beta):
+      current_inputs = dataclasses.replace(
+          local_inputs, q=q, k=k, v=v, g=g, beta=beta
+      )
+      output, _ = _call_attention(
+          "pallas_tpu", case, current_inputs, cp_context=cp_context
+      )
+      return output
+
+    _, pullback = jax.vjp(local_forward, q, k, v, g, beta)
+    return pullback(dout)
 
   qkv_spec = P(None, None, "context", None)
   beta_spec = P(None, None, "context")
@@ -423,8 +469,8 @@ def _cp_backward(case: _Case, inputs: _Inputs) -> tuple[jax.Array, ...]:
     )
 
 
-def _reference_backward(
-    case: _Case, inputs: _Inputs
+def _direct_backward(
+    implementation: api.Implementation, case: _Case, inputs: _Inputs
 ) -> tuple[jax.Array, ...]:
   def loss_fn(q, k, v, g, beta, initial_state):
     current_inputs = dataclasses.replace(
@@ -436,7 +482,9 @@ def _reference_backward(
         beta=beta,
         initial_state=initial_state,
     )
-    output, final_state = _forward(case, current_inputs, reference=True)
+    output, final_state = _call_attention(
+        implementation, case, current_inputs
+    )
     loss = jnp.sum(output.astype(jnp.float32) * inputs.dout)
     if inputs.dfinal_state is not None:
       if final_state is None:
@@ -475,7 +523,17 @@ def test_chunk_kda_forward(case: _Case):
   reference = _forward(case, inputs, reference=True)
   jax.block_until_ready((output, reference))
 
-  chex.assert_trees_all_close(output, reference, atol=0.05, rtol=0.05)
+  for name, actual, expected in zip(
+      ("output", "final_state"), output, reference, strict=True
+  ):
+    assert compare_tensor(
+        name,
+        expected,
+        actual,
+        atol=0.05,
+        rtol=0.05,
+        dtype=actual.dtype if actual is not None else case.dtype,
+    ), f"{name} mismatch"
 
 
 @pytest.mark.parametrize("case", _case_params())
@@ -486,14 +544,25 @@ def test_chunk_kda_backward(case: _Case):
   grads = (
       _cp_backward(case, inputs)
       if case.cp_size > 1
-      else _pallas_backward(case, inputs)
+      else _direct_backward("pallas_tpu", case, inputs)
   )
-  reference_grads = _reference_backward(case, inputs)
+  reference_grads = _direct_backward("xla", case, inputs)
   jax.block_until_ready((grads, reference_grads))
 
-  chex.assert_trees_all_close(
-      grads, reference_grads, atol=0.08, rtol=0.08
-  )
+  grad_names = ["dq", "dk", "dv", "dg", "dbeta"]
+  if case.use_initial_state:
+    grad_names.append("dh0")
+  for name, actual, expected in zip(
+      grad_names, grads, reference_grads, strict=True
+  ):
+    assert compare_tensor(
+        name,
+        expected,
+        actual,
+        atol=0.05,
+        rtol=0.05,
+        dtype=actual.dtype,
+    ), f"Gradient mismatch for {name}"
 
 
 if __name__ == "__main__":

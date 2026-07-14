@@ -14,7 +14,8 @@
 # ==============================================================================
 """Shared data contracts for the Pallas TPU KDA implementation."""
 
-from typing import NamedTuple, TypeAlias
+import dataclasses
+from typing import TypeAlias
 
 import jax
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
@@ -28,7 +29,9 @@ CpMetadata: TypeAlias = tuple[
 ] | None
 
 
-class KdaResiduals(NamedTuple):
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, slots=True)
+class KdaResiduals:
   """Prepared forward values consumed by the custom backward."""
 
   q: Float[Array, "H B T_ALIGNED K"]

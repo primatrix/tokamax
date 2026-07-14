@@ -1541,7 +1541,6 @@ def kda_fwd_intra_fused(
         g=g,
         scale=RCP_LN2,
         chunk_size=chunk_size,
-        head_first=True,
       )
 
     # S2: intra-chunk solve without BC=16 tiling.
@@ -1570,39 +1569,26 @@ def kda_fwd_intra_fused(
   )
 
 
+@jaxtyping.jaxtyped
 def kda_gate_cumsum(
-  g: jax.Array,
+  g: Float[Array, "H B T K"],
   chunk_size: int,
   reverse: bool = False,
   scale: float = RCP_LN2,
-  head_first: bool = True,
   output_dtype: jnp.dtype | None = jnp.float32,
-) -> jax.Array:
-  """Chunk-local cumulative sum of pre-activated KDA gates.
-
-  For the case where gates are already activated (use_gate_in_kernel=False),
-  converts g from natural log space to log2 space (g / ln2) via
-  chunk-local cumsum with scale=RCP_LN2.
-
-  Args:
-      g:          [H, B, T, K] -- per-element gate in natural log space
-                  (head-first layout).
-      chunk_size: int -- chunk size BT. T must be divisible by chunk_size.
-      scale:      float -- scale factor applied after cumsum (default 1/ln2).
-
-  Returns:
-      g_out: [H, B, T, K] (float32) -- chunk-local cumsum in log2 space.
-  """
-  H, B, T, K = g.shape
-  assert_shape(g, (H, B, T, K), "g")
-  assert T % chunk_size == 0, f"T={T} must be divisible by chunk_size={chunk_size}"
+) -> Float[Array, "H B T K"]:
+  """Computes chunk-local log2 cumulative sums of activated gates."""
+  T = g.shape[2]
+  if T % chunk_size != 0:
+    raise ValueError(
+        f"T={T} must be divisible by chunk_size={chunk_size}."
+    )
 
   return chunk_local_cumsum_vector(
     g,
     chunk_size=chunk_size,
     reverse=reverse,
     scale=scale,
-    head_first=head_first,
     output_dtype=output_dtype,
   )
 

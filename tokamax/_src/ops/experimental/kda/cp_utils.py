@@ -31,11 +31,12 @@ context. All ranks share one trace inside ``shard_map``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Annotated, TYPE_CHECKING, Any, TypeAlias
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pydantic
 
 if TYPE_CHECKING:
   import jax.sharding
@@ -118,6 +119,21 @@ class CPContext:
   def is_cp_enabled(self) -> bool:
     """True iff CP is actually parallelised (``cp_size > 1``)."""
     return self.cp_size > 1
+
+
+def _exclude_cp_context_from_json(_: CPContext | None) -> None:
+  """Keeps the runtime mesh out of serialized Op metadata."""
+  return None
+
+
+CPContextArg: TypeAlias = Annotated[
+    CPContext | None,
+    pydantic.PlainSerializer(
+        _exclude_cp_context_from_json,
+        return_type=type(None),
+        when_used="json",
+    ),
+]
 
 
 def all_gather_into_tensor(
