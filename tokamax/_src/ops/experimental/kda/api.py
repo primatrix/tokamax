@@ -31,6 +31,7 @@ try:
   from tokamax._src.ops.experimental.kda import pallas_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
   IMPLEMENTATIONS["pallas_tpu"] = pallas_tpu.PallasTpuKimiDeltaAttention()
+  _DEFAULT_IMPLEMENTATIONS = ("pallas_tpu",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
@@ -98,12 +99,14 @@ def kimi_delta_attention(
       `kda.CPContext(mesh, axis_name)`.
     chunk_size: Chunk size used by Pallas.
     N_max: Static upper bound for the number of varlen segments. Required when
-      `segment_ids` is provided without `initial_state`. When `initial_state`
-      is provided, `N_max` defaults to its segment dimension `N`; an explicitly
-      supplied value must equal `N`.
-    implementation: The implementation to use. `"xla"` evaluates the recurrent
-      reference implementation. `"pallas_tpu"` uses the experimental Pallas TPU
-      forward and custom VJP implementation from pallas-kernel.
+      `segment_ids` is provided without `initial_state`; otherwise inferred
+      from the initial state's segment dimension.
+    implementation: The implementation to use. By default, the Pallas TPU
+      implementation is attempted first when available, with XLA as a fallback.
+      `"xla"` evaluates the recurrent reference implementation. `"pallas_tpu"`
+      uses the experimental Pallas TPU forward and custom VJP implementation
+      from pallas-kernel. A sequence tries implementations in order, falling
+      back when an implementation raises `NotImplementedError`.
 
   Returns:
     A pair `(output, final_state)`. The output has shape `[H, B, T, V]`.
