@@ -31,7 +31,6 @@ try:
   from tokamax._src.ops.experimental.kda import pallas_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
   IMPLEMENTATIONS["pallas_tpu"] = pallas_tpu.PallasTpuKimiDeltaAttention()
-  _DEFAULT_IMPLEMENTATIONS = ("pallas_tpu",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
