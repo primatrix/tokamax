@@ -494,6 +494,7 @@ def _solve_unit_lower_triangular(A, b):
           vec,
           mat,
           (((1,), (0,)), ((), ())),
+          precision=jax.lax.Precision.HIGHEST,
           preferred_element_type=jnp.float32,
         ).squeeze(axis=0)
         rows[j] = rows[j] - correction
@@ -510,6 +511,7 @@ def _solve_unit_lower_triangular(A, b):
         A_rest,
         x_block,
         (((1,), (0,)), ((), ())),
+        precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
       )
       x_rest = x_rest - update

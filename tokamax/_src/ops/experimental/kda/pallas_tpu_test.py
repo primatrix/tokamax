@@ -86,11 +86,11 @@ def compare_tensor(
 
   diff = np.abs(expected_np - actual_np)
   max_diff = np.max(diff)
-  max_value = np.max(np.abs(actual_np))
-  max_relative_diff = np.max(diff / (np.abs(actual_np) + 1e-12))
+  max_value = np.max(np.abs(expected_np))
+  max_relative_diff = np.max(diff / (np.abs(expected_np) + 1e-12))
   is_close = np.allclose(
-      expected_np,
       actual_np,
+      expected_np,
       atol=atol,
       rtol=rtol,
       equal_nan=True,
@@ -101,7 +101,7 @@ def compare_tensor(
         np.maximum(np.abs(expected_np), np.abs(actual_np)), dtype
     )
     tolerance = np.maximum(
-        atol + rtol * np.abs(actual_np), max_ulp * ulp
+        atol + rtol * np.abs(expected_np), max_ulp * ulp
     )
     is_close = bool(np.all(diff <= tolerance))
 
@@ -950,7 +950,11 @@ def _cp_mesh(case: TestConfig) -> tuple[Mesh, CPContext]:
   return mesh, CPContext(mesh=mesh, axis_name="context")
 
 
-def _cp_forward(case: TestConfig, inputs: _Inputs) -> tuple[jax.Array, None]:
+def _cp_forward(
+    implementation: api.Implementation | Sequence[api.Implementation] | None,
+    case: TestConfig,
+    inputs: _Inputs,
+) -> tuple[jax.Array, None]:
   mesh, cp_context = _cp_mesh(case)
 
   def local_forward(q, k, v, g, beta, segment_ids):
@@ -964,7 +968,7 @@ def _cp_forward(case: TestConfig, inputs: _Inputs) -> tuple[jax.Array, None]:
         segment_ids=segment_ids,
     )
     output, _ = _call_attention(
-        "pallas_tpu",
+        implementation,
         case,
         local_inputs,
         cp_context=cp_context,
@@ -995,19 +999,11 @@ def _cp_forward(case: TestConfig, inputs: _Inputs) -> tuple[jax.Array, None]:
   return output, None
 
 
-def _forward(case: TestConfig, inputs: _Inputs, *, reference: bool = False):
-  if case.cp_size > 1:
-    if not reference:
-      return _cp_forward(case, inputs)
-    # Match pallas-kernel's CP tests: isolate context parallelism by comparing
-    # it with the non-CP Pallas path on the same global tensors.
-    return _call_attention("pallas_tpu", case, inputs)
-  return _call_attention(
-      "xla" if reference else None, case, inputs
-  )
-
-
-def _cp_backward(case: TestConfig, inputs: _Inputs) -> tuple[jax.Array, ...]:
+def _cp_backward(
+    implementation: api.Implementation | Sequence[api.Implementation] | None,
+    case: TestConfig,
+    inputs: _Inputs,
+) -> tuple[jax.Array, ...]:
   mesh, cp_context = _cp_mesh(case)
 
   def local_backward(q, k, v, g, beta, segment_ids, dout):
@@ -1027,7 +1023,7 @@ def _cp_backward(case: TestConfig, inputs: _Inputs) -> tuple[jax.Array, ...]:
           local_inputs, q=q, k=k, v=v, g=g, beta=beta
       )
       output, _ = _call_attention(
-          "pallas_tpu", case, current_inputs, cp_context=cp_context
+          implementation, case, current_inputs, cp_context=cp_context
       )
       return output
 
@@ -1135,8 +1131,12 @@ def test_chunk_kda_forward(case: TestConfig):
   _require_tpu(case)
   inputs = _make_inputs(case)
 
-  actual_result = _forward(case, inputs)
-  expected_result = _forward(case, inputs, reference=True)
+  if case.cp_size > 1:
+    actual_result = _cp_forward("pallas_tpu", case, inputs)
+    expected_result = _cp_forward("xla", case, inputs)
+  else:
+    actual_result = _call_attention("pallas_tpu", case, inputs)
+    expected_result = _call_attention("xla", case, inputs)
   jax.block_until_ready((actual_result, expected_result))
 
   for name, actual, expected in zip(
@@ -1191,7 +1191,7 @@ def test_chunk_kda_backward(case: TestConfig):
   inputs = _make_inputs(case)
 
   grads = (
-      _cp_backward(case, inputs)
+      _cp_backward("pallas_tpu", case, inputs)
       if case.cp_size > 1
       else _direct_backward(None, case, inputs)
   )
@@ -1200,7 +1200,11 @@ def test_chunk_kda_backward(case: TestConfig):
     grad_names += ("dh0",)
 
   if case.backward_check == "finite":
-    output, _ = _forward(case, inputs)
+    output, _ = (
+        _cp_forward("pallas_tpu", case, inputs)
+        if case.cp_size > 1
+        else _call_attention("pallas_tpu", case, inputs)
+    )
     jax.block_until_ready((grads, output))
     for name, grad in zip(grad_names, grads, strict=True):
       assert bool(jnp.all(jnp.isfinite(grad))), f"{name} contains NaN/Inf"
@@ -1209,8 +1213,10 @@ def test_chunk_kda_backward(case: TestConfig):
   if case.backward_check != "reference":
     raise ValueError(f"Unknown backward check: {case.backward_check}")
 
-  reference_grads = _direct_backward(
-      "pallas_tpu" if case.cp_size > 1 else "xla", case, inputs
+  reference_grads = (
+      _cp_backward("xla", case, inputs)
+      if case.cp_size > 1
+      else _direct_backward("xla", case, inputs)
   )
   jax.block_until_ready((grads, reference_grads))
 
@@ -1236,4 +1242,4 @@ def test_chunk_kda_backward(case: TestConfig):
 
 
 if __name__ == "__main__":
-  pytest.main([__file__, "-v", "-x"])
+  pytest.main([__file__, "-v"])

@@ -101,6 +101,9 @@ def _chunk_gated_delta_rule_bwd_dhu_pre_process_kernel(
   TOTAL = N_HG * NT
   eye_k = jnp.eye(K, dtype=jnp.float32)
   SEM_OUT = 6 * MB
+  precision = (
+      None if q_ref.dtype == jnp.bfloat16 else jax.lax.Precision.HIGHEST
+  )
 
   def _async_copy(src, dst, sem, wait=False):
     cp = pltpu.make_async_copy(src, dst, sem)
@@ -186,6 +189,7 @@ def _chunk_gated_delta_rule_bwd_dhu_pre_process_kernel(
       dv_cur = jax.lax.dot_general(
         bk, dh,
         (((2,), (1,)), ((0,), (0,))),
+        precision=precision,
         preferred_element_type=jnp.float32,
       ) + bdv
 
@@ -201,11 +205,13 @@ def _chunk_gated_delta_rule_bwd_dhu_pre_process_kernel(
         jax.lax.dot_general(
           bq, bdo,
           (((1,), (1,)), ((0,), (0,))),
+          precision=precision,
           preferred_element_type=jnp.float32,
         ) * SCALE
         - jax.lax.dot_general(
           bw, dv_cur,
           (((1,), (1,)), ((0,), (0,))),
+          precision=precision,
           preferred_element_type=jnp.float32,
         )
       )
@@ -474,14 +480,28 @@ def _chunk_segment_metadata(chunk_seg_ids, batch_idx, chunk_id, NT):
 @partial(jax.jit, static_argnames=["dtype"])
 def compute_m1_recompute(bq, bk, bv, bb, bA, bg, bh, dtype):
   """Recomputes (u, w, v_new, qg, kg) from a saved state."""
+  precision = (
+      None if dtype == jnp.bfloat16 else jax.lax.Precision.HIGHEST
+  )
   g_exp = jnp.exp2(bg)
   v_beta = bv * bb[:, :, None]
-  u = jnp.matmul(bA.astype(jnp.float32), v_beta.astype(jnp.float32), preferred_element_type=jnp.float32)
+  u = jnp.matmul(
+      bA.astype(jnp.float32),
+      v_beta.astype(jnp.float32),
+      precision=precision,
+      preferred_element_type=jnp.float32,
+  )
   w = jnp.matmul(bA.astype(jnp.float32), (bk * bb[:, :, None] * g_exp).astype(jnp.float32),
+                 precision=precision,
                  preferred_element_type=jnp.float32)
   u_mat = u.astype(dtype)
   w_mat = w.astype(dtype)
-  v_new = u_mat.astype(jnp.float32) - jnp.matmul(w_mat.astype(jnp.float32), bh.astype(jnp.float32), preferred_element_type=jnp.float32)
+  v_new = u_mat.astype(jnp.float32) - jnp.matmul(
+      w_mat.astype(jnp.float32),
+      bh.astype(jnp.float32),
+      precision=precision,
+      preferred_element_type=jnp.float32,
+  )
   qg = bq * g_exp
   kg = bk * jnp.exp2(bg[:, -1:, :] - bg)
   return u, w, v_new, qg, kg
@@ -501,15 +521,20 @@ def _recompute_w_u_fwd(q, k, v, beta, A, gk, chunk_size):
   beta_chunks = beta.reshape(H * B * NT, BT, 1)
   g_chunks = gk.reshape(H * B * NT, BT, K)
   g_exp = jnp.exp2(g_chunks)
+  precision = (
+      None if q.dtype == jnp.bfloat16 else jax.lax.Precision.HIGHEST
+  )
 
   u = jnp.matmul(
       A_chunks,
       (v_chunks * beta_chunks).astype(jnp.float32),
+      precision=precision,
       preferred_element_type=jnp.float32,
   ).astype(v.dtype)
   w = jnp.matmul(
       A_chunks,
       (k_chunks * beta_chunks * g_exp).astype(jnp.float32),
+      precision=precision,
       preferred_element_type=jnp.float32,
   ).astype(k.dtype)
   qg = (q_chunks * g_exp).astype(q.dtype)
@@ -523,11 +548,19 @@ def _recompute_w_u_fwd(q, k, v, beta, A, gk, chunk_size):
   )
 
 
-def compute_dhu_recurrence(bkg, dh, bdv0, dh_tmp, g_exp_last, bqg, bw, bdo, scale):
-  bdv = jnp.matmul(bkg, dh, preferred_element_type=jnp.float32) + bdv0
+def compute_dhu_recurrence(
+    bkg, dh, bdv0, dh_tmp, g_exp_last, bqg, bw, bdo, scale, precision
+):
+  bdv = jnp.matmul(
+      bkg,
+      dh,
+      precision=precision,
+      preferred_element_type=jnp.float32,
+  ) + bdv0
   dh_new = dh_tmp * g_exp_last[:, :, None] + jnp.matmul(
     jnp.concatenate([bqg * scale, -bw], axis=1).transpose(0, 2, 1),
     jnp.concatenate([bdo.astype(jnp.float32), bdv], axis=1),
+    precision=precision,
     preferred_element_type=jnp.float32,
   )
   return bdv, dh_new
@@ -773,10 +806,10 @@ def fused_recompute_w_u_vnew_from_h_pallas(
 # Shared L1 helpers for the fused backward kernel
 # ══════════════════════════════════════════════════════════════════════════
 
-@partial(jax.jit, static_argnames=["ref_dtype", "precision"])
+@partial(jax.jit, static_argnames=["precision"])
 def compute_intra_backward(bq, bk, bg, bb, dAqk, dAkk,
                            dq_acc, dk_acc, db_acc, dg_acc,
-                           precision, ref_dtype):
+                           precision):
   BT = bq.shape[1]
   idx = jnp.arange(BT, dtype=jnp.int32)
   causal_mask = idx[:, None] >= idx[None, :]
@@ -913,7 +946,7 @@ def compute_intra_backward(bq, bk, bg, bb, dAqk, dAkk,
   dq_total = dq_acc + dq_intra
   dk_total = dk_acc + dk_intra
   db_total = db_acc + db_intra
-  dg_total = (dg_acc + dg_intra).astype(ref_dtype).astype(jnp.float32)
+  dg_total = dg_acc + dg_intra
   return dq_total, dk_total, db_total, dg_total
 
 
@@ -996,7 +1029,18 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   bdAqk = dAqk_ref[:, 0, 0].astype(jnp.float32)
 
   # --- dhu reverse recurrence ---
-  bdv, dh_new = compute_dhu_recurrence(bkg, dh, bdv0, dh_tmp_ref[:], g_exp_last, bqg, bw, bdo, scale)
+  bdv, dh_new = compute_dhu_recurrence(
+      bkg,
+      dh,
+      bdv0,
+      dh_tmp_ref[:],
+      g_exp_last,
+      bqg,
+      bw,
+      bdo,
+      scale,
+      precision,
+  )
   dh_tmp_ref[:] = dh_new
 
   # --- WY backward ---
@@ -1006,7 +1050,7 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   # --- Intra backward + reverse cumsum ---
   dq_total, dk_total, db_total, dg_total = compute_intra_backward(
     bq, bk, bg, bb, bdAqk, dAkk_local, dq_acc, dk_acc, db_acc, dg_acc,
-    precision=precision, ref_dtype=q_ref.dtype,
+    precision=precision,
   )
   dg_reverse_cumsum = compute_reverse_cumsum_dg(dg_total)
 
@@ -1248,6 +1292,9 @@ def _chunk_kda_bwd_dAv_kernel(
   bv = v_ref[:]  # [MB, BT, V]
   bA = A_ref[:]  # [MB, BT, BT]
   bdo = do_ref[:]  # [MB, BT, V]
+  precision = (
+      None if A_ref.dtype == jnp.bfloat16 else jax.lax.Precision.HIGHEST
+  )
 
   m_causal = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
   bA_masked = jnp.where(m_causal[None, :, :], bA, 0.0)  # [MB, BT, BT]
@@ -1267,14 +1314,16 @@ def _chunk_kda_bwd_dAv_kernel(
       b_do_blk,
       b_v_blk,
       (((2,), (2,)), ((0,), (0,))),
+      precision=precision,
       preferred_element_type=jnp.float32,
     )
 
     # dv = A^T @ do — contract BT_row (dim 1), batch MB (dim 0)
     b_dv_blk = jax.lax.dot_general(
       bA_masked,
-      b_do_blk,
+      b_do_blk.astype(bA_masked.dtype),
       (((1,), (1,)), ((0,), (0,))),
+      precision=precision,
       preferred_element_type=jnp.float32,
     )
     dv_blocks.append(b_dv_blk)
