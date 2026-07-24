@@ -29,7 +29,6 @@ dependencies = [
     "typeguard==2.13.3",
     "immutabledict",
     "tensorboardx",
-    "libtpu==0.0.41"
 ]
 
 
