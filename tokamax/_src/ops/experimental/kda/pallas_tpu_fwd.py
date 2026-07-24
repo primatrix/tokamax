@@ -830,28 +830,86 @@ def _kda_fwd_intra_varlen_kernel(
   k_f32 = k.astype(jnp.float32)
   beta_f32 = beta.astype(jnp.float32)
 
-  # Build Aqk and L directly using exp2(g[i] - g[j]).
-  # For causal (i >= j): g_cumsum[i] <= g_cumsum[j], so g[i]-g[j] <= 0,
-  # giving exp2 in (0, 1].  This avoids the split-normalization overflow
-  # that occurs with exp2(g-gn) when per-step gate changes exceed ~127.
-  causal_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
-  strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1)
+  causal_bc = jnp.tril(jnp.ones((BC, BC), dtype=jnp.float32))
+  strict_bc = jnp.tril(jnp.ones((BC, BC), dtype=jnp.float32), k=-1)
+  zeros_bc = jnp.zeros((BC, BC), dtype=jnp.float32)
 
-  # g_diff[i, j, k] = g[i, k] - g[j, k];  shape [BT, BT, K]
-  g_diff = g_f32[:, None, :] - g_f32[None, :, :]
-  # Mask anti-causal entries to -126 before exp2 to prevent overflow;
-  # they will be zeroed by causal_bt / strict_bt anyway.
-  g_diff = jnp.where(causal_bt[:, :, None] > 0, g_diff, -126.0)
-  decay = exp2(jnp.maximum(g_diff, -126.0))  # [BT, BT, K]
+  # Construct Aqk and L in BC x BC sub-blocks. For each (row, column)
+  # pair, factor the gate decay around the maximum difference over K:
+  #
+  #   exp2(g_diff) = exp2(g_max) * exp2(g_diff - g_max).
+  #
+  # The inner exponent is always non-positive, so it cannot overflow.
+  # For valid non-increasing cumulative gates, g_max is also non-positive,
+  # which keeps the outer exponential in (0, 1].
+  # Anti-causal entries in a diagonal block are masked before computing
+  # g_max; otherwise their positive gate differences could select a bad
+  # reference point even though those entries are discarded later.
+  neg_inf_f32 = jnp.float32(-1e30)
+  Aqk_rows = []
+  L_rows = []
+  for i_sc in range(NC):
+    i_s = i_sc * BC
+    q_i = q_f32[i_s : i_s + BC]
+    k_i = k_f32[i_s : i_s + BC]
+    g_i = g_f32[i_s : i_s + BC]
+    beta_i = beta_f32[i_s : i_s + BC]
 
-  # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * decay[i,j,k]
-  Aqk = scale * jnp.sum(q_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
-  # Use `where` instead of `* mask` to avoid `inf * 0 = NaN`.
-  Aqk = jnp.where(causal_bt > 0, Aqk, jnp.float32(0.0)).astype(dtype)
+    Aqk_blocks = []
+    L_blocks = []
+    for j_sc in range(NC):
+      if j_sc > i_sc:
+        Aqk_blocks.append(zeros_bc)
+        L_blocks.append(zeros_bc)
+        continue
 
-  # L[i, j] = beta[i] * sum_k k[i,k] * k[j,k] * decay[i,j,k]   (i > j)
-  L = jnp.sum(k_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1) * beta_f32
-  L = jnp.where(strict_bt > 0, L, jnp.float32(0.0))
+      j_s = j_sc * BC
+      k_j = k_f32[j_s : j_s + BC]
+      g_j = g_f32[j_s : j_s + BC]
+
+      # [BC, BC, K]: row gate minus column gate.
+      g_diff = g_i[:, None, :] - g_j[None, :, :]
+      if i_sc == j_sc:
+        g_diff = jnp.where(
+            causal_bc[:, :, None] > 0, g_diff, neg_inf_f32
+        )
+
+      g_max = jnp.max(g_diff, axis=-1, keepdims=True)
+      decay = jnp.exp2(g_diff - g_max)
+      exp_max = jnp.exp2(g_max[..., 0])
+
+      Aqk_block = (
+          scale
+          * exp_max
+          * jnp.sum(
+              q_i[:, None, :] * decay * k_j[None, :, :], axis=-1
+          )
+      )
+      L_block = (
+          beta_i
+          * exp_max
+          * jnp.sum(
+              k_i[:, None, :] * decay * k_j[None, :, :], axis=-1
+          )
+      )
+
+      if i_sc == j_sc:
+        # `where` avoids inf * 0 producing NaN on discarded entries.
+        Aqk_block = jnp.where(
+            causal_bc > 0, Aqk_block, jnp.float32(0.0)
+        )
+        L_block = jnp.where(
+            strict_bc > 0, L_block, jnp.float32(0.0)
+        )
+
+      Aqk_blocks.append(Aqk_block)
+      L_blocks.append(L_block)
+
+    Aqk_rows.append(jnp.concatenate(Aqk_blocks, axis=1))
+    L_rows.append(jnp.concatenate(L_blocks, axis=1))
+
+  Aqk = jnp.concatenate(Aqk_rows, axis=0).astype(dtype)
+  L = jnp.concatenate(L_rows, axis=0)
 
   v_beta = v.astype(jnp.float32) * beta_f32
   k_eg_beta = k_f32 * exp2(g_f32) * beta_f32
