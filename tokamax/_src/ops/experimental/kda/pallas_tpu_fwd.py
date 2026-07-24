@@ -1541,36 +1541,36 @@ def kda_fwd_intra_fused(
   """
   assert chunk_size == 64, f"Expected chunk_size=64, got {chunk_size}"
   # fp32 fallback: use separate S1+S2 to avoid BC=16 numerical issues
-  # if q.dtype == jnp.float32:
-  #   if use_gate_in_kernel:
-  #     assert A_log is not None, "A_log must not be None when use_gate_in_kernel=True"
-  #     g_cumsum = kda_gate_chunk_cumsum(
-  #       g=g,
-  #       A_log=A_log,
-  #       chunk_size=chunk_size,
-  #       scale=RCP_LN2,
-  #       dt_bias=dt_bias,
-  #       lower_bound=lower_bound,
-  #     )
-  #   else:
-  #     g_cumsum = kda_gate_cumsum(
-  #       g=g,
-  #       scale=RCP_LN2,
-  #       chunk_size=chunk_size,
-  #     )
+  if q.dtype == jnp.float32:
+    if use_gate_in_kernel:
+      assert A_log is not None, "A_log must not be None when use_gate_in_kernel=True"
+      g_cumsum = kda_gate_chunk_cumsum(
+        g=g,
+        A_log=A_log,
+        chunk_size=chunk_size,
+        scale=RCP_LN2,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+      )
+    else:
+      g_cumsum = kda_gate_cumsum(
+        g=g,
+        scale=RCP_LN2,
+        chunk_size=chunk_size,
+      )
 
-  #   # S2: intra-chunk solve without BC=16 tiling.
-  #   w, u, qg, kg, Aqk, Akk = kda_fwd_intra(
-  #     q=q, k=k, v=v, gk=g_cumsum, beta=beta,
-  #     scale=scale, cu_seqlens=cu_seqlens,
-  #     chunk_size=chunk_size, chunk_indices=chunk_indices,
-  #     safe_gate=safe_gate, disable_recompute=disable_recompute,
-  #   )
+    # S2: intra-chunk solve without BC=16 tiling.
+    w, u, qg, kg, Aqk, Akk = kda_fwd_intra(
+      q=q, k=k, v=v, gk=g_cumsum, beta=beta,
+      scale=scale, cu_seqlens=cu_seqlens,
+      chunk_size=chunk_size, chunk_indices=chunk_indices,
+      safe_gate=safe_gate, disable_recompute=disable_recompute,
+    )
 
-  #   # Flatten the chunk axes to the orchestrator's [H, B, T, BT] layout.
-  #   Aqk = Aqk.reshape(q.shape[0], q.shape[1], -1, Aqk.shape[-1])
-  #   Akk = Akk.reshape(q.shape[0], q.shape[1], -1, Akk.shape[-1])
-  #   return w, u, qg, kg, Aqk, Akk, g_cumsum
+    # Flatten the chunk axes to the orchestrator's [H, B, T, BT] layout.
+    Aqk = Aqk.reshape(q.shape[0], q.shape[1], -1, Aqk.shape[-1])
+    Akk = Akk.reshape(q.shape[0], q.shape[1], -1, Akk.shape[-1])
+    return w, u, qg, kg, Aqk, Akk, g_cumsum
 
   # The caller has already BT-aligned varlen inputs, so the same contiguous
   # fused kernel handles both fixed-length and variable-length batches.
