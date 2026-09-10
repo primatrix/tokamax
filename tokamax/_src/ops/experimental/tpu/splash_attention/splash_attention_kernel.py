@@ -166,6 +166,13 @@ class SplashConfig:
   # This is lossless and opt-in; strict shape/mask preconditions are enforced.
   qk_diag_skip: bool = False
   qk_diag_grid: int = 4
+  # Skip zero causal-diagonal probability/value products in forward.
+  sv_diag_skip: bool = False
+  sv_diag_grid: int = 4
+  # Omit masked Q prefixes in the backward P.T @ dO contraction.
+  dv_diag_skip: bool = False
+  # Also crop dP/dK/dQ on the same causal-diagonal compute tiles.
+  bwd_diag_skip: bool = False
 
   def __post_init__(self):
     if self.block_kv_compute is None:
@@ -180,6 +187,23 @@ class SplashConfig:
       )
     if not self.use_fused_bwd_kernel:
       raise ValueError("Only the fused bwd kernel is supported.")
+    if (self.dv_diag_skip or self.bwd_diag_skip) and (
+        not self.has_backward_blocks or self.block_q_dkv != self.block_kv_dkv
+    ):
+      raise ValueError("backward diagonal skip requires square backward blocks")
+    if self.sv_diag_skip:
+      grid = self.sv_diag_grid
+      if grid < 2 or grid & (grid - 1) or grid > self.block_q:
+        raise ValueError("sv_diag_grid must be a power of two in [2, block_q]")
+      if (
+          self.block_q != self.block_kv
+          or self.block_q % grid
+          or self.block_kv_compute % (self.block_q // grid)
+      ):
+        raise ValueError(
+            "sv_diag_skip requires square forward blocks and "
+            "block_kv_compute divisible by block_q // sv_diag_grid"
+        )
     if self.qk_diag_skip:
       if self.qk_diag_grid < 2 or self.qk_diag_grid & (self.qk_diag_grid - 1):
         raise ValueError("qk_diag_grid must be a power of two >= 2")
@@ -534,7 +558,38 @@ def flash_attention_kernel(
       v = v_ref[slice_k, :]
     else:
       v = v_ref[:, slice_k]
-    o_curr = lax.dot_general(s_curr, v, sv_dims)
+    if config.sv_diag_skip and has_partial_mask:
+      # Each compute tile starts at a different global KV band. Use a single
+      # prefix dot per Q band rather than summing separately rounded SV dots.
+      band = bq // config.sv_diag_grid
+      first_k_band = kv_compute_index * (bkv_compute // band)
+      rows = []
+      q_band = 0
+      while q_band < config.sv_diag_grid:
+        valid_k = min(bkv_compute, max(0, q_band + 1 - first_k_band) * band)
+        # Merge equal-length prefixes so fully valid rows keep a large MXU dot.
+        end_band = q_band + 1
+        while end_band < config.sv_diag_grid and min(
+            bkv_compute, max(0, end_band + 1 - first_k_band) * band
+        ) == valid_k:
+          end_band += 1
+        if valid_k == 0:
+          row = jnp.zeros(
+              ((end_band - q_band) * band, head_dim_v), o_scratch_ref.dtype
+          )
+        else:
+          probabilities = s_curr[q_band * band : end_band * band, :valid_k]
+          values = (
+              v[:valid_k, :]
+              if config.v_layout == HEAD_DIM_MINOR
+              else v[:, :valid_k]
+          )
+          row = lax.dot_general(probabilities, values, sv_dims)
+        rows.append(row)
+        q_band = end_band
+      o_curr = jnp.concatenate(rows, axis=0)
+    else:
+      o_curr = lax.dot_general(s_curr, v, sv_dims)
 
     if max_logit_estimate is None:
       alpha_o = jnp.tile(alpha, (1, head_dim_v_repeats))
@@ -554,7 +609,7 @@ def flash_attention_kernel(
 
   @pl.when(jnp.logical_not(should_not_mask))
   def _():
-    if config.qk_diag_skip:
+    if config.qk_diag_skip or config.sv_diag_skip:
       for i in range(num_iters):
         body(i, None, has_partial_mask=True)
     else:
@@ -1443,16 +1498,35 @@ def _flash_attention_dkv_kernel(
     )
     exp = jnp.exp2 if config.use_base2_exp else jnp.exp
     p = exp(qk - logsumexp)
-    dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32)
+    if (config.dv_diag_skip or config.bwd_diag_skip) and has_partial_mask:
+      # p is [K, Q]. Q positions before this compute tile's first K are
+      # causally masked. Keep one suffix dot, preserving FP32 accumulation.
+      q_start = i * bkv_compute
+      dv = lax.dot(
+          p[:, q_start:].astype(do.dtype),
+          do[q_start:, :],
+          preferred_element_type=jnp.float32,
+      )
+    else:
+      dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32)
     dv = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[slice_k, :]
     dv_scratch_ref[slice_k, :] = dv
 
-    dp = lax.dot_general(
-        v,
-        do,
-        NT_DIM_NUMBERS,
-        preferred_element_type=jnp.float32,
-    )
+    if config.bwd_diag_skip and has_partial_mask and i > 0:
+      q_start = i * bkv_compute
+      dp_valid = lax.dot_general(
+          v,
+          do[q_start:, :],
+          NT_DIM_NUMBERS,
+          preferred_element_type=jnp.float32,
+      )
+      dp = jnp.concatenate(
+          (jnp.zeros((bkv_compute, q_start), jnp.float32), dp_valid), axis=1
+      )
+    else:
+      dp = lax.dot_general(
+          v, do, NT_DIM_NUMBERS, preferred_element_type=jnp.float32,
+      )
     ds = (dp - di) * p
     if attn_logits_soft_cap is not None:
       normalized = qk_uncapped / attn_logits_soft_cap
@@ -1463,18 +1537,34 @@ def _flash_attention_dkv_kernel(
     dk_dims = (
         NN_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
     )
-    dk = lax.dot_general(
-        ds.astype(do.dtype), q, dk_dims, preferred_element_type=jnp.float32
-    )
+    if config.bwd_diag_skip and has_partial_mask and i > 0:
+      q_valid = (
+          q[q_start:, :] if config.q_layout == HEAD_DIM_MINOR else q[:, q_start:]
+      )
+      dk = lax.dot_general(
+          ds[:, q_start:].astype(do.dtype), q_valid, dk_dims,
+          preferred_element_type=jnp.float32,
+      )
+    else:
+      dk = lax.dot_general(
+          ds.astype(do.dtype), q, dk_dims, preferred_element_type=jnp.float32
+      )
     dk = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[slice_k, :]
     dk_scratch_ref[slice_k, :] = dk
     if dq_scratch_ref is not None or dq_ref is not None:
-      dq = lax.dot_general(
-          ds.T.astype(k.dtype),
-          k,
-          NN_DIM_NUMBERS,
-          preferred_element_type=jnp.float32,
-      )
+      if config.bwd_diag_skip and has_partial_mask and i > 0:
+        dq_valid = lax.dot_general(
+            ds[:, q_start:].T.astype(k.dtype), k, NN_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
+        dq = jnp.concatenate(
+            (jnp.zeros((q_start, k.shape[1]), jnp.float32), dq_valid), axis=0
+        )
+      else:
+        dq = lax.dot_general(
+            ds.T.astype(k.dtype), k, NN_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
       if dq_scratch_ref is not None:
         # Compute block size != memory block size
         dq_scratch_ref[...] += dq
@@ -1502,7 +1592,7 @@ def _flash_attention_dkv_kernel(
 
   @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
   def _():
-    if config.qk_diag_skip:
+    if config.qk_diag_skip or config.dv_diag_skip or config.bwd_diag_skip:
       for i in range(num_iters):
         body(i, None, has_partial_mask=True)
     else:
@@ -2166,7 +2256,10 @@ def _make_splash_attention(
 
   if config is None:
     config = SplashConfig.get_default()
-  if config.qk_diag_skip:
+  if (
+      config.qk_diag_skip or config.sv_diag_skip
+      or config.dv_diag_skip or config.bwd_diag_skip
+  ):
     if (
         not isinstance(mask, mask_lib.CausalMask)
         or mask.offset != 0
@@ -2175,7 +2268,8 @@ def _make_splash_attention(
         or (config.has_backward_blocks and mask.shape[0] % config.block_q_dkv)
     ):
       raise ValueError(
-          "qk_diag_skip requires a square, block-aligned CausalMask with offset=0"
+          "causal diagonal skip requires a square, block-aligned CausalMask "
+          "with offset=0"
       )
 
   process_fn = partial(
@@ -2247,8 +2341,11 @@ def _make_dynamic_splash_attention(
 
   if config is None:
     config = SplashConfig.get_default()
-  if config.qk_diag_skip:
-    raise ValueError("qk_diag_skip is not supported by dynamic Splash masks")
+  if (
+      config.qk_diag_skip or config.sv_diag_skip
+      or config.dv_diag_skip or config.bwd_diag_skip
+  ):
+    raise ValueError("causal diagonal skip is not supported by dynamic Splash masks")
 
   # This is the only mode that supports the dynamic grid.
   config = dataclasses.replace(config, dq_reduction_steps=3)

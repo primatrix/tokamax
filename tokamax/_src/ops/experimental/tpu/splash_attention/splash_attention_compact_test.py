@@ -99,7 +99,9 @@ def test_compact_residuals_exact(base2, fuse, packed, scale, amplitude):
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("base2", [False, True])
-def test_causal_diagonal_skip_exact(packed, base2):
+@pytest.mark.parametrize("skip_mode", ["qk", "sv", "both"])
+@pytest.mark.parametrize("compute_tile", [128, 256, 512])
+def test_causal_diagonal_skip(packed, base2, skip_mode, compute_tile):
   if jax.default_backend() != "tpu":
     pytest.skip("This regression test requires real TPU compilation")
   rng = np.random.default_rng(193)
@@ -113,7 +115,7 @@ def test_causal_diagonal_skip_exact(packed, base2):
   base_config = splash.SplashConfig(
       block_q=512,
       block_kv=512,
-      block_kv_compute=128,
+      block_kv_compute=compute_tile,
       block_q_dkv=512,
       block_kv_dkv=512,
       block_kv_dkv_compute=128,
@@ -124,7 +126,11 @@ def test_causal_diagonal_skip_exact(packed, base2):
   )
   results = []
   for skip in (False, True):
-    config = dataclasses.replace(base_config, qk_diag_skip=skip)
+    config = dataclasses.replace(
+        base_config,
+        qk_diag_skip=skip and skip_mode in ("qk", "both"),
+        sv_diag_skip=skip and skip_mode in ("sv", "both"),
+    )
     attention = splash.make_splash_mha_single_device(
         masks.CausalMask((512, 512)), config=config
     )
@@ -136,36 +142,77 @@ def test_causal_diagonal_skip_exact(packed, base2):
       return out, pb(do)
 
     results.append(jax.device_get(jax.jit(fb)(q, k, v, do)))
-  for expected, actual in zip(jax.tree.leaves(results[0]), jax.tree.leaves(results[1])):
-    assert np.isfinite(actual).all()
-    np.testing.assert_array_equal(actual, expected)
+  if skip_mode == "qk" or compute_tile == 128:
+    for expected, actual in zip(
+        jax.tree.leaves(results[0]), jax.tree.leaves(results[1])
+    ):
+      assert np.isfinite(actual).all()
+      np.testing.assert_array_equal(actual, expected)
+  else:
+    # A shorter SV contraction can change FP32 accumulation rounding. Check
+    # BOTH implementations against an independent reference, rather than
+    # declaring the port bitwise-equivalent or lowering the dot precision.
+    def reference(q, k, v):
+      logits = jnp.einsum(
+          "hsd,htd->hst", q.astype(jnp.float32), k.astype(jnp.float32)
+      ) * jnp.float32(192**-0.5)
+      valid = jnp.arange(512)[:, None] >= jnp.arange(512)[None, :]
+      if packed:
+        valid &= ids[:, None] == ids[None, :]
+      probs = jax.nn.softmax(jnp.where(valid[None], logits, -jnp.inf), axis=-1)
+      return jnp.einsum("hst,htd->hsd", probs, v.astype(jnp.float32))
+
+    out, pb = jax.vjp(reference, q, k, v)
+    expected = (out, pb(do.astype(jnp.float32)))
+    tolerances = ((8e-3, 1e-2), (8e-2, 3e-2), (7e-2, 3e-2), (2e-2, 3e-2))
+    for result in results:
+      for actual, ref, (atol, rtol) in zip(
+          jax.tree.leaves(result), jax.tree.leaves(expected), tolerances
+      ):
+        assert np.isfinite(actual).all()
+        np.testing.assert_allclose(
+            actual.astype(np.float32),
+            np.asarray(ref, dtype=np.float32),
+            atol=atol,
+            rtol=rtol,
+        )
 
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("base2", [False, True])
-def test_optimized_training_config_matches_fp32_reference(packed, base2):
+@pytest.mark.parametrize("sv_skip", [False, True])
+@pytest.mark.parametrize("sv_grid", [2, 4])
+@pytest.mark.parametrize("dv_skip", [False, True, "all", "all_no_qk"])
+def test_optimized_training_config_matches_fp32_reference(
+    packed, base2, sv_skip, sv_grid, dv_skip
+):
   """Checks the complete performance configuration, including dq reduction."""
   if jax.default_backend() != "tpu":
     pytest.skip("This regression test requires real TPU compilation")
   rng = np.random.default_rng(307)
+  length = 2048  # More than three KV blocks exercise deferred dQ reduction.
 
   def array(dim, amp):
-    return jnp.asarray(rng.standard_normal((1, 512, dim)) * amp, jnp.bfloat16)
+    return jnp.asarray(rng.standard_normal((1, length, dim)) * amp, jnp.bfloat16)
 
   q = array(192, 0.25)
   k = array(192, 0.25)
   v = array(128, 1.0)
   do = array(128, 1.0)
-  ids = jnp.arange(512, dtype=jnp.int32) // 173
+  ids = jnp.arange(length, dtype=jnp.int32) // 173
   segments = splash_base.SegmentIds(ids, ids) if packed else None
   config = splash.SplashConfig(
       block_q=512,
       block_kv=512,
-      block_kv_compute=128,
+      block_kv_compute=256,
       block_q_dkv=512,
       block_kv_dkv=512,
       block_kv_dkv_compute=128,
-      qk_diag_skip=True,
+      qk_diag_skip=dv_skip != "all_no_qk",
+      sv_diag_skip=sv_skip,
+      dv_diag_skip=dv_skip is True,
+      bwd_diag_skip=dv_skip in ("all", "all_no_qk"),
+      sv_diag_grid=sv_grid,
       qk_diag_grid=4,
       compact_residuals=True,
       dq_reduction_steps=3,
@@ -174,14 +221,14 @@ def test_optimized_training_config_matches_fp32_reference(packed, base2):
       use_experimental_scheduler=True,
   )
   attention = splash.make_splash_mha_single_device(
-      masks.CausalMask((512, 512)), config=config
+      masks.CausalMask((length, length)), config=config
   )
 
   def reference(q, k, v):
     logits = jnp.einsum(
         "hsd,htd->hst", q.astype(jnp.float32), k.astype(jnp.float32)
     ) * jnp.float32(192**-0.5)
-    valid = jnp.arange(512)[:, None] >= jnp.arange(512)[None, :]
+    valid = jnp.arange(length)[:, None] >= jnp.arange(length)[None, :]
     if packed:
       valid &= ids[:, None] == ids[None, :]
     logits = jnp.where(valid[None], logits, -jnp.inf)

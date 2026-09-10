@@ -16,6 +16,7 @@
 
 import argparse
 import dataclasses
+import hashlib
 import importlib.metadata
 import json
 import platform
@@ -40,7 +41,27 @@ p = argparse.ArgumentParser()
 p.add_argument("--out", required=True)
 p.add_argument("--packed", action="store_true")
 p.add_argument("--seed", type=int, default=17)
+p.add_argument(
+    "--sv-only",
+    action="store_true",
+    help="Compare PR12 optimized config against the same config plus SV skip",
+)
+p.add_argument("--forward-only", action="store_true")
+p.add_argument("--sv-grid", type=int, default=4)
+p.add_argument(
+    "--dv-only",
+    action="store_true",
+    help="Compare optimized+SV2 with and without dV skip",
+)
+p.add_argument(
+    "--bwd-only",
+    action="store_true",
+    help="Compare optimized+SV2 against all backward diagonal crops",
+)
 a = p.parse_args()
+if a.dv_only or a.bwd_only:
+  a.sv_only = True
+  a.sv_grid = 2
 rows = []
 
 
@@ -56,11 +77,18 @@ log(
         "packages": {
             k: importlib.metadata.version(k) for k in ["jax", "jaxlib", "libtpu"]
         },
-        "base_commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
-        ).strip(),
+        "base_commit": subprocess.run(
+            ["git", "rev-parse", "HEAD"], text=True, capture_output=True
+        ).stdout.strip()
+        or "source archive (see kernel_sha256)",
+        "kernel_sha256": hashlib.sha256(Path(sk.__file__).read_bytes()).hexdigest(),
         "devices": list(map(str, jax.devices())),
         "seed": a.seed,
+        "sv_only": a.sv_only,
+        "dv_only": a.dv_only,
+        "bwd_only": a.bwd_only,
+        "sv_grid": a.sv_grid,
+        "mode": "forward" if a.forward_only else "forward+backward",
         "packed": a.packed,
         "shape": [2, 64, 8192, 192, 128],
         "dtype": "bf16",
@@ -113,10 +141,14 @@ outputs = []
 for optimized in [False, True]:
   config = dataclasses.replace(
       base,
-      compact_residuals=optimized,
-      qk_diag_skip=optimized,
+      compact_residuals=optimized or a.sv_only,
+      qk_diag_skip=optimized or a.sv_only,
+      sv_diag_skip=a.dv_only or a.bwd_only or (optimized and a.sv_only),
+      dv_diag_skip=a.dv_only and optimized,
+      bwd_diag_skip=a.bwd_only and optimized,
+      sv_diag_grid=a.sv_grid,
       qk_diag_grid=4,
-      dq_reduction_steps=3 if optimized else None,
+      dq_reduction_steps=3 if optimized or a.sv_only else None,
   )
   kernel = sk.make_splash_mha_single_device(
       masks.CausalMask((8192, 8192)), config=config
@@ -129,7 +161,15 @@ for optimized in [False, True]:
     y, pb = jax.vjp(fwd, q, k, v)
     return y, pb(do)
 
-  fn = jax.jit(fb).lower(*args).compile()
+  if a.forward_only:
+
+    def forward(q, k, v, do, fwd=fwd):
+      del do
+      return fwd(q, k, v)
+
+    fn = jax.jit(forward).lower(*args).compile()
+  else:
+    fn = jax.jit(fb).lower(*args).compile()
   outputs.append(jax.block_until_ready(fn(*args)))
   for _ in range(5):
     jax.block_until_ready(fn(*args))
