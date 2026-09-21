@@ -197,6 +197,7 @@ def _parser():
   parser.add_argument("--bwd-reuse-bf16-probabilities", action="store_true")
   parser.add_argument("--bwd-compact-segment-ids", action="store_true")
   parser.add_argument("--bwd-dkv-scratch-seq-minor", action="store_true")
+  parser.add_argument("--bwd-dkv-output-seq-minor", action="store_true")
   parser.add_argument(
       "--bwd-parallel-heads", action=argparse.BooleanOptionalAction, default=False
   )
@@ -249,6 +250,7 @@ def main():
       bwd_reuse_bf16_probabilities=args.bwd_reuse_bf16_probabilities,
       bwd_compact_segment_ids=args.bwd_compact_segment_ids,
       bwd_dkv_scratch_seq_minor=args.bwd_dkv_scratch_seq_minor,
+      bwd_dkv_output_seq_minor=args.bwd_dkv_output_seq_minor,
       interpret=args.interpret,
   )
   kernel = _make_kernel(ids, config)

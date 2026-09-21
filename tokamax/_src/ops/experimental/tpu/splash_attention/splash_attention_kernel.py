@@ -174,6 +174,9 @@ class SplashConfig:
   # Store FP32 dK/dV accumulators with sequence as the minor dimension. This
   # avoids padding a non-MXU-facing head dimension in VMEM.
   bwd_dkv_scratch_seq_minor: bool = False
+  # Return dK/dV from the Pallas call in sequence-minor physical layout, then
+  # restore the public logical layout outside the custom call.
+  bwd_dkv_output_seq_minor: bool = False
   # Process multiple independent MHA heads in one Pallas program. Dots remain
   # 2D (Mosaic TPU does not support a rank-3 batched dot); the larger program
   # gives the scheduler independent BF16 dot/vector work to interleave.
@@ -1645,13 +1648,19 @@ def _flash_attention_dkv_kernel(
   if dk_alias is None:
     assert dv_alias is None
 
+    def format_dkv_output(scratch_ref):
+      value = scratch_ref[...]
+      if (
+          config.bwd_dkv_scratch_seq_minor
+          != config.bwd_dkv_output_seq_minor
+      ):
+        value = jnp.swapaxes(value, -1, -2)
+      return value
+
     @pl.when(should_write)
     def _():
-      dk = dk_scratch_ref[...]
-      dv = dv_scratch_ref[...]
-      if config.bwd_dkv_scratch_seq_minor:
-        dk = jnp.swapaxes(dk, -1, -2)
-        dv = jnp.swapaxes(dv, -1, -2)
+      dk = format_dkv_output(dk_scratch_ref)
+      dv = format_dkv_output(dv_scratch_ref)
       dk_ref[...] = dk.astype(dk_ref.dtype)
       dv_ref[...] = dv.astype(dv_ref.dtype)
 
@@ -1739,6 +1748,11 @@ def _splash_attention_bwd_dkv(
       raise ValueError(
           f"{num_q_heads=} must be divisible by {head_group_size=}"
       )
+  if config.bwd_dkv_output_seq_minor:
+    if is_mqa or q_heads_per_kv_head != 1 or head_group_size != 1:
+      raise NotImplementedError(
+          "Sequence-minor dK/dV outputs currently support ungrouped MHA only"
+      )
 
   if dynamic_grid:
 
@@ -1814,21 +1828,36 @@ def _splash_attention_bwd_dkv(
   def create_dkv_index_map(h, i, j, *_):
     del i  # Unused.
     prefix = () if is_mqa else (_div(h, q_heads_per_kv_head),)
-    return (*prefix, j, 0)
+    layout = (
+        QKVLayout.SEQ_MINOR
+        if config.bwd_dkv_output_seq_minor
+        else QKVLayout.HEAD_DIM_MINOR
+    )
+    return from_head_minor((*prefix, j, 0), layout)
 
   dkv_index_map = unravel(create_dkv_index_map)
 
   dk_spec = pl.BlockSpec(
-      (bkv, head_dim_qk)
-      if is_mqa
-      else (head_block, bkv, head_dim_qk),
+      from_head_minor(
+          (bkv, head_dim_qk)
+          if is_mqa
+          else (head_block, bkv, head_dim_qk),
+          QKVLayout.SEQ_MINOR
+          if config.bwd_dkv_output_seq_minor
+          else QKVLayout.HEAD_DIM_MINOR,
+      ),
       dkv_index_map,
   )
 
   dv_spec = pl.BlockSpec(
-      (bkv, head_dim_v)
-      if is_mqa
-      else (head_block, bkv, head_dim_v),
+      from_head_minor(
+          (bkv, head_dim_v)
+          if is_mqa
+          else (head_block, bkv, head_dim_v),
+          QKVLayout.SEQ_MINOR
+          if config.bwd_dkv_output_seq_minor
+          else QKVLayout.HEAD_DIM_MINOR,
+      ),
       dkv_index_map,
   )
   mask_spec = pl.BlockSpec((None, bkv, bq), mask_index_map)
@@ -1949,10 +1978,12 @@ def _splash_attention_bwd_dkv(
     dk_type = k.dtype
     dv_type = v.dtype
 
+  dk_shape = k.mT.shape if config.bwd_dkv_output_seq_minor else k.shape
+  dv_shape = v.mT.shape if config.bwd_dkv_output_seq_minor else v.shape
   out_shapes = [
       dq_shape,
-      jax.ShapeDtypeStruct(k.shape, dk_type),
-      jax.ShapeDtypeStruct(v.shape, dv_type),
+      jax.ShapeDtypeStruct(dk_shape, dk_type),
+      jax.ShapeDtypeStruct(dv_shape, dv_type),
   ]
   out_specs = [dq_spec, dk_spec, dv_spec]
 
@@ -2162,6 +2193,9 @@ def _splash_attention_bwd_dkv(
     )(*args, dq, dk, dv)
   dq = dq_unreduced.sum(axis=0)
   dq = dq.astype(q.dtype)
+  if config.bwd_dkv_output_seq_minor:
+    dk = dk.mT
+    dv = dv.mT
   dk = dk.astype(k.dtype)
   dv = dv.astype(v.dtype)
   return dq, dk, dv
