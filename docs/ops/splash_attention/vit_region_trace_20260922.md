@@ -19,6 +19,13 @@ attributes a concrete gain to output formatting: Q2048 drain time falls
 from 0.833 to 0.025 ms while KV-loop time stays near 17 ms. Independent
 backward-only no-scope timing remains 45.313 versus 49.738 ms.
 
+The subsequent branchless-forward, internal-Q backward pipeline and
+small-body backward-unroll screens add **no retained speedup**. The best
+new backward case is Q1024/unroll-4 at 46.070 ms versus the retained
+45.201 ms in the same experiment. All remain default-off. The expanded
+CPU kernel/oracle suite passes 234 tests; these TPU screens preserve finite
+outputs and essentially unchanged sampled independent-oracle errors.
+
 All new orientation/pipeline controls remain default-off. BF16 inputs,
 FP32 softmax, and model rematerialization are unchanged. The joint candidates
 are non-bitwise. Seed 29 now checks all **32 full-length FP32 oracle heads**:
@@ -1356,10 +1363,92 @@ Evidence: details `an-2wvzbyu88w`, regions/final LLO `an-7fzehbn9df`,
 operator `an-newu7r3zxn`, LLO `an-ortghmetnl`; all declared reports and
 filtered timing/precision/compiler outputs were inspected.
 
-## Next bounded work: small-body backward unrolling
+### Separate steady-state loops from the pipeline's first/last tile
 
-Test unroll 2/4 on internal Q1024 and unroll 4 on Q512, paired sequential
+The structure audit `an-i2wor9qwqf` shows SCF loops in these final-LLO
+body dumps, not fully allocated machine code. Its corrected loop-region
+parser `an-k8jcbrw3ds` separates the loop body from the first/last tile:
+
+| Non-partial loop body | Compute-Q coverage | Carried vector SSA values | MXU | Transpose | Vector loads | Vector stores |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Retained | 4096 | 0 | 4416 | 1728 | 792 | 432 |
+| Q1024 sequential | 1024 | 0 | 1104 | 384 | 432 | 216 |
+| Q1024 staged steady state | 1024 | 1024 | 1104 | 384 | 468 | 216 |
+
+Thus four sequential Q-subtiles cover the retained loop's Q extent with
+the same counted MXU operations but 1,728 versus 792 explicit vector loads
+and 864 versus 432 stores. This identifies a data-reuse cost of subdivision;
+it is not a measurement of register spills or elapsed memory time. The
+staged steady-state body adds only 36 explicit loads versus sequential,
+not a doubled matmul body; it also carries 1,024 vector SSA values across
+iterations. A source-level two-stage pipeline is therefore not evidence
+of useful physical overlap.
+
+Hardware counters independently confirm that every Q-tiled candidate and
+the retained layout issue **54,263,808** DIE0 BF16 VREG matmuls across the
+three captured calls. Q-tiled variants split these evenly between MXU0/1;
+the retained layout splits them 28,311,552 / 25,952,256. PR13 issues
+62,914,560. These are dynamic instruction counts, not utilization. Different
+execution times at equal matmul counts require scheduling/dataflow analysis.
+An initial loop-parser attempt (`an-gqvxlvorvt`) failed to accept SCF closing
+braces with trailing attributes; it was corrected and rerun successfully.
+
+## Small-body backward unrolling
+
+This screen tests unroll 2/4 on internal Q1024 and unroll 4 on Q512, paired sequential
 and staged. The outer DMA blocks and numerical expressions are unchanged.
 The purpose is to test cross-iteration scheduling with a smaller compiled
 body than the previously rejected whole-Q unroll probes. It is not a claim
 that fewer source loops or more live tiles improve hardware overlap.
+
+Source `953970a1f73940e0d164fb7c2f1a6132c8b049a1` adds the runner cases
+and unroll 2/4 precision tests; all **234 CPU tests pass** in 172.17 seconds.
+At the tested small shapes, unfolded sequential/staged results are directly
+bitwise equal to the corresponding rolled sequential Q-tile implementation.
+TPU experiment `exp-wj29g6uxq1` (artifact `art-ussa0ijycy`) completed all
+ten cases, with all gradient and sampled oracle arrays finite:
+
+| Backward variant | Latency ms | Live PR13 ms | KV loops ms | Internal uncovered ms | IMEM bytes / descriptors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Retained | 45.201 | 49.989 | 42.476 | 0.198 | 79,872 / 3 |
+| Q1024 sequential, rolled | 49.054 | 50.051 | 46.257 | 0.198 | 79,872 / 3 |
+| Q1024 sequential, unroll 2 | 46.878 | 50.279 | 43.954 | 0.200 | 79,872 / 3 |
+| Q1024 sequential, unroll 4 | 46.070 | 50.194 | 43.050 | 0.200 | 79,872 / 3 |
+| Q1024 staged, rolled | 59.032 | 50.043 | 56.288 | 0.203 | 79,872 / 3 |
+| Q1024 staged, unroll 2 | 52.129 | 50.236 | 49.413 | 0.201 | 79,872 / 3 |
+| Q1024 staged, unroll 4 | 58.759 | 50.186 | 46.207 | 9.854 | 7,120,811,520 / 9,071 |
+| Q512 sequential, unroll 4 | 46.789 | 50.184 | 43.948 | 0.204 | 79,872 / 3 |
+| Q512 staged, unroll 4 | 49.786 | 49.862 | 46.957 | 0.208 | 79,872 / 3 |
+
+Limited unrolling recovers some internal-loop cost but does not beat the
+retained implementation. Q1024 staged/unroll-4 shrinks its measured loop
+regions while creating about 9.85 ms of uncovered intervals and 7.12 GB of
+instruction-loading traffic. This is strong evidence that code loading
+offsets its internal-loop gains, not evidence of a faster overall kernel.
+Its final body has 17,664 MXU / 6,656 transpose instructions, compared with
+8,832 / 3,584 for Q1024 sequential/unroll-4. These static totals include
+expanded prologue/epilogue and branches, not doubled dynamic work.
+
+Within each Q-compute family, all reported precision statistics and
+per-head FP32 oracle errors match the rolled counterpart. Every candidate
+retains exactly the reference's maximum absolute gradient error on heads
+0/15/16/31; worst L2-error ratios are 1.000000561 (dQ), 1.000005405 (dK),
+and 1.000005690 (dV). Equal summaries are not direct pairwise bitwise proof,
+and this negative-performance screen does not certify training convergence.
+There is no new candidate to promote into a joint forward/backward run.
+
+Evidence: details `an-j7etg5hdj2`, regions/final LLO `an-30odu1zl05`,
+operator `an-h54fjs11r6`, LLO `an-gfitg60zhv`; all are terminal and their
+declared reports and filtered numerical/trace outputs were read.
+
+## Remaining direction
+
+The unchanged retained joint result is 62.555 versus 70.098 ms: the target
+is still unmet. The Q-subtile probes reveal more explicit accumulator
+traffic per covered Q extent. A next bounded dataflow experiment is to
+retain dK/dV accumulators across inner Q subtiles and drain once per compute
+KV block, instead of repeatedly loading/storing them for every subtile.
+Keep the FP32 addition order and BF16 dot boundaries, compare against the
+same Q-tile control, and recheck both oracle errors and VMEM/code footprint.
+This is a proposed experiment, not an implemented or measured gain. The
+current evidence does not establish that MXU/vector overlap is optimal.
