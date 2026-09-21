@@ -9,6 +9,7 @@ Non-bitwise candidates are measured for diagnosis but are never marked accepted.
 Backward tiling changes replace the residual MaskInfo, not just the config.
 Backward screens share forward activations and residual statistics unchanged.
 Forward screens also validate outputs, residual statistics, and all gradients.
+Joint screens compile forward and backward together using candidate residuals.
 """
 
 import argparse
@@ -46,11 +47,26 @@ _FWD_KVMAJOR = dict(
     compact_softmax_scratch=True, fwd_output_scratch_seq_minor=True,
 )
 
+_FWD_FAST = _FWD_KVMAJOR | dict(block_q=2048, block_kv_compute=512)
+
 
 def variants(phase="backward"):
+  if phase == "joint":
+    return [
+        ("pr13", {}),
+        ("bwd_fast", _DQ_DK_FIRST),
+        ("fwd_fast", _FWD_FAST),
+        ("joint_fast", _FWD_FAST | _DQ_DK_FIRST),
+        ("joint_native_drain", _FWD_FAST | _DQ_DK_FIRST | dict(fwd_native_output_normalization=True)),
+        ("joint_native_output", _FWD_FAST | _DQ_DK_FIRST | dict(fwd_native_output_normalization=True, fwd_output_seq_minor=True)),
+    ]
   if phase == "forward":
     return [
         ("pr13", {}),
+        ("native_drain", _FWD_FAST | dict(fwd_native_output_normalization=True)),
+        ("native_output", _FWD_FAST | dict(fwd_native_output_normalization=True, fwd_output_seq_minor=True)),
+        ("q4096_k4096_native_drain", _FWD_KVMAJOR | dict(block_q=4096, block_kv=4096, fwd_native_output_normalization=True)),
+        ("q4096_k4096_native_output", _FWD_KVMAJOR | dict(block_q=4096, block_kv=4096, fwd_native_output_normalization=True, fwd_output_seq_minor=True)),
         ("kvmajor", _FWD_KVMAJOR),
         ("kvmajor_qsum", _FWD_KVMAJOR | dict(fwd_kvmajor_sum_in_qmajor=True)),
         ("kvmajor_qsum_u4", _FWD_KVMAJOR | dict(fwd_kvmajor_sum_in_qmajor=True, fwd_kv_unroll=4)),
@@ -221,6 +237,17 @@ def oracle_statistics(values, oracles, *, phase):
   }
 
 
+def joint_values(kernel, q, k, v, ids, do):
+  """Public custom-VJP composition, not summed independent timings.
+
+  Return only the public output and three gradients. Residual LSE is checked
+  separately outside timing, avoiding extra forward work in this function.
+  This is an operator composition, not a model/remat simulation.
+  """
+  output, pullback = jax.vjp(lambda q, k, v: kernel(q, k, v, ids), q, k, v)
+  return output, *pullback(do)
+
+
 def _config(args):
   return splash.SplashConfig(
       block_q=min(1024, args.sequence // 2),
@@ -246,7 +273,7 @@ def _config(args):
 
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("--phase", choices=("forward", "backward"), default="backward")
+  parser.add_argument("--phase", choices=("forward", "backward", "joint"), default="backward")
   parser.add_argument("--sequence", type=int, default=32768)
   parser.add_argument("--heads", type=int, default=32, help="Merged batch*heads")
   parser.add_argument("--head-dim", type=int, default=72)
@@ -293,6 +320,14 @@ def main():
       lambda res, do: bench._backward(reference_kernel, res, do)
   ).lower(residuals, do).compile()
   reference_grads = bench._ready(reference_backward(residuals, do))
+  reference_lse = residuals[6]
+  reference_joint = None
+  if args.phase == "joint":
+    reference_joint = jax.jit(functools.partial(joint_values, reference_kernel)).lower(
+        q, k, v, ids, do
+    ).compile()
+    joint_reference_values = bench._ready(reference_joint(q, k, v, ids, do))
+    forward_output, *reference_grads = joint_reference_values
   oracles = {}
   oracle_fn = jax.jit(functools.partial(
       accuracy.fp32_attention_and_gradients,
@@ -304,7 +339,7 @@ def main():
     print(json.dumps(dict(status="oracle_head_complete", head=head)), flush=True)
   reference_values = (
       reference_grads if args.phase == "backward"
-      else (forward_output, residuals[6] / splash.LOG2E, *reference_grads)
+      else (forward_output, reference_lse / splash.LOG2E, *reference_grads)
   )
   reference_oracle = oracle_statistics(reference_values, oracles, phase=args.phase)
   forward_timing = bench._summary(bench._measure(
@@ -318,7 +353,7 @@ def main():
       overrides = available[name].copy()
       # Small CPU smoke tests retain legal blocks without altering production.
       if args.interpret:
-        for field in ("block_q", "block_kv_compute", "block_q_dkv", "block_kv_dkv_compute"):
+        for field in ("block_q", "block_kv", "block_kv_compute", "block_q_dkv", "block_kv_dkv", "block_kv_dkv_compute"):
           if field in overrides:
             overrides[field] = min(overrides[field], args.sequence // 2)
       candidate_cfg = dataclasses.replace(cfg, **overrides)
@@ -339,6 +374,15 @@ def main():
           candidate = jax.jit(
               lambda res, do: bench._backward(kernel, res, do)
           ).lower(*candidate_args).compile()
+        elif args.phase == "joint":
+          candidate_args = (q, k, v, ids, do)
+          candidate = jax.jit(functools.partial(joint_values, kernel)).lower(
+              *candidate_args
+          ).compile()
+          candidate_lse_check = jax.jit(
+              lambda q, k, v, ids: bench._forward(kernel, q, k, v, ids)
+          ).lower(q, k, v, ids).compile()
+          row["joint_lse_source"] = "untimed_standalone_forward"
         else:
           candidate_args = (q, k, v, ids)
           candidate = jax.jit(
@@ -350,18 +394,25 @@ def main():
           candidate_grads = bench._ready(candidate(*candidate_args))
           output_precision = {}
         else:
-          candidate_output, candidate_residuals = bench._ready(candidate(*candidate_args))
+          if args.phase == "joint":
+            candidate_output, *candidate_grads = bench._ready(candidate(*candidate_args))
+            _, checked_residuals = bench._ready(candidate_lse_check(q, k, v, ids))
+            candidate_lse = checked_residuals[6]
+            del checked_residuals
+          else:
+            candidate_output, candidate_residuals = bench._ready(candidate(*candidate_args))
+            candidate_lse = candidate_residuals[6]
+            candidate_grads = bench._ready(reference_backward(candidate_residuals, do))
           output_precision = precision_statistics(
-              (candidate_output, candidate_residuals[6]),
-              (forward_output, residuals[6]), names=("output", "logsumexp"),
+              (candidate_output, candidate_lse),
+              (forward_output, reference_lse), names=("output", "logsumexp"),
           )
-          candidate_grads = bench._ready(reference_backward(candidate_residuals, do))
         row["precision"] = precision_statistics(candidate_grads, reference_grads)
         row["precision"].update(output_precision)
         if oracles:
           candidate_values = (
               candidate_grads if args.phase == "backward"
-              else (candidate_output, candidate_residuals[6] / splash.LOG2E, *candidate_grads)
+              else (candidate_output, candidate_lse / splash.LOG2E, *candidate_grads)
           )
           row["fp32_oracle"] = dict(
               kind="independent_full_length_fp32_highest_precision",
@@ -371,8 +422,10 @@ def main():
               decision="diagnostic_only_no_automatic_acceptance",
           )
           del candidate_values
-        if args.phase == "forward":
+        if args.phase != "backward":
           del candidate_output
+        if args.phase == "joint":
+          del candidate_lse_check
         del candidate_grads
         exact = all(x["bitwise_equal"] and x["finite"] for x in row["precision"].values())
         row["numerical_status"] = "bitwise_equal" if exact else "needs_accuracy_review"
@@ -400,8 +453,11 @@ def main():
           message = message[:2500] + "\n[... omitted ...]\n" + message[-2500:]
         row.update(status="error", error_type=type(error).__name__, error=message)
       # Recheck the live reference to expose drift during a long compile sweep.
-      reference_fn = reference_backward if args.phase == "backward" else reference_forward
-      reference_args = (residuals, do) if args.phase == "backward" else (q, k, v, ids)
+      if args.phase == "joint":
+        reference_fn, reference_args = reference_joint, (q, k, v, ids, do)
+      else:
+        reference_fn = reference_backward if args.phase == "backward" else reference_forward
+        reference_args = (residuals, do) if args.phase == "backward" else (q, k, v, ids)
       row["reference_" + args.phase] = bench._summary(bench._measure(
           reference_fn, reference_args, 1, max(3, args.repeats // 2)
       ))

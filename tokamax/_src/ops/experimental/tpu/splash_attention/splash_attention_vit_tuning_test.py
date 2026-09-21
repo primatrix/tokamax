@@ -299,6 +299,88 @@ def test_forward_fused_normalizer_against_fp64(unroll, q_block, monkeypatch):
   np.testing.assert_allclose(np.asarray(actual_res[6][0] / splash.LOG2E), oracle[1], rtol=2e-7, atol=1e-6)
 
 
+@pytest.mark.parametrize("kvmajor", [False, True])
+@pytest.mark.parametrize("physical_seqminor", [False, True])
+@pytest.mark.parametrize("fuse_reciprocal", [False, True])
+def test_native_output_drain_preserves_all_values(kvmajor, physical_seqminor, fuse_reciprocal):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
+
+  q, k, v, do = [jax.random.normal(key, (1, 512, 72), jnp.bfloat16)
+                 for key in jax.random.split(jax.random.key(28), 4)]
+  ids = jnp.asarray(np.repeat(np.array([1, 2, 3, 0], np.int32), [256, 240, 8, 8]))
+  segments = base.SegmentIds(ids, ids)
+  cfg = splash.SplashConfig(
+      block_q=128, block_kv=256, block_kv_compute=128,
+      block_q_dkv=256, block_kv_dkv=256, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR, k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR, softmax_scale=72**-0.5,
+      use_base2_exp=True, max_logit_const=0.0, interpret=True,
+      fwd_kvmajor_probabilities=kvmajor, fwd_output_scratch_seq_minor=True,
+      compact_softmax_scratch=True, fuse_reciprocal=fuse_reciprocal, **_TUNING,
+  )
+  reference = bench._make_kernel(segments, cfg)
+  output, residuals = bench._forward(reference, q, k, v, segments)
+  grads = bench._backward(reference, residuals, do)
+  candidate = bench._make_kernel(segments, dataclasses.replace(
+      cfg, fwd_native_output_normalization=True,
+      fwd_output_seq_minor=physical_seqminor,
+  ))
+  actual_output, actual_residuals = bench._forward(candidate, q, k, v, segments)
+  actual_grads = bench._backward(candidate, actual_residuals, do)
+  for value, expected in zip(
+      (actual_output, actual_residuals[6], *actual_grads),
+      (output, residuals[6], *grads),
+  ):
+    assert value.shape == expected.shape
+    assert value.dtype == expected.dtype
+    assert np.isfinite(np.asarray(value)).all()
+    np.testing.assert_array_equal(value, expected)
+
+
+@pytest.mark.parametrize("drain", ["reference", "native", "native_output"])
+@pytest.mark.parametrize("fast_backward", [False, True])
+def test_joint_runner_matches_public_custom_vjp(drain, fast_backward):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_schedule_sweep as sweep
+
+  q, k, v, do = [jax.random.normal(key, (1, 512, 72), jnp.bfloat16)
+                 for key in jax.random.split(jax.random.key(28), 4)]
+  ids = jnp.asarray(np.repeat(np.array([1, 2, 3, 0], np.int32), [256, 240, 8, 8]))
+  segments = base.SegmentIds(ids, ids)
+  cfg = splash.SplashConfig(
+      block_q=128, block_kv=256, block_kv_compute=128,
+      block_q_dkv=256, block_kv_dkv=256, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR, k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR, softmax_scale=72**-0.5,
+      use_base2_exp=True, max_logit_const=0.0, interpret=True,
+      **(_TUNING | sweep._FWD_KVMAJOR
+         | (sweep._DQ_DK_FIRST if fast_backward else {})
+         | dict(fwd_native_output_normalization=drain != "reference",
+                fwd_output_seq_minor=drain == "native_output")),
+  )
+  kernel = bench._make_kernel(segments, cfg)
+
+  @jax.jit
+  def public_joint(q, k, v, do):
+    output, pullback = jax.vjp(lambda q, k, v: kernel(q, k, v, segments), q, k, v)
+    return output, *pullback(do)
+
+  expected_values = public_joint(q, k, v, do)
+  actual = jax.jit(lambda q, k, v, do: sweep.joint_values(kernel, q, k, v, segments, do))(q, k, v, do)
+  for value, expected in zip(actual, expected_values):
+    assert np.isfinite(np.asarray(value)).all()
+    np.testing.assert_array_equal(value, expected)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"fwd_native_output_normalization": True},
+    {"fwd_output_seq_minor": True},
+])
+def test_invalid_native_output_layout_rejected(kwargs):
+  with pytest.raises(ValueError, match="requires"):
+    splash.SplashConfig(block_q=128, block_kv=128, **kwargs)
+
+
 def test_invalid_trace_mode_rejected():
   with pytest.raises(ValueError, match="Invalid region_trace_mode"):
     splash.SplashConfig(block_q=128, block_kv=128, region_trace_mode="invalid")

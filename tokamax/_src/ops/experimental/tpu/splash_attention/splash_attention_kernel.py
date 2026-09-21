@@ -220,6 +220,12 @@ class SplashConfig:
   # PV still consumes the original FP32 probabilities.
   fwd_pv_transposed_output: bool = False
   fwd_output_scratch_seq_minor: bool = False
+  # Normalize sequence-minor FP32 scratch before casting/transposing output.
+  # Keep compact statistics in their native layout through the drain.
+  fwd_native_output_normalization: bool = False
+  # Return a sequence-minor physical Pallas output, then restore public layout.
+  # Any outer conversion must be included in end-to-end kernel timing.
+  fwd_output_seq_minor: bool = False
   # Fixed-shift ViT diagnostic: produce P as [KV, Q] from QK onward,
   # feed V @ P directly, and keep output/state scratch sequence-minor.
   fwd_kvmajor_probabilities: bool = False
@@ -255,6 +261,13 @@ class SplashConfig:
       raise ValueError(f"Invalid region_trace_mode: {self.region_trace_mode}")
     if self.bwd_dv_between_dq_dk and self.bwd_dv_last:
       raise ValueError("dV cannot be both between dQ/dK and last")
+    if self.fwd_native_output_normalization and not (
+        self.fwd_output_scratch_seq_minor
+        and self.compact_softmax_scratch and self.compact_stats_output
+    ):
+      raise ValueError("native output normalization requires sequence-minor output and compact statistics scratch")
+    if self.fwd_output_seq_minor and not self.fwd_native_output_normalization:
+      raise ValueError("sequence-minor forward output requires native normalization")
     if self.block_kv_compute is None:
       object.__setattr__(self, "block_kv_compute", self.block_kv)
     if self.block_kv_dkv_compute is None:
@@ -817,6 +830,26 @@ def flash_attention_kernel(
   @pl.when(should_write)
   def end():
     with _attention_scope(config, "splash_fwd_output_drain", coarse=True):
+      if config.fwd_native_output_normalization:
+        # Keep the exact reciprocal -> multiply -> BF16 cast sequence. Avoid
+        # transposing FP32 output or broadcasting statistics to [Q, 128].
+        l_native = l_scratch_ref[...]
+        m_native = m_scratch_ref[...]
+        output_native = o_scratch_ref[...]
+        if fuse_reciprocal:
+          output_native *= 1.0 / l_native[:1, :]
+        output_native = output_native.astype(o_ref.dtype)
+        o_ref[...] = (
+            output_native if config.fwd_output_seq_minor else output_native.T
+        )
+        if logsumexp_ref is not None:
+          log = jnp.log2 if config.use_base2_exp else jnp.log
+          logsumexp_ref[...] = (m_native + log(l_native)).astype(logsumexp_ref.dtype)
+        if l_linear_ref is not None:
+          l_linear_ref[...] = l_native.astype(l_linear_ref.dtype)
+        if max_logits_ref is not None:
+          max_logits_ref[...] = m_native.astype(max_logits_ref.dtype)
+        return
       l = load_state(l_scratch_ref)
       m = load_state(m_scratch_ref)
       if fuse_reciprocal:  # allows fusing reciprocal out of the kernel
@@ -966,6 +999,9 @@ def _splash_attention_forward(
   q_layout = config.q_layout
   k_layout = config.k_layout
   v_layout = config.v_layout
+  out_layout = (
+      QKVLayout.SEQ_MINOR if config.fwd_output_seq_minor else QKVLayout.HEAD_DIM_MINOR
+  )
 
   def unravel(f):
     def index_map(h, grid_idx, rows_ref, cols_ref, *_):
@@ -988,7 +1024,7 @@ def _splash_attention_forward(
     return index_map
 
   q_index_map = unravel(lambda h, i, j: from_head_minor((h, i, 0), q_layout))
-  out_index_map = unravel(lambda h, i, j: (h, i, 0))
+  out_index_map = unravel(lambda h, i, j: from_head_minor((h, i, 0), out_layout))
   k_index_map = unravel(create_kv_index_map(k_layout))
   v_index_map = unravel(create_kv_index_map(v_layout))
 
@@ -1083,10 +1119,12 @@ def _splash_attention_forward(
     in_specs.append(None)
 
   out_shapes = [
-      jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim_v), q.dtype),
+      jax.ShapeDtypeStruct(
+          from_head_minor((num_q_heads, q_seq_len, head_dim_v), out_layout), q.dtype
+      ),
   ]
   out_specs = [
-      pl.BlockSpec((None, bq, head_dim_v), out_index_map),
+      pl.BlockSpec(from_head_minor((None, bq, head_dim_v), out_layout), out_index_map),
   ]
   if save_residuals:
     logsumexp_index_map = unravel(
@@ -1270,6 +1308,8 @@ def _splash_attention_forward(
         max_logit_value,
     )
   out, logsumexp, l_linear, max_logits = all_out
+  if config.fwd_output_seq_minor:
+    out = out.mT
 
   # If there is no compute to do within an attention block, then we want to
   # initialize the output and residuals to default values. Otherwise, we will
