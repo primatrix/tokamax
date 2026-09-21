@@ -194,6 +194,60 @@ def test_dv_between_gradient_consumers(layout, dq_first, dp_early):
     np.testing.assert_array_equal(value, wanted)
 
 
+@pytest.mark.parametrize("seed", [27, 28])
+@pytest.mark.parametrize("compute_q", [128, 256])
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_backward_internal_q_tiles_against_fp64(seed, compute_q, pipeline):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_accuracy as accuracy
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_schedule_sweep as sweep
+
+  q, k, v, do = [jax.random.normal(key, (1, 1024, 72), jnp.bfloat16)
+                 for key in jax.random.split(jax.random.key(seed), 4)]
+  ids = jnp.asarray(np.repeat(np.array([1, 2, 3, 0], np.int32), [512, 496, 8, 8]))
+  segments = base.SegmentIds(ids, ids)
+  cfg = splash.SplashConfig(
+      block_q=256, block_kv=512, block_kv_compute=128,
+      block_q_dkv=512, block_kv_dkv=512, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR, k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR, softmax_scale=72**-0.5,
+      use_base2_exp=True, max_logit_const=0.0, interpret=True,
+      **(_TUNING | sweep._DQ_DK_FIRST),
+  )
+  reference = bench._make_kernel(segments, cfg)
+  _, residuals = bench._forward(reference, q, k, v, segments)
+  grads = bench._backward(reference, residuals, do)
+  candidate = bench._make_kernel(segments, dataclasses.replace(
+      cfg, bwd_block_q_compute=compute_q, bwd_qtile_pipeline=pipeline,
+  ))
+  actual = bench._backward(candidate, residuals, do)
+  oracle = accuracy.numpy_attention_and_gradients(q[0], k[0], v[0], do[0], ids, ids)
+  if pipeline:
+    sequential = bench._make_kernel(segments, dataclasses.replace(
+        cfg, bwd_block_q_compute=compute_q, bwd_qtile_pipeline=False,
+    ))
+    for value, expected in zip(actual, bench._backward(sequential, residuals, do)):
+      np.testing.assert_array_equal(value, expected)
+  # Q-compute splitting changes the dK/dV reduction association. Check all
+  # gradient elements against the independent FP64 reference at the existing
+  # screening bound; CPU results are not a substitute for TPU verification.
+  for value, expected, fp64 in zip(actual, grads, oracle[2:]):
+    assert value.shape == expected.shape and value.dtype == expected.dtype
+    assert np.isfinite(np.asarray(value)).all()
+    assert _relative_l2(value[0], fp64) <= _relative_l2(expected[0], fp64) * 1.001 + 1e-7
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(block_q_dkv=512, bwd_block_q_compute=64),
+    dict(block_q_dkv=512, bwd_block_q_compute=384),
+    dict(bwd_qtile_pipeline=True),
+    dict(block_q_dkv=256, bwd_block_q_compute=128, bwd_staged_kv_pipeline=True),
+])
+def test_invalid_backward_q_compute_tile_rejected(kwargs):
+  with pytest.raises(ValueError):
+    splash.SplashConfig(block_q=128, block_kv=128, **kwargs)
+
+
 def test_conflicting_dv_order_rejected():
   with pytest.raises(ValueError, match="dV cannot be both"):
     splash.SplashConfig(

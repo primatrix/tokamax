@@ -143,6 +143,12 @@ def variants(phase="backward"):
     ]
   return [
       ("pr13", {}),
+      ("qtile1024", _DQ_DK_FIRST | dict(bwd_block_q_compute=1024)),
+      ("qtile1024_pipeline", _DQ_DK_FIRST | dict(bwd_block_q_compute=1024, bwd_qtile_pipeline=True)),
+      ("qtile512", _DQ_DK_FIRST | dict(bwd_block_q_compute=512)),
+      ("qtile512_pipeline", _DQ_DK_FIRST | dict(bwd_block_q_compute=512, bwd_qtile_pipeline=True)),
+      ("qtile2048_c512", _DQ_DK_FIRST | dict(bwd_block_q_compute=2048, block_kv_dkv_compute=512)),
+      ("qtile2048_c512_pipeline", _DQ_DK_FIRST | dict(bwd_block_q_compute=2048, block_kv_dkv_compute=512, bwd_qtile_pipeline=True)),
       ("seqminor", _EXACT_LAYOUT),
       ("dk_first", _EXACT_LAYOUT | dict(bwd_dq_first=False)),
       ("dv_last", _EXACT_LAYOUT | dict(bwd_dv_last=True)),
@@ -369,7 +375,7 @@ def main():
       overrides = available[name].copy()
       # Small CPU smoke tests retain legal blocks without altering production.
       if args.interpret:
-        for field in ("block_q", "block_kv", "block_kv_compute", "block_q_dkv", "block_kv_dkv", "block_kv_dkv_compute"):
+        for field in ("block_q", "block_kv", "block_kv_compute", "block_q_dkv", "block_kv_dkv", "block_kv_dkv_compute", "bwd_block_q_compute"):
           if field in overrides:
             overrides[field] = min(overrides[field], args.sequence // 2)
       candidate_cfg = dataclasses.replace(cfg, **overrides)

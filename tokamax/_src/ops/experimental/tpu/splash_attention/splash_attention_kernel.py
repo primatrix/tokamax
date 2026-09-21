@@ -169,6 +169,10 @@ class SplashConfig:
   # ViT diagnostic: prepare the next KV block before consuming prior P/dS.
   # Carried P/dS are cast only where the reference gradient dots already cast.
   bwd_staged_kv_pipeline: bool = False
+  # Split Q compute independently of the outer Q DMA tile to bound P/dS live
+  # ranges. Optional producer/consumer carry holds only BF16 P and dS.
+  bwd_block_q_compute: int | None = None
+  bwd_qtile_pipeline: bool = False
   bwd_dq_first: bool = False
   bwd_dv_last: bool = False
   # Complete the gradient-consumer ordering screen without changing dots.
@@ -267,6 +271,17 @@ class SplashConfig:
       raise ValueError(f"Invalid region_trace_mode: {self.region_trace_mode}")
     if self.bwd_dv_between_dq_dk and self.bwd_dv_last:
       raise ValueError("dV cannot be both between dQ/dK and last")
+    if self.bwd_block_q_compute is not None and (
+        self.bwd_block_q_compute <= 0
+        or self.bwd_block_q_compute % NUM_LANES
+        or self.block_q_dkv is None
+        or self.block_q_dkv % self.bwd_block_q_compute
+    ):
+      raise ValueError("backward Q compute tile must be lane-aligned and divide block_q_dkv")
+    if self.bwd_qtile_pipeline and self.bwd_block_q_compute is None:
+      raise ValueError("Q-tile pipeline requires bwd_block_q_compute")
+    if self.bwd_block_q_compute is not None and self.bwd_staged_kv_pipeline:
+      raise ValueError("Q compute tiling cannot use the legacy KV pipeline")
     if self.fwd_native_output_normalization and not (
         self.fwd_output_scratch_seq_minor
         and self.compact_softmax_scratch and self.compact_stats_output
@@ -1825,6 +1840,101 @@ def _flash_attention_dkv_kernel(
     state = lax.fori_loop(1, num_iters, step, state, unroll=False)
     consume(num_iters - 1, state)
 
+  def run_q_tiled_loop(num_kv_iters, has_partial_mask):
+    # This probe retains outer DMA tiles and reduction/output handling. Only
+    # internal compute is split; dK/dV reduction association may change.
+    if not (
+        head_group_size == q_heads_per_kv_head == 1
+        and config.q_layout == config.k_layout == config.v_layout == QKVLayout.SEQ_MINOR
+        and config.bwd_do_seq_minor and config.bwd_dq_scratch_seq_minor
+        and config.bwd_dkv_scratch_seq_minor and config.bwd_scale_after_dot
+        and config.bwd_dq_transposed_output and not config.bwd_dq_first
+        and not config.bwd_staged_kv_pipeline and not config.bwd_dp_before_qk
+        and not config.bwd_qmajor_probabilities and not config.bwd_keep_kv_seq_minor
+        and not config.bwd_dk_transposed_output and not config.bwd_dv_transposed_output
+        and not config.bwd_dv_last and not config.bwd_dv_between_dq_dk
+        and not config.bwd_dq_contract_ds_axis0 and not config.bwd_reuse_bf16_probabilities
+        and config.use_base2_exp and config.combine_log2_scale
+        and config.softmax_scale is not None and attn_logits_soft_cap is None
+        and dq_scratch_ref is not None and mask_ref is None and mask_function is None
+        and q_segment_ids_ref is not None and kv_segment_ids_ref is not None
+        and q_ref.dtype == k_ref.dtype == v_ref.dtype == do_ref.dtype == jnp.bfloat16
+    ):
+      raise ValueError("Q compute tiling requires the ViT transposed-dQ/dK-first layout")
+    bq_compute = config.bwd_block_q_compute
+    assert bq_compute is not None and bq % bq_compute == 0
+    q_inner_steps = bq // bq_compute
+    num_tiles = num_kv_iters * q_inner_steps
+
+    def windows(i):
+      return (
+          pl.ds((i % q_inner_steps) * bq_compute, bq_compute),
+          pl.ds((i // q_inner_steps) * bkv_compute, bkv_compute),
+      )
+
+    def prepare(i):
+      q_window, kv_window = windows(i)
+      q, k = q_ref[:, q_window], k_ref[:, kv_window]
+      with _attention_scope(config, "splash_bwd_qk_recompute_mxu"):
+        logits = lax.dot_general(k, q, TN_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        logits *= jnp.float32(config.softmax_scale * LOG2E)
+      with _attention_scope(config, "splash_bwd_mask_softmax"):
+        if not config.segment_mask_on_partial_only or has_partial_mask:
+          q_ids = q_segment_ids_ref[:1, q_window]
+          kv_ids = kv_segment_ids_ref[kv_window, :1]
+          logits = jnp.where(kv_ids == q_ids, logits, mask_value)
+        p = jnp.exp2(logits - logsumexp_ref[:1, q_window])
+      with _attention_scope(config, "splash_bwd_dp_mxu"):
+        dp = lax.dot_general(
+            v_ref[:, kv_window], do_ref[:, q_window], TN_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
+      with _attention_scope(config, "splash_bwd_softmax_grad"):
+        ds = ((dp - di_ref[:1, q_window]) * p).astype(do_ref.dtype)
+      # FP32 p is used for dS. Cast only at the reference's gradient-dot
+      # boundaries, so the carried state does not lower softmax precision.
+      return p.astype(do_ref.dtype), ds
+
+    def consume(i, state):
+      q_window, kv_window = windows(i)
+      p, ds = state
+      with _attention_scope(config, "splash_bwd_dv_mxu_accum"):
+        dv = lax.dot_general(
+            p, do_ref[:, q_window], NT_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
+        dv_scratch_ref[:, kv_window] += dv.T
+      with _attention_scope(config, "splash_bwd_dk_mxu_accum"):
+        dk = lax.dot_general(
+            ds, q_ref[:, q_window], NT_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
+        dk *= jnp.float32(config.softmax_scale)
+        dk_scratch_ref[:, kv_window] += dk.T
+      with _attention_scope(config, "splash_bwd_dq_mxu_accum"):
+        dq = lax.dot_general(
+            k_ref[:, kv_window], ds, NN_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
+        dq *= jnp.float32(config.softmax_scale)
+        dq_scratch_ref[:, q_window] += dq
+
+    if config.bwd_qtile_pipeline:
+      def step(i, previous):
+        current = prepare(i)
+        consume(i - 1, previous)
+        return current
+
+      state = lax.fori_loop(
+          1, num_tiles, step, prepare(0), unroll=config.bwd_kv_unroll,
+      )
+      consume(num_tiles - 1, state)
+    else:
+      def step(i, _):
+        consume(i, prepare(i))
+
+      lax.fori_loop(0, num_tiles, step, None, unroll=config.bwd_kv_unroll)
+
   def qmajor_body(i, has_partial_mask):
     if not (
         head_group_size == 1
@@ -2167,6 +2277,15 @@ def _flash_attention_dkv_kernel(
     k_seq_axis += 1
   num_iters = k_ref.shape[k_seq_axis] // bkv_compute
 
+  def run_inner_loop(has_partial_mask):
+    if config.bwd_block_q_compute is not None:
+      run_q_tiled_loop(num_iters, has_partial_mask)
+    else:
+      lax.fori_loop(
+          0, num_iters, partial(body, has_partial_mask=has_partial_mask), None,
+          unroll=config.bwd_kv_unroll,
+      )
+
   if config.bwd_staged_kv_pipeline and not config.bwd_single_segment_mask_body:
     raise ValueError("bwd_staged_kv_pipeline requires a single segment-mask body")
   if config.bwd_single_segment_mask_body:
@@ -2184,26 +2303,17 @@ def _flash_attention_dkv_kernel(
         if config.bwd_staged_kv_pipeline:
           run_staged_pipeline(num_iters)
         else:
-          lax.fori_loop(
-              0, num_iters, partial(body, has_partial_mask=True), None,
-              unroll=config.bwd_kv_unroll,
-          )
+          run_inner_loop(True)
   else:
     @pl.when(jnp.logical_and(should_not_mask, should_run))
     def _():
       with _attention_scope(config, "splash_bwd_kv_loop", coarse=True):
-        lax.fori_loop(0, num_iters, body, None, unroll=config.bwd_kv_unroll)
+        run_inner_loop(False)
 
     @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
     def _():
       with _attention_scope(config, "splash_bwd_kv_loop_partial", coarse=True):
-        lax.fori_loop(
-            0,
-            num_iters,
-            partial(body, has_partial_mask=True),
-            None,
-            unroll=config.bwd_kv_unroll,
-        )
+        run_inner_loop(True)
 
   if dq_scratch_ref is not None:
     with _attention_scope(config, "splash_bwd_dq_output_drain", coarse=True):
