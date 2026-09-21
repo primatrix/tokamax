@@ -6,14 +6,20 @@ Best screened backward setting: sequence-minor scratch/dO plus transposed dQ,
 with **dK before dQ**. Across repeated full-shape runs it measures about
 45.3 ms versus PR13 about 50 ms. With region scopes removed and seed changed
 to 28, it measures 45.313 versus 49.738 ms: 8.9% lower latency / 1.098x
-throughput. Forward remains about 21 ms; the combined attention target of
-20–30% improvement has **not** been reached. No full-model speedup is claimed.
+throughput. Native KV-major forward with Q2048/compute-KV512 measures
+19.881 ms versus live PR13 21.049 ms (5.5% lower latency) with coarse scopes;
+seed 28 with region tracing disabled reproduces 19.658 versus 20.907 ms
+(6.0% lower latency / 1.064x throughput). The combined attention
+target of 20–30% improvement has **not** been reached. Joint forward/backward
+and full-model speedups are not claimed from separate timings.
 
 All new orientation/pipeline controls remain default-off, BF16 inputs/FP32 softmax are preserved,
 and model rematerialization is unchanged. dK/dV are bitwise equal for the best
 candidate; dQ differs in 302–303 of 75,497,472 elements across seeds 27/28.
 Independent-reference errors are essentially unchanged on four full-length
 heads per seed, but this is not training-convergence certification.
+The DEFAULT-precision fused-normalizer probe is rejected for TPU LSE/gradient
+accuracy regression. Its faster timings are excluded from retained results.
 
 ## Scope and controls
 
@@ -978,3 +984,61 @@ SUCCEEDED experiment is not success of these kernel configurations.
 The follow-up widens BF16 V values exactly to FP32 before this contraction.
 Four focused CPU tests pass and assert both FP32 lhs and HIGHEST precision;
 another TPU run is required. No model input dtype is changed.
+
+Evidence: details `an-413tzmgvae`, region/LLO audit `an-jb7jzfzd67`,
+operator `an-q8htv688fh`, LLO `an-ofg46hnyto`. The seed-28/no-scope corrected
+run is `exp-7tdj35x71p`, pinned to `5bcf73f` (artifact `art-y41qjesibl`).
+
+## Forward seed-28 reproduction with region tracing disabled
+
+`exp-7tdj35x71p` completed with `region_trace_mode=none` and libtpu's custom
+region trace flag disabled. Thirty samples per candidate confirm:
+
+| Variant | Forward ms | Live PR13 ms | Decision |
+| --- | ---: | ---: | --- |
+| Native Q2048, compute-KV512 | 19.658 | 20.907 | Retain for joint validation |
+| Native Q4096, memory-KV4096 | 19.945 | 20.802 | Smaller gain |
+| Native Q4096, unroll 8 | 20.409 | 20.963 | Smaller gain |
+| FP32-contract fused Q4096, unroll 8 | 60.521 | 21.029 | Reject |
+| FP32-contract fused Q2048, compute-KV512 | 81.520 | 21.127 | Reject |
+
+For the retained Q2048/compute-KV512 candidate, all arrays are finite. Output
+differs from PR13 at 6,516 / 75,497,472 elements, relative L2 `2.48309e-5`,
+max absolute `2.44141e-4`. dQ/dK/dV relative L2 differences are
+`1.38337e-4` / `1.40596e-4` / `1.28228e-4`. Against four full-length FP32
+oracle heads, worst candidate/reference L2-error ratios are 1.000009753
+(output), 0.993629862 (natural LSE), 1.000052810 (dQ), 1.000008662 (dK), and
+1.000003912 (dV). All per-head maximum absolute errors are unchanged.
+Together with seed 27, this supports the numerical screening result but
+does not establish joint forward/backward accuracy or training convergence.
+
+Exact BF16-to-FP32 V widening makes HIGHEST compile, and fixes the fused
+denominator's earlier LSE regression. It does not make fusion useful: output
+L2 error versus the oracle improves (worst ratio about 0.8053), but dK L2
+error rises by about 2.59% and its max-absolute error by 10.83%, while latency
+triples or quadruples. More accurate forward PV does not guarantee every
+quantized-backward error metric improves. These fused probes stay rejected.
+The current CPU kernel/oracle regression suite passes **176 tests** in
+124.43 seconds, including explicit HIGHEST/FP32-operand assertions.
+
+Evidence: details `an-u3hfr26giw`, operator `an-gxdqkovxwh`, LLO
+`an-adv2gcsp6h`. All experiments submitted in this iteration and their
+requested analyses are terminal and have been inspected through Falcon.
+
+## Next bounded work
+
+First jointly measure and validate the retained native forward candidate
+with the existing transposed-dQ/dK-first backward candidate. Do not infer
+joint speedup or accuracy by adding independent screening numbers.
+
+The forward region audit `an-wu7yvy4xut` identifies a concrete remaining
+layout cost: `splash_fwd_output_drain` is 0.836 ms for native
+Q2048/compute-KV512 and 0.812 ms for Q4096/memory-KV4096, versus PR13's
+0.177 ms. Initialization is only 0.023 ms for either native variant versus
+0.098 ms for PR13. Thus approximately 0.66 ms of the loop improvement is
+lost in normalization/output formatting. A bounded next kernel probe is
+direct sequence-minor normalization/writeback, with the public output
+layout and precision preserved and any outer conversion included in timing.
+Another independent option is removing duplicated full/partial loop bodies
+without changing segment semantics. Neither is implemented or claimed as a
+speedup here; inner-loop overlap is still not proven optimal.
