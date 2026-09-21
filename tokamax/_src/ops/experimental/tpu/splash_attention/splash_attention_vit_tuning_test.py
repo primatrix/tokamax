@@ -290,6 +290,55 @@ def test_backward_large_q_aspect_ratio_against_fp64(seed, block_q, compute_kv):
     assert _relative_l2(value[0], fp64) <= _relative_l2(control[0], fp64) * 1.001 + 1e-7
 
 
+@pytest.mark.parametrize("seed", [27, 28])
+@pytest.mark.parametrize("block_q", [256, 512])
+@pytest.mark.parametrize("memory_kv", [256, 512])
+@pytest.mark.parametrize("reduction_steps", [None, 3])
+def test_native_dq_output_preserves_public_vjp(seed, block_q, memory_kv, reduction_steps):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_schedule_sweep as sweep
+
+  q, k, v, do = [jax.random.normal(key, (1, 2048, 72), jnp.bfloat16)
+                 for key in jax.random.split(jax.random.key(seed), 4)]
+  # memory_kv=256 gives four active blocks per long segment, exercising j % 3
+  # alias collisions. With no alias, both FP32 (>4 KV steps) and BF16 partials
+  # (<=4 KV steps) are covered.
+  # The last two segments also test partial masks and allowed 0 == 0 tokens.
+  ids = np.repeat(np.array([1, 2, 3, 0], np.int32), [1024, 1008, 8, 8])
+  segments = base.SegmentIds(jnp.asarray(ids), jnp.asarray(ids))
+  mask = mask_lib.NumpyMask(ids[:, None] == ids[None, :])
+  cfg = splash.SplashConfig(
+      block_q=256, block_kv=512, block_kv_compute=128,
+      block_q_dkv=block_q, block_kv_dkv=memory_kv, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR, k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR, softmax_scale=72**-0.5,
+      use_base2_exp=True, max_logit_const=0.0, interpret=True,
+      dq_reduction_steps=reduction_steps, **(_TUNING | sweep._DQ_DK_FIRST),
+  )
+
+  def run(config):
+    kernel = splash.make_splash_mha_single_device(mask, config=config)
+    return jax.jit(lambda q, k, v, do: sweep.joint_values(
+        kernel, q, k, v, segments, do))(q, k, v, do)
+
+  expected = run(cfg)
+  actual = run(dataclasses.replace(cfg, bwd_dq_output_seq_minor=True))
+  for value, control in zip(actual, expected):
+    assert value.shape == control.shape and value.dtype == control.dtype
+    assert np.isfinite(np.asarray(value)).all()
+    np.testing.assert_array_equal(value, control)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {},
+    {"bwd_dq_scratch_seq_minor": True, "use_fused_bwd_kernel": False},
+])
+def test_native_dq_output_requires_scratch_and_fused_backward(kwargs):
+  with pytest.raises(ValueError, match="requires native scratch and fused backward"):
+    splash.SplashConfig(
+        block_q=128, block_kv=256, bwd_dq_output_seq_minor=True, **kwargs,
+    )
+
+
 def test_conflicting_dv_order_rejected():
   with pytest.raises(ValueError, match="dV cannot be both"):
     splash.SplashConfig(

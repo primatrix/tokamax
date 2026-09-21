@@ -208,6 +208,9 @@ class SplashConfig:
   # Store the FP32 dQ accumulator with sequence as the minor dimension. This
   # avoids the same head-dimension padding without changing the public layout.
   bwd_dq_scratch_seq_minor: bool = False
+  # Keep the dQ partial output and its alias in sequence-minor layout too.
+  # Preserve partial dtype/rounding and restore public layout after reduction.
+  bwd_dq_output_seq_minor: bool = False
   # Return dK/dV from the Pallas call in sequence-minor physical layout, then
   # restore the public logical layout outside the custom call.
   bwd_dkv_output_seq_minor: bool = False
@@ -275,6 +278,10 @@ class SplashConfig:
       raise ValueError(f"Invalid region_trace_mode: {self.region_trace_mode}")
     if self.bwd_dv_between_dq_dk and self.bwd_dv_last:
       raise ValueError("dV cannot be both between dQ/dK and last")
+    if self.bwd_dq_output_seq_minor and not (
+        self.bwd_dq_scratch_seq_minor and self.use_fused_bwd_kernel
+    ):
+      raise ValueError("sequence-minor dQ output requires native scratch and fused backward")
     if self.bwd_block_q_compute is not None and (
         self.bwd_block_q_compute <= 0
         or self.bwd_block_q_compute % NUM_LANES
@@ -2378,7 +2385,7 @@ def _flash_attention_dkv_kernel(
   if dq_scratch_ref is not None:
     with _attention_scope(config, "splash_bwd_dq_output_drain", coarse=True):
       dq_scratch = dq_scratch_ref[...]
-      if config.bwd_dq_scratch_seq_minor:
+      if config.bwd_dq_scratch_seq_minor != config.bwd_dq_output_seq_minor:
         dq_scratch = jnp.swapaxes(dq_scratch, -1, -2)
       if dq_alias is not None:
         dq_ref[...] = dq_alias[...] + dq_scratch.astype(dq_ref.dtype)
@@ -2482,6 +2489,13 @@ def _splash_attention_bwd_dkv(
   q_steps = q_seq_len // bq
   q_heads_per_kv_head = num_q_heads // num_kv_heads
   head_group_size = config.bwd_head_group_size
+  if config.bwd_dq_output_seq_minor:
+    if is_mqa or q_heads_per_kv_head != 1 or head_group_size != 1:
+      raise NotImplementedError(
+          "Sequence-minor dQ output currently supports ungrouped MHA only"
+      )
+    if bkv == bkv_compute:
+      raise ValueError("sequence-minor dQ output requires a dQ scratch window")
   if head_group_size < 1:
     raise ValueError(f"{head_group_size=} must be positive")
   if head_group_size > 1:
@@ -2684,22 +2698,28 @@ def _splash_attention_bwd_dkv(
     dq_reduction_steps = None
 
   dq = dq_alias_spec = None
+  dq_layout = (
+      QKVLayout.SEQ_MINOR if config.bwd_dq_output_seq_minor
+      else QKVLayout.HEAD_DIM_MINOR
+  )
+  dq_block_shape = (None, head_block, *from_head_minor((bq, head_dim_qk), dq_layout))
+  dq_output_shape = from_head_minor(q.shape, dq_layout)
   if dq_reduction_steps == 3:
-    dq_index_map = unravel(lambda h, i, j: (j % 3, h, i, 0))
-    dq_spec = pl.BlockSpec(
-        (None, head_block, bq, head_dim_qk), dq_index_map
+    dq_index_map = unravel(
+        lambda h, i, j: from_head_minor((j % 3, h, i, 0), dq_layout)
     )
+    dq_spec = pl.BlockSpec(dq_block_shape, dq_index_map)
     dq_alias_spec = dq_spec
-    dq_shape = jax.ShapeDtypeStruct((3, *q.shape), q.dtype)
+    dq_shape = jax.ShapeDtypeStruct((3, *dq_output_shape), q.dtype)
     dq = jnp.zeros_like(dq_shape)
   else:
-    dq_index_map = unravel(lambda h, i, j: (j, h, i, 0))
-    dq_spec = pl.BlockSpec(
-        (None, head_block, bq, head_dim_qk), dq_index_map
+    dq_index_map = unravel(
+        lambda h, i, j: from_head_minor((j, h, i, 0), dq_layout)
     )
+    dq_spec = pl.BlockSpec(dq_block_shape, dq_index_map)
     # Only accumulate in fp32 if there's a small number of reduction steps.
     q_dtype = q.dtype if kv_steps <= 4 else jnp.float32
-    dq_shape = jax.ShapeDtypeStruct((kv_steps, *q.shape), q_dtype)
+    dq_shape = jax.ShapeDtypeStruct((kv_steps, *dq_output_shape), q_dtype)
 
   in_specs += [dq_alias_spec]
 
@@ -2984,6 +3004,8 @@ def _splash_attention_bwd_dkv(
   with jax.named_scope("splash_bwd_epilogue"):
     dq = dq_unreduced.sum(axis=0)
     dq = dq.astype(q.dtype)
+    if config.bwd_dq_output_seq_minor:
+      dq = dq.mT
     if config.bwd_dkv_output_seq_minor:
       dk = dk.mT
       dv = dv.mT
