@@ -1405,17 +1405,20 @@ def _flash_attention_dkv_kernel(
     slice_k = pl.ds(i * bkv_compute, bkv_compute)
 
     def per_head(head_offset):
-      def head(ref):
-        return ref[...] if head_group_size == 1 else ref[head_offset, ...]
+      def head_ref(ref):
+        return ref if head_group_size == 1 else ref.at[head_offset]
 
-      q = head(q_ref)  # We keep q potentially transposed, since it's always RHS
+      # Keep the head selection as a transformed Ref. Loading the head first
+      # would turn the subsequent KV-loop slice into a dynamic_slice primitive,
+      # which Mosaic TPU does not lower.
+      q = head_ref(q_ref)[...]
       if config.use_base2_exp and config.softmax_scale is None:
         scaled_q = q * LOG2E
       else:
         scaled_q = q
 
       def _load_kv(ref, layout):
-        ref = head(ref)
+        ref = head_ref(ref)
         if layout == HEAD_DIM_MINOR:
           return ref[slice_k, :]
         value = ref[:, slice_k]
@@ -1423,9 +1426,9 @@ def _flash_attention_dkv_kernel(
 
       k = _load_kv(k_ref, config.k_layout)
       v = _load_kv(v_ref, config.v_layout)
-      logsumexp = head(logsumexp_ref)[:1, :]
-      do = head(do_ref)
-      di = head(di_ref)[:1, :]
+      logsumexp = head_ref(logsumexp_ref)[:1, :]
+      do = head_ref(do_ref)[...]
+      di = head_ref(di_ref)[:1, :]
 
       dp_dims = (
           TT_DIM_NUMBERS
@@ -1491,15 +1494,9 @@ def _flash_attention_dkv_kernel(
 
       def compute_dv():
         dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32)
-        if head_group_size == 1:
-          dv = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[slice_k, :]
-          dv_scratch_ref[slice_k, :] = dv
-        else:
-          dv = (
-              dv.astype(dv_scratch_ref.dtype)
-              + dv_scratch_ref[head_offset, slice_k, :]
-          )
-          dv_scratch_ref[head_offset, slice_k, :] = dv
+        scratch_ref = head_ref(dv_scratch_ref)
+        dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[slice_k, :]
+        scratch_ref[slice_k, :] = dv
 
       if not config.bwd_dv_last:
         compute_dv()
@@ -1525,15 +1522,9 @@ def _flash_attention_dkv_kernel(
         )
         if config.softmax_scale is not None and config.bwd_scale_after_dot:
           dk *= jnp.float32(config.softmax_scale)
-        if head_group_size == 1:
-          dk = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[slice_k, :]
-          dk_scratch_ref[slice_k, :] = dk
-        else:
-          dk = (
-              dk.astype(dk_scratch_ref.dtype)
-              + dk_scratch_ref[head_offset, slice_k, :]
-          )
-          dk_scratch_ref[head_offset, slice_k, :] = dk
+        scratch_ref = head_ref(dk_scratch_ref)
+        dk = dk.astype(dk_scratch_ref.dtype) + scratch_ref[slice_k, :]
+        scratch_ref[slice_k, :] = dk
 
       if not config.bwd_dq_first:
         compute_dk()
@@ -1567,7 +1558,7 @@ def _flash_attention_dkv_kernel(
           if head_group_size == 1:
             dq_scratch_ref[...] += dq
           else:
-            dq_scratch_ref[head_offset, ...] += dq
+            head_ref(dq_scratch_ref)[...] += dq
         else:
           # Compute block size == memory block size
           if head_group_size == 1:
@@ -1576,12 +1567,13 @@ def _flash_attention_dkv_kernel(
             else:
               dq_ref[...] = dq.astype(dq_ref.dtype)
           else:
+            dq_out_ref = head_ref(dq_ref)
             if dq_alias is not None:
-              dq_ref[head_offset, ...] = (
-                  dq_alias[head_offset, ...] + dq.astype(dq_ref.dtype)
+              dq_out_ref[...] = (
+                  head_ref(dq_alias)[...] + dq.astype(dq_ref.dtype)
               )
             else:
-              dq_ref[head_offset, ...] = dq.astype(dq_ref.dtype)
+              dq_out_ref[...] = dq.astype(dq_ref.dtype)
 
       if config.bwd_dq_first:
         compute_dk()
