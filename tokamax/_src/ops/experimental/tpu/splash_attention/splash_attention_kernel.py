@@ -168,6 +168,9 @@ class SplashConfig:
   bwd_keep_kv_seq_minor: bool = False
   bwd_dp_before_qk: bool = False
   bwd_reuse_bf16_probabilities: bool = False
+  # Keep backward segment IDs scalar per token in VMEM. Partial-mask tiles
+  # broadcast them only when constructing the elementwise segment mask.
+  bwd_compact_segment_ids: bool = False
   # Process multiple independent MHA heads in one Pallas program. Dots remain
   # 2D (Mosaic TPU does not support a rank-3 batched dot); the larger program
   # gives the scheduler independent BF16 dot/vector work to interleave.
@@ -302,12 +305,19 @@ def _apply_mask_and_soft_cap(
       q_ids = jnp.tile(q_segment_ids_ref[:], (1, repeats))  # [bq, bkv]
     else:
       assert bq == q_segment_ids_ref.shape[-1]
-      repeats, rem = divmod(bq, NUM_LANES)
-      if rem:
-        raise NotImplementedError(f"block_q must be a multiple of {NUM_LANES}")
-      kv_ids = jnp.tile(
-          kv_segment_ids_ref[k_slice, :], (1, repeats)
-      )  # [k_slice, bq]
+      if kv_segment_ids_ref.shape[-1] == 1:
+        kv_ids = jnp.broadcast_to(
+            kv_segment_ids_ref[k_slice, :1], (k_slice.size, bq)
+        )
+      else:
+        repeats, rem = divmod(bq, NUM_LANES)
+        if rem:
+          raise NotImplementedError(
+              f"block_q must be a multiple of {NUM_LANES}"
+          )
+        kv_ids = jnp.tile(
+            kv_segment_ids_ref[k_slice, :], (1, repeats)
+        )  # [k_slice, bq]
       q_ids = q_segment_ids_ref[:1, :]  # [1, bq]
     masks.append(q_ids == kv_ids)
 
@@ -1800,15 +1810,24 @@ def _splash_attention_bwd_dkv(
   q_segment_ids_index_map = unravel(lambda h, i, j: (0, i))
   if segment_ids is not None:
     kv_segment_ids_index_map = unravel(lambda h, i, j: (j, 0))
-
-    q_segment_spec = pl.BlockSpec((NUM_SUBLANES, bq), q_segment_ids_index_map)
-    kv_segment_spec = pl.BlockSpec((bkv, NUM_LANES), kv_segment_ids_index_map)
-    q_segment_ids = jax.lax.broadcast_in_dim(
-        segment_ids.q, (NUM_SUBLANES, q_seq_len), (1,)
-    )
-    kv_segment_ids = jax.lax.broadcast_in_dim(
-        segment_ids.kv, (kv_seq_len, NUM_LANES), (0,)
-    )
+    if config.bwd_compact_segment_ids:
+      q_segment_spec = pl.BlockSpec((1, bq), q_segment_ids_index_map)
+      kv_segment_spec = pl.BlockSpec((bkv, 1), kv_segment_ids_index_map)
+      q_segment_ids = segment_ids.q[None, :]
+      kv_segment_ids = segment_ids.kv[:, None]
+    else:
+      q_segment_spec = pl.BlockSpec(
+          (NUM_SUBLANES, bq), q_segment_ids_index_map
+      )
+      kv_segment_spec = pl.BlockSpec(
+          (bkv, NUM_LANES), kv_segment_ids_index_map
+      )
+      q_segment_ids = jax.lax.broadcast_in_dim(
+          segment_ids.q, (NUM_SUBLANES, q_seq_len), (1,)
+      )
+      kv_segment_ids = jax.lax.broadcast_in_dim(
+          segment_ids.kv, (kv_seq_len, NUM_LANES), (0,)
+      )
   else:
     q_segment_spec = kv_segment_spec = None
     q_segment_ids = kv_segment_ids = None

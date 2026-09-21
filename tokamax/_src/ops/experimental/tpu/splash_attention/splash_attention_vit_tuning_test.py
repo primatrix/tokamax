@@ -65,6 +65,7 @@ def _relative_l2(actual, expected):
         {"bwd_dp_before_qk": True},
         {"bwd_head_group_size": 2},
         {"bwd_reuse_bf16_probabilities": True},
+        {"bwd_compact_segment_ids": True},
     ],
     ids=[
         "combined",
@@ -75,6 +76,7 @@ def _relative_l2(actual, expected):
         "dp_before_qk",
         "head_group_2",
         "reuse_bf16_probabilities",
+        "compact_segment_ids",
     ],
 )
 def test_tuning_preserves_segmented_outputs_and_all_gradients(
@@ -116,9 +118,20 @@ def test_tuning_preserves_segmented_outputs_and_all_gradients(
   expected, reference_pullback = jax.vjp(run(config), q, k, v)
   actual, pullback = jax.vjp(run(tuned), q, k, v)
   assert _relative_l2(actual, expected) < 0.01
-  for actual_grad, expected_grad in zip(pullback(do), reference_pullback(do)):
+  actual_grads = pullback(do)
+  expected_grads = reference_pullback(do)
+  for actual_grad, expected_grad in zip(actual_grads, expected_grads):
     assert np.isfinite(np.asarray(actual_grad)).all()
     assert _relative_l2(actual_grad, expected_grad) < 0.01
+
+  if extra.get("bwd_compact_segment_ids", False):
+    noncompact = dataclasses.replace(tuned, bwd_compact_segment_ids=False)
+    noncompact_out, noncompact_pullback = jax.vjp(run(noncompact), q, k, v)
+    np.testing.assert_array_equal(actual, noncompact_out)
+    for actual_grad, noncompact_grad in zip(
+        actual_grads, noncompact_pullback(do)
+    ):
+      np.testing.assert_array_equal(actual_grad, noncompact_grad)
 
   # Omitting internal max logits must not remove explicitly requested stats.
   (_, actual_stats), _ = jax.vjp(run(tuned, save_residuals=True), q, k, v)
