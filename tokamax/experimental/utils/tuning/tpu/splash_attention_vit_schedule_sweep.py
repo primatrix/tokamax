@@ -40,6 +40,14 @@ def variants(phase="backward"):
   if phase == "forward":
     return [
         ("pr13", {}),
+        ("rolled", dict(fwd_kv_unroll=False)),
+        ("unroll2", dict(fwd_kv_unroll=2)),
+        ("unroll4", dict(fwd_kv_unroll=4)),
+        ("unroll8", dict(fwd_kv_unroll=8)),
+        ("pipeline", dict(fwd_staged_kv_pipeline=True, fwd_kv_unroll=False)),
+        ("pipeline_u2", dict(fwd_staged_kv_pipeline=True, fwd_kv_unroll=2)),
+        ("pipeline_u4", dict(fwd_staged_kv_pipeline=True, fwd_kv_unroll=4)),
+        ("pipeline_c512_u2", dict(fwd_staged_kv_pipeline=True, fwd_kv_unroll=2, block_kv_compute=512)),
         ("loop_carry", dict(fwd_loop_carry=True)),
         ("loop_carry_compact", dict(fwd_loop_carry=True, compact_softmax_scratch=True)),
         ("q2048_carry", dict(fwd_loop_carry=True, block_q=2048)),

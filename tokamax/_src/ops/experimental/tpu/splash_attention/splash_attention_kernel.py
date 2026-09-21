@@ -204,6 +204,9 @@ class SplashConfig:
   # Keep inner-loop softmax/output state as SSA loop carry. Scratch is still
   # used across memory tiles, but not explicitly loaded/stored each compute tile.
   fwd_loop_carry: bool = False
+  fwd_kv_unroll: bool | int = True
+  # Fixed-logit-shift ViT diagnostic: QK/exp for i before PV/accum for i-1.
+  fwd_staged_kv_pipeline: bool = False
   bwd_parallel_heads: bool = False
   bwd_scheduler: bool | None = None
   # Caller contract: every full tile in MaskInfo must also be fully allowed
@@ -615,18 +618,79 @@ def flash_attention_kernel(
 
   def run_inner_loop(has_partial_mask):
     loop_body = partial(body, has_partial_mask=has_partial_mask)
-    if config.fwd_loop_carry:
+    if config.fwd_staged_kv_pipeline:
+      if not (
+          config.max_logit_const == 0.0
+          and max_logit_value_ref is None
+          and sinks_ref is None
+          and attn_logits_soft_cap is None
+          and config.use_base2_exp
+          and config.combine_log2_scale
+          and config.softmax_scale is not None
+          and not config.fwd_loop_carry
+          and config.q_layout == QKVLayout.SEQ_MINOR
+          and config.k_layout == QKVLayout.SEQ_MINOR
+          and config.v_layout == QKVLayout.SEQ_MINOR
+          and q_ref.dtype == k_ref.dtype == v_ref.dtype == jnp.bfloat16
+      ):
+        raise ValueError("fwd_staged_kv_pipeline requires fixed-shift BF16 ViT attention")
+
+      def prepare(i):
+        window = pl.ds(i * bkv_compute, bkv_compute)
+        with _attention_scope(config, "splash_fwd_qk_mxu"):
+          logits = lax.dot_general(
+              q_ref[...].T, k_ref[:, window], NN_DIM_NUMBERS,
+              preferred_element_type=jnp.float32,
+          )
+          logits *= jnp.float32(config.softmax_scale * LOG2E)
+        with _attention_scope(config, "splash_fwd_mask"):
+          logits = _apply_mask_and_soft_cap(
+              logits, mask_value, mask_ref, q_sequence_ref,
+              q_segment_ids_ref if (not config.segment_mask_on_partial_only or has_partial_mask) else None,
+              kv_segment_ids_ref if (not config.segment_mask_on_partial_only or has_partial_mask) else None,
+              attn_logits_soft_cap=None, k_slice=window,
+              k_offset=j * bkv + i * bkv_compute,
+              bq=bq, mask_function=mask_function, has_partial_mask=has_partial_mask,
+          )
+        with _attention_scope(config, "splash_fwd_softmax"):
+          return jnp.exp2(logits - max_logit_estimate)
+
+      def consume(i, probabilities):
+        window = pl.ds(i * bkv_compute, bkv_compute)
+        with _attention_scope(config, "splash_fwd_softmax"):
+          previous_l = load_state(l_scratch_ref)
+          current_l = lax.broadcast_in_dim(
+              probabilities.sum(axis=-1), previous_l.shape, (0,),
+          )
+          store_state(l_scratch_ref, current_l + previous_l)
+        with _attention_scope(config, "splash_fwd_pv_mxu"):
+          # Retain FP32 probabilities for PV, exactly as the reference does.
+          output = lax.dot_general(probabilities, v_ref[:, window], NT_DIM_NUMBERS)
+        with _attention_scope(config, "splash_fwd_output_accum"):
+          o_scratch_ref[...] = o_scratch_ref[...] + output
+
+      def step(i, previous):
+        current = prepare(i)
+        consume(i - 1, previous)
+        return current
+
+      probabilities = prepare(0)
+      probabilities = lax.fori_loop(
+          1, num_iters, step, probabilities, unroll=config.fwd_kv_unroll,
+      )
+      consume(num_iters - 1, probabilities)
+    elif config.fwd_loop_carry:
       initial = (
           load_state(m_scratch_ref),
           load_state(l_scratch_ref),
           o_scratch_ref[...],
       )
-      m, l, o = lax.fori_loop(0, num_iters, loop_body, initial, unroll=True)
+      m, l, o = lax.fori_loop(0, num_iters, loop_body, initial, unroll=config.fwd_kv_unroll)
       store_state(m_scratch_ref, m)
       store_state(l_scratch_ref, l)
       o_scratch_ref[...] = o
     else:
-      lax.fori_loop(0, num_iters, loop_body, None, unroll=True)
+      lax.fori_loop(0, num_iters, loop_body, None, unroll=config.fwd_kv_unroll)
 
   @pl.when(should_not_mask)
   def _():
