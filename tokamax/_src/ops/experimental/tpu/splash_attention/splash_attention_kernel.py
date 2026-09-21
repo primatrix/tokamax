@@ -166,6 +166,7 @@ class SplashConfig:
   bwd_cast_before_transpose: bool = False
   bwd_dq_contract_ds_axis0: bool = False
   bwd_keep_kv_seq_minor: bool = False
+  bwd_dp_before_qk: bool = False
   bwd_scale_after_dot: bool = False
   omit_unused_max_logits: bool = False
   compact_stats_output: bool = False
@@ -1415,6 +1416,23 @@ def _flash_attention_dkv_kernel(
     do = do_ref[...]
     di = di_ref[:1, :]
 
+    dp_dims = (
+        TT_DIM_NUMBERS
+        if config.bwd_keep_kv_seq_minor
+        and config.v_layout == QKVLayout.SEQ_MINOR
+        else NT_DIM_NUMBERS
+    )
+
+    def compute_dp():
+      return lax.dot_general(
+          v,
+          do,
+          dp_dims,
+          preferred_element_type=jnp.float32,
+      )
+
+    dp = compute_dp() if config.bwd_dp_before_qk else None
+
     if config.bwd_keep_kv_seq_minor and config.k_layout == QKVLayout.SEQ_MINOR:
       qk_dims = (
           TT_DIM_NUMBERS
@@ -1466,18 +1484,8 @@ def _flash_attention_dkv_kernel(
     if not config.bwd_dv_last:
       compute_dv()
 
-    dp_dims = (
-        TT_DIM_NUMBERS
-        if config.bwd_keep_kv_seq_minor
-        and config.v_layout == QKVLayout.SEQ_MINOR
-        else NT_DIM_NUMBERS
-    )
-    dp = lax.dot_general(
-        v,
-        do,
-        dp_dims,
-        preferred_element_type=jnp.float32,
-    )
+    if dp is None:
+      dp = compute_dp()
     ds = (dp - di) * p
     if attn_logits_soft_cap is not None:
       normalized = qk_uncapped / attn_logits_soft_cap

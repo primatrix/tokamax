@@ -62,6 +62,7 @@ def _relative_l2(actual, expected):
             "k_layout": splash.QKVLayout.SEQ_MINOR,
             "v_layout": splash.QKVLayout.SEQ_MINOR,
         },
+        {"bwd_dp_before_qk": True},
     ],
     ids=[
         "combined",
@@ -69,6 +70,7 @@ def _relative_l2(actual, expected):
         "dv_last",
         "dq_contract_axis0",
         "keep_kv_seq_minor",
+        "dp_before_qk",
     ],
 )
 def test_tuning_preserves_segmented_outputs_and_all_gradients(
