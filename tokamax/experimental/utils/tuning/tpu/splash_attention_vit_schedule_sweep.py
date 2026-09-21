@@ -13,6 +13,7 @@ Forward screens also validate outputs, residual statistics, and all gradients.
 
 import argparse
 import dataclasses
+import functools
 import gc
 import json
 from pathlib import Path
@@ -25,6 +26,7 @@ import numpy as np
 from tokamax._src.ops.experimental.tpu.splash_attention import base
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
 from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
+from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_accuracy as accuracy
 
 
 _EXACT_LAYOUT = dict(
@@ -127,6 +129,19 @@ def precision_statistics(actual, expected, names=("dq", "dk", "dv")):
   return report
 
 
+def oracle_statistics(values, oracles, *, phase):
+  """Compare sampled full-length heads to an independent FP32 computation."""
+  indices = (2, 3, 4) if phase == "backward" else (0, 1, 2, 3, 4)
+  names = ("dq", "dk", "dv") if phase == "backward" else ("output", "logsumexp", "dq", "dk", "dv")
+  return {
+      str(head): {
+          name: accuracy.accuracy_statistics(value[head], oracle[index])
+          for name, value, index in zip(names, values, indices)
+      }
+      for head, oracle in oracles.items()
+  }
+
+
 def _config(args):
   return splash.SplashConfig(
       block_q=min(1024, args.sequence // 2),
@@ -163,11 +178,16 @@ def main():
   parser.add_argument("--output-dir", required=True)
   parser.add_argument("--profile-variants", nargs="*", default=[])
   parser.add_argument("--profile-repeats", type=int, default=3)
+  parser.add_argument("--oracle-heads", type=int, nargs="*", default=[],
+                      help="Untimed independent FP32 oracle on these full-length merged heads")
+  parser.add_argument("--oracle-block-q", type=int, default=512)
   parser.add_argument("--region-trace-mode", choices=("none", "coarse", "fine"), default="none")
   parser.add_argument("--interpret", action="store_true")
   args = parser.parse_args()
   if args.sequence < 256 or args.sequence & (args.sequence - 1):
     raise ValueError("sequence must be a power of two >= 256")
+  if any(head < 0 or head >= args.heads for head in args.oracle_heads):
+    raise ValueError("oracle-heads must index the merged head dimension")
   available = dict(variants(args.phase))
   selected = args.variants or list(available)
   if set(selected) - available.keys():
@@ -194,6 +214,19 @@ def main():
       lambda res, do: bench._backward(reference_kernel, res, do)
   ).lower(residuals, do).compile()
   reference_grads = bench._ready(reference_backward(residuals, do))
+  oracles = {}
+  oracle_fn = jax.jit(functools.partial(
+      accuracy.fp32_attention_and_gradients,
+      block_q=min(args.oracle_block_q, args.sequence),
+  ))
+  for head in args.oracle_heads:
+    oracles[head] = bench._ready(oracle_fn(q[head], k[head], v[head], do[head], ids.q, ids.kv))
+    print(json.dumps(dict(status="oracle_head_complete", head=head)), flush=True)
+  reference_values = (
+      reference_grads if args.phase == "backward"
+      else (forward_output, residuals[6] / splash.LOG2E, *reference_grads)
+  )
+  reference_oracle = oracle_statistics(reference_values, oracles, phase=args.phase)
   forward_timing = bench._summary(bench._measure(
       reference_forward, (q, k, v, ids), args.warmup, args.repeats
   ))
@@ -243,9 +276,23 @@ def main():
               (forward_output, residuals[6]), names=("output", "logsumexp"),
           )
           candidate_grads = bench._ready(reference_backward(candidate_residuals, do))
-          del candidate_output
         row["precision"] = precision_statistics(candidate_grads, reference_grads)
         row["precision"].update(output_precision)
+        if oracles:
+          candidate_values = (
+              candidate_grads if args.phase == "backward"
+              else (candidate_output, candidate_residuals[6] / splash.LOG2E, *candidate_grads)
+          )
+          row["fp32_oracle"] = dict(
+              kind="independent_full_length_fp32_highest_precision",
+              heads=args.oracle_heads, block_q=min(args.oracle_block_q, args.sequence),
+              reference=reference_oracle,
+              candidate=oracle_statistics(candidate_values, oracles, phase=args.phase),
+              decision="diagnostic_only_no_automatic_acceptance",
+          )
+          del candidate_values
+        if args.phase == "forward":
+          del candidate_output
         del candidate_grads
         exact = all(x["bitwise_equal"] and x["finite"] for x in row["precision"].values())
         row["numerical_status"] = "bitwise_equal" if exact else "needs_accuracy_review"
