@@ -1,5 +1,20 @@
 # ViT Splash region tracing: 2026-09-22
 
+## Current result
+
+Best screened backward setting: sequence-minor scratch/dO plus transposed dQ,
+with **dK before dQ**. Across repeated full-shape runs it measures about
+45.3 ms versus PR13 about 50 ms. With region scopes removed and seed changed
+to 28, it measures 45.313 versus 49.738 ms: 8.9% lower latency / 1.098x
+throughput. Forward remains about 21 ms; the combined attention target of
+20–30% improvement has **not** been reached. No full-model speedup is claimed.
+
+All new orientation/pipeline controls remain default-off, BF16 inputs/FP32 softmax are preserved,
+and model rematerialization is unchanged. dK/dV are bitwise equal for the best
+candidate; dQ differs in 302–303 of 75,497,472 elements across seeds 27/28.
+Independent-reference errors are essentially unchanged on four full-length
+heads per seed, but this is not training-convergence certification.
+
 ## Scope and controls
 
 This investigation measures BF16 noncausal segmented ViT attention on **one
@@ -590,7 +605,7 @@ claim that finite values alone establish numerical correctness. A strict
 finite check now rejects invalid references before benchmarking. Commit
 `28a157b` enables barriers by default and adds independent CPU/NumPy FP64
 reference validation on the exact TPU-generated full head. That full-head
-cross-check is pending in `exp-r3ryu5qvp6` at this point. Local validation is
+cross-check completed in `exp-r3ryu5qvp6` (results below). Local validation is
 127 passing tests, including the twelve dK/dV orientation cases; the 26
 oracle tests also validate NumPy against dense FP64 autodiff.
 
@@ -637,3 +652,150 @@ underlying PV schedule before closing this direction.
 
 Evidence: details `an-6924vtlmtq`, regions/counters/final-LLO `an-915yfg2e51`,
 operator `an-6s2a2bppgp`, LLO `an-8t7snn4y9r`.
+
+### Removing the forward instruction-loading confound
+
+`exp-1bg5vj2c1m` (`a07f44a`, artifact `art-ylgxjwddyq`) controls partial
+unrolling while retaining FP32 probabilities. PV transpose with unroll 2/4/8
+measures 40.424 / 35.100 / 38.624 ms. Adding sequence-minor output scratch
+measures 56.757 / 57.233 / 65.619 ms. Q2048 with unroll-4 measures 53.867 ms;
+compute-KV512 with unroll-4 measures 32.374 ms. Live PR13 stays 20.8–21.3 ms.
+All cases except compute-KV512 are bitwise for output, LSE and all gradients.
+
+Unroll-4 restores normal TCS instruction loading: every captured variant has
+3 Any2IMEM descriptors and 79,872 bytes. Its PV-transpose device module is
+33.800 ms, with 32.398 ms in KV loops and 0.431 ms of internal scope gaps.
+With sequence-minor scratch, these are 55.839 / 54.330 / 0.424 ms. Baseline is
+20.072 / 18.685 / 0.430 ms. Thus instruction loading explains part of the
+fully-unrolled regression, but eliminating it does **not** produce a faster
+inner loop. This PV orientation is not a retained optimization.
+
+Evidence: details `an-mrfjzwjqjs`, regions `an-80gswv1rj1`, operator
+`an-56hkdzfkjt`, LLO `an-bzkbrpsn27`.
+
+## Whole-head CPU validation and extended backward controls
+
+`exp-r3ryu5qvp6` (`28a157b`, artifact `art-jklpzc9yb8`) validates the repaired
+TPU oracle against independent NumPy/CPU FP64, using every element of head 0
+at sequence 32768. CPU computation evaluates each equality-masked segment
+separately and does not reuse TPU residuals or gradients. For the
+negative-infinity-mask + stage-barrier oracle:
+
+| Array | Relative L2 vs CPU FP64 | Max absolute error |
+| --- | ---: | ---: |
+| Output | 1.38677e-7 | 1.52202e-7 |
+| Natural-log LSE | 4.46738e-8 | 1.30225e-6 |
+| dQ | 1.96810e-7 | 2.04853e-7 |
+| dK | 1.91563e-7 | 2.03390e-7 |
+| dV | 1.39792e-7 | 1.43716e-7 |
+
+These values validate this full-head reference case, not all possible inputs.
+The original unbarriered oracle still reproduces NaNs. Evidence:
+`an-tkpp5u1yul/details.json`.
+
+The extended backward screen explicitly uses the fast dK-first schedule:
+
+| Variant | Backward ms | Live PR13 ms |
+| --- | ---: | ---: |
+| Layouts only | 49.549 | 49.765 |
+| Transposed dQ, dK first | 45.278 | 50.102 |
+| Single mask body | 46.689 | 50.231 |
+| Single body, unroll 2 | 46.682 | 50.316 |
+| Single body, unroll 4 | 53.075 | 49.894 |
+| Q2048 | 47.299 | 50.028 |
+| Compute-KV512 | 48.004 | 50.120 |
+| Additionally transpose dK | 48.478 | 50.168 |
+| Additionally transpose dV | 51.429 | 50.019 |
+| Transpose all gradient outputs | 50.878 | 49.902 |
+| All transposed, single body, unroll 2 | 53.612 | 50.060 |
+
+Transposing all outputs reduces final-body `vmatmul.mubr` count to 6016
+from the fast candidate's 8832 (baseline 10240), but raises `vxpose` to 4480
+from 3968. Its device module / KV loops are 49.578 / 48.126 ms versus the
+fast candidate's 43.920 / 42.476 ms. IMEM bytes remain 79,872 for all captures.
+This is another inner-loop scheduling/layout regression despite fewer dot
+issues, not an outer instruction-loading stall.
+
+For the fast candidate, FP32-oracle dQ relative-L2 errors across heads
+0/15/16/31 are 0.002888517 / 0.002921635 / 0.002910684 / 0.003081070.
+PR13 errors are 0.002888520 / 0.002921634 / 0.002910684 / 0.003081072.
+Each head's max-absolute error is unchanged; dK/dV are bitwise with PR13.
+
+Evidence: details `an-42z5r75nvz`, regions/final-LLO `an-c5m6uq5mdc`, operator
+`an-tnyy5kohl3`, LLO `an-gptkw3umh8`.
+
+### Independent seed and no-region-scope reproduction
+
+`exp-i3pvqp34m4` (`28a157b`, artifact `art-e3o3uukric`) uses seed 28 and
+`region_trace_mode=none`, 30 timing samples and the same four oracle heads.
+The best candidate is 45.313 ms versus live PR13 49.738 ms. Layouts alone
+measure 49.529 ms. Additional dK / dV / both transpositions measure
+48.412 / 51.538 / 50.725 ms and are not improvements over the best candidate.
+
+All candidate arrays are finite. Best-candidate dQ differs in 302 elements,
+relative L2 `7.70493e-6`, max absolute `2.44141e-4` versus PR13. dK/dV are
+bitwise. Against the independent FP32 oracle, dQ errors on heads 0/15/16/31
+are 0.003188923 / 0.003116066 / 0.002905411 / 0.002933370 versus PR13
+0.003188935 / 0.003116070 / 0.002905410 / 0.002933371. The worst ratio of
+candidate/reference L2 error is 1.000000561; max-absolute error is unchanged
+on every sampled head. These are diagnostic evidence, not an implicit
+relaxation of a user-defined accuracy threshold or training validation.
+
+Evidence: details `an-gcmcxfizuf`, operator `an-7hg8gz2au1`, LLO
+`an-uqz3roun7j`.
+
+## Whole-backward probability-layout probe
+
+Commit `d90a633` adds default-off `bwd_qmajor_probabilities`: construct P/dS
+as `[Q, KV]` throughout backward, rather than independently transposing each
+gradient dot on the old `[KV, Q]` intermediates. dK/dV directly consume this
+orientation and write existing sequence-minor scratch. dQ orientation and
+stage order remain independent controls. All BF16 dot boundaries and FP32
+probability/softmax arithmetic are preserved; forward residuals are unchanged.
+Eight CPU tests compare all gradients bitwise with asymmetric Q256/KV128
+tiles at head width 72. The combined regression suite passes **147 tests**.
+
+`exp-hio7co26dh` (artifact `art-m6b2e4474k`, 30 samples, four oracle heads)
+has completed. It does not beat the earlier fast candidate:
+
+| P/dS layout and schedule | Backward ms | Live PR13 ms | Numerics vs PR13 |
+| --- | ---: | ---: | --- |
+| Old layout, transposed dQ, dK first | 45.071 | 49.939 | Only dQ differs |
+| Q-major, normal dQ, dQ first | 48.012 | 49.759 | Bitwise all gradients |
+| Q-major, normal dQ, dK first | 52.830 | 49.736 | Bitwise all gradients |
+| Q-major, transposed dQ, dQ first | 50.217 | 49.820 | Only dQ differs |
+| Q-major, transposed dQ, dK first | 51.622 | 50.140 | Only dQ differs |
+| Previous row, compute-KV512 | 61.535 | 50.047 | Only dQ differs |
+| Previous base, Q2048 | 53.365 | 50.033 | All gradients differ |
+
+Moving dP before QK in the transposed-dQ/dK-first configuration does not
+compile: 66.75M VMEM requested versus 63.94M available, including 37.12M
+register-allocator spill slots. This is a rejected configuration, not a
+numerical or runtime failure of the other variants. All measured arrays are
+finite. At unchanged tiles, dQ-transposed variants reproduce the same 303
+dQ differences; dK/dV stay bitwise.
+
+| Capture | Device ms | KV loops ms | Internal uncovered ms | Static matmul / transpose ops |
+| --- | ---: | ---: | ---: | ---: |
+| Layouts baseline | 48.146 | 46.706 | 0.197 | 10240 / 6912 |
+| Q-major, normal dQ | 46.839 | 45.392 | 0.199 | 7424 / 5248 |
+| Q-major, transposed dQ, dK first | 50.246 | 48.792 | 0.203 | 6016 / 4224 |
+
+All three captures have 79,872 TCS IMEM bytes. Static vector loads/stores are
+3664/2880 for each final body. Fewer MXU/transpose instructions do not explain
+the runtime ordering; the regression is inside the KV loop. This still does
+not establish inner-loop MXU/vector overlap as optimal.
+
+Evidence: details `an-a6iipk3bno`, regions/final-LLO `an-9qlt4trpqz`, operator
+`an-xmsp4oyowg`, LLO `an-purr19lvhz`.
+
+## Next bounded experiment
+
+Forward remains unchanged at roughly 21 ms. The existing PV-transpose probe
+retains Q-major probabilities and then pays for their preparation/transposes.
+A separate, not-yet-implemented probe should form forward P in `[KV, Q]`
+orientation from QK onward, feed `V @ P` directly, and accumulate `[D, Q]`.
+Keep P FP32, fixed logit shift and all masking semantics; explicitly measure
+the new KV-axis reduction and layout overhead, including code expansion.
+Do not assume that the negative backward Q-major result predicts the forward
+result, or promote a candidate solely because static dot counts shrink.
