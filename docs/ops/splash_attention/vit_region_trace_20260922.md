@@ -23,7 +23,7 @@ The subsequent branchless-forward, internal-Q backward pipeline and
 small-body backward-unroll screens add **no retained speedup**. The best
 new backward case is Q1024/unroll-4 at 46.070 ms versus the retained
 45.201 ms in the same experiment. All remain default-off. The expanded
-CPU kernel/oracle suite passes 284 tests; these TPU screens preserve finite
+CPU kernel/oracle suite passes 292 tests; measured TPU screens preserve finite
 outputs and essentially unchanged sampled independent-oracle errors.
 
 All new orientation/pipeline controls remain default-off. BF16 inputs,
@@ -1532,3 +1532,64 @@ retained Q4096/compute-KV1024 and Q4096/compute-KV512 controls. Larger Q
 can amortize accumulations and outer-block setup, but grows Q/dO/dQ buffer
 requirements; VMEM capacity, precision and loop/drain timing must be checked.
 This is a hypothesis, not a measured speedup.
+
+Source `9f711d330f09392acd3cbb161eb2d0c40119a6d9` passes eight new
+sequence-4096 FP64 aspect-ratio tests and all **292 CPU tests** in 235.99
+seconds. TPU `exp-dqatlnpnen` (artifact `art-0e4zwcugvb`) finishes with five
+measured configurations and two compile failures; the successful Falcon job
+status does not mean that every candidate compiled.
+
+| Q / compute-KV | Backward ms | Live PR13 ms | KV-loop ms | Internal uncovered ms |
+| --- | ---: | ---: | ---: | ---: |
+| Retained 4096 / 1024 | 44.928 | 49.747 | 42.476 | 0.198 |
+| 4096 / 512 | 47.620 | 49.808 | 45.154 | 0.199 |
+| 8192 / 512 | 46.174 | 49.925 | 43.509 | 0.099 |
+| 8192 / 256 | 55.664 | 49.653 | 53.178 | 0.100 |
+| 16384 / 256 | VMEM failure | 49.868 | — | — |
+| 16384 / 128 | VMEM failure | 50.065 | — | — |
+
+At compute-KV512, larger Q reduces the loop total by 1.645 ms and halves
+coarse loop-region count from 512 to 256, with dQ drain 0.171 -> 0.153 ms.
+That is evidence of amortization at matched compute-KV, but it is still
+slower than retained Q4096/compute-KV1024. All five captured configurations
+have 79,872 IMEM bytes / 3 descriptors, so instruction-loading traffic does
+not explain the slower Q8192/compute-KV256 loop. No new tile is promoted.
+
+The compiler reports 75.10M required VMEM for Q16384/compute-KV256 versus
+63.94M available, including 21.10M register-allocator spill slots. At
+compute-KV128 these are 66.35M required and 12.35M spill slots, still over
+capacity by 2.41M. Both errors identify an **8 MiB** double-buffered
+`s32[8192,128]` KV segment-ID window and an **8 MiB** double-buffered
+`bf16[1,1,16384,72]` dQ alias window. These are concrete allocations in
+failed configurations, not measured stall costs in the retained kernel.
+Neither failed candidate has a valid TPU timing or precision result.
+
+All five measured variants and their four-head FP32 oracle arrays are
+finite. For the Q8192 variants, per-head maximum absolute gradient errors
+are unchanged versus PR13. Worst L2-error ratios are 1.000005239 (dQ),
+1.000002761 (dK), 1.000005480 (dV). Compared with PR13, Q8192/compute-KV512
+changes 2,372 dQ, 8,922 dK and 5,640 dV elements; it is non-bitwise and
+not a training-convergence certificate. The compute-KV256 case changes
+2,838 dQ elements with the same reported dK/dV statistics.
+
+Evidence: details `an-ops4rxklot`, regions/final LLO `an-fi6ofr0h3y`,
+operator `an-v9nn7elqbq`, LLO `an-dfxjim3m6m`; all reports and filtered
+precision/trace outputs were inspected. All experiments and analyses in
+these two follow-up screens are terminal; no job is left running.
+
+## Remaining evidence-led checks
+
+The retained joint result remains 62.555 versus 70.098 ms, below the target
+improvement. No new default is enabled. Two concrete follow-ups remain:
+
+1. Complete the compiler-scheduler control on the actual retained
+   transposed-dQ/**dK-first** configuration. Existing `dq_transposed_scheduler`
+   uses the old dQ-first order; it does not answer this matched question.
+   Compare scheduler false/true/default with unchanged dataflow and the
+   public joint VJP before attributing any gain to overlap.
+2. Explore native-layout segment-ID and dQ alias/output windows to reduce
+   padding and double-buffered VMEM pressure. The allocation evidence above
+   motivates this, but fitting a rejected tile is not itself a speedup.
+   Preserve dQ partial dtype/rounding and segment equality, and include all
+   wrapper conversions in joint timing. The existing compact-ID flag alone
+   changes logical width, not a proven native-layout allocation reduction.
