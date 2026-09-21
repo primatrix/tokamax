@@ -16,13 +16,17 @@ from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_accuracy 
 
 @pytest.mark.parametrize("input_scale", [0.25, 1.0, 2.0])
 @pytest.mark.parametrize("block_q", [32, 64])
-def test_oracle_matches_dense_float64_autodiff(input_scale, block_q):
+@pytest.mark.parametrize("mask_value,barrier_stages", [(-jnp.inf, False), (-1e30, False), (-jnp.inf, True), (-1e30, True)])
+def test_oracle_matches_dense_float64_autodiff(input_scale, block_q, mask_value, barrier_stages):
   q, k, v, do = [
       (jax.random.normal(key, (128, 72), jnp.float32) * input_scale).astype(jnp.bfloat16)
       for key in jax.random.split(jax.random.key(41), 4)
   ]
   ids = jnp.asarray(np.repeat(np.array([1, 2, 3, 0], np.int32), [64, 48, 8, 8]))
-  result = accuracy.fp32_attention_and_gradients(q, k, v, do, ids, ids, block_q=block_q)
+  result = accuracy.fp32_attention_and_gradients(
+      q, k, v, do, ids, ids, block_q=block_q,
+      mask_value=mask_value, barrier_stages=barrier_stages,
+  )
   with jax.enable_x64():
     def dense(q64, k64, v64):
       logits = q64 @ k64.T / jnp.sqrt(jnp.float64(q64.shape[-1]))
@@ -47,3 +51,10 @@ def test_statistics_keep_oracle_precision():
   assert stats["finite"]
   assert stats["relative_l2"] > 0
   assert stats["max_abs"] > 0
+
+
+def test_nonfinite_oracle_is_rejected():
+  values = [jnp.ones((2,), jnp.float32) for _ in range(5)]
+  values[2] = jnp.asarray([1.0, jnp.nan], jnp.float32)
+  with pytest.raises(FloatingPointError, match="dq"):
+    accuracy.require_finite_oracle(values, head=0)

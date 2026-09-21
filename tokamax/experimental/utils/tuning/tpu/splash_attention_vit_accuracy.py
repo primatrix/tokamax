@@ -15,7 +15,10 @@ import jax
 import jax.numpy as jnp
 
 
-def fp32_attention_and_gradients(q, k, v, do, q_ids, kv_ids, *, block_q=512):
+def fp32_attention_and_gradients(
+    q, k, v, do, q_ids, kv_ids, *, block_q=512,
+    mask_value=-jnp.inf, barrier_stages=False,
+):
   """Returns output, natural-log LSE, dQ, dK, dV for one head in FP32."""
   if q.ndim != 2 or k.ndim != 2 or v.ndim != 2 or do.ndim != 2:
     raise ValueError("Expected one head with rank-2 arrays")
@@ -37,19 +40,23 @@ def fp32_attention_and_gradients(q, k, v, do, q_ids, kv_ids, *, block_q=512):
   def dot(a, b):
     return jnp.matmul(a, b, precision=jax.lax.Precision.HIGHEST)
 
+  def stage(value):
+    return jax.lax.optimization_barrier(value) if barrier_stages else value
+
   def block(index, carry):
     output, lse, dq, dk, dv = carry
     start = index * block_q
     qi = jax.lax.dynamic_slice_in_dim(q, start, block_q)
     doi = jax.lax.dynamic_slice_in_dim(do, start, block_q)
     ids = jax.lax.dynamic_slice_in_dim(q_ids, start, block_q)
-    logits = dot(qi, k.T) * scale
-    logits = jnp.where(ids[:, None] == kv_ids[None, :], logits, -jnp.inf)
+    logits = stage(dot(qi, k.T) * scale)
+    logits = jnp.where(ids[:, None] == kv_ids[None, :], logits, jnp.float32(mask_value))
     log_norm = jax.scipy.special.logsumexp(logits, axis=-1)
-    p = jax.nn.softmax(logits, axis=-1)
-    oi = dot(p, v)
-    dp = dot(doi, v.T)
-    ds = p * (dp - jnp.sum(doi * oi, axis=-1, keepdims=True))
+    p = stage(jax.nn.softmax(logits, axis=-1))
+    oi = stage(dot(p, v))
+    dp = stage(dot(doi, v.T))
+    delta = stage(jnp.sum(doi * oi, axis=-1, keepdims=True))
+    ds = stage(p * (dp - delta))
     dqi = dot(ds, k) * scale
     return (
         jax.lax.dynamic_update_slice(output, oi, (start, 0)),
@@ -60,6 +67,13 @@ def fp32_attention_and_gradients(q, k, v, do, q_ids, kv_ids, *, block_q=512):
     )
 
   return jax.lax.fori_loop(0, q.shape[0] // block_q, block, initial)
+
+
+def require_finite_oracle(values, *, head):
+  names = ("output", "logsumexp", "dq", "dk", "dv")
+  invalid = [name for name, value in zip(names, values) if not bool(jnp.isfinite(value).all())]
+  if invalid:
+    raise FloatingPointError(f"Independent FP32 oracle is non-finite: head={head}, fields={invalid}")
 
 
 @jax.jit

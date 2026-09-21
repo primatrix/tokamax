@@ -233,6 +233,7 @@ def main():
   ))
   for head in args.oracle_heads:
     oracles[head] = bench._ready(oracle_fn(q[head], k[head], v[head], do[head], ids.q, ids.kv))
+    accuracy.require_finite_oracle(oracles[head], head=head)
     print(json.dumps(dict(status="oracle_head_complete", head=head)), flush=True)
   reference_values = (
       reference_grads if args.phase == "backward"
