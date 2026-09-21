@@ -55,7 +55,7 @@ def main():
         k,
         v,
         precision=precision,
-        logits_dtype=jnp.float32,
+        logits_dtype=jnp.dtype(jnp.float32),
         logits_scale=args.head_dim**-0.5,
         bias=None,
         logits_soft_cap=None,
