@@ -207,6 +207,10 @@ class SplashConfig:
   # Keep inner-loop softmax/output state as SSA loop carry. Scratch is still
   # used across memory tiles, but not explicitly loaded/stored each compute tile.
   fwd_loop_carry: bool = False
+  # Diagnostic orientations: keep the head-width axis out of the MXU columns.
+  # PV still consumes the original FP32 probabilities.
+  fwd_pv_transposed_output: bool = False
+  fwd_output_scratch_seq_minor: bool = False
   fwd_kv_unroll: bool | int = True
   # Fixed-logit-shift ViT diagnostic: QK/exp for i before PV/accum for i-1.
   fwd_staged_kv_pipeline: bool = False
@@ -491,6 +495,20 @@ def flash_attention_kernel(
         else value
     )
 
+  def load_output():
+    value = o_scratch_ref[...]
+    return value.T if config.fwd_output_scratch_seq_minor else value
+
+  def store_output(value):
+    o_scratch_ref[...] = value.T if config.fwd_output_scratch_seq_minor else value
+
+  def compute_pv(probabilities, v):
+    if config.fwd_pv_transposed_output:
+      dims = TT_DIM_NUMBERS if config.v_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
+      return lax.dot_general(v, probabilities, dims).T
+    dims = NN_DIM_NUMBERS if config.v_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
+    return lax.dot_general(probabilities, v, dims)
+
   def store_output_stat(ref, value):
     ref[...] = (
         jnp.broadcast_to(value[:, :1].T, (NUM_SUBLANES, bq))
@@ -592,27 +610,24 @@ def flash_attention_kernel(
         if not config.fwd_loop_carry:
           store_state(l_scratch_ref, l_next)
 
-    sv_dims = (
-        NN_DIM_NUMBERS if config.v_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
-    )
     with _attention_scope(config, "splash_fwd_pv_mxu"):
       if config.v_layout == HEAD_DIM_MINOR:
         v = v_ref[slice_k, :]
       else:
         v = v_ref[:, slice_k]
-      o_curr = lax.dot_general(s_curr, v, sv_dims)
+      o_curr = compute_pv(s_curr, v)
 
     with _attention_scope(config, "splash_fwd_output_accum"):
-      o_prev = carry[2] if config.fwd_loop_carry else o_scratch_ref[...]
+      o_prev = carry[2] if config.fwd_loop_carry else load_output()
       if max_logit_estimate is None:
         alpha_o = jnp.tile(alpha, (1, head_dim_v_repeats))
-        alpha_o = alpha_o[..., : o_scratch_ref.shape[-1]]
+        alpha_o = alpha_o[..., :head_dim_v]
         o_next = alpha_o * o_prev + o_curr
       else:
         o_next = o_prev + o_curr
       if config.fwd_loop_carry:
         return m_prev if m_next is None else m_next, l_next, o_next
-      o_scratch_ref[...] = o_next
+      store_output(o_next)
 
   assert bkv % bkv_compute == 0
   num_iters = (
@@ -668,9 +683,9 @@ def flash_attention_kernel(
           store_state(l_scratch_ref, current_l + previous_l)
         with _attention_scope(config, "splash_fwd_pv_mxu"):
           # Retain FP32 probabilities for PV, exactly as the reference does.
-          output = lax.dot_general(probabilities, v_ref[:, window], NT_DIM_NUMBERS)
+          output = compute_pv(probabilities, v_ref[:, window])
         with _attention_scope(config, "splash_fwd_output_accum"):
-          o_scratch_ref[...] = o_scratch_ref[...] + output
+          store_output(load_output() + output)
 
       def step(i, previous):
         current = prepare(i)
@@ -686,12 +701,12 @@ def flash_attention_kernel(
       initial = (
           load_state(m_scratch_ref),
           load_state(l_scratch_ref),
-          o_scratch_ref[...],
+          load_output(),
       )
       m, l, o = lax.fori_loop(0, num_iters, loop_body, initial, unroll=config.fwd_kv_unroll)
       store_state(m_scratch_ref, m)
       store_state(l_scratch_ref, l)
-      o_scratch_ref[...] = o
+      store_output(o)
     else:
       lax.fori_loop(0, num_iters, loop_body, None, unroll=config.fwd_kv_unroll)
 
@@ -712,10 +727,10 @@ def flash_attention_kernel(
       m = load_state(m_scratch_ref)
       if fuse_reciprocal:  # allows fusing reciprocal out of the kernel
         l_inv = jnp.tile(1.0 / l, (1, head_dim_v_repeats))
-        l_inv = l_inv[..., : o_scratch_ref.shape[-1]]
-        o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
+        l_inv = l_inv[..., :head_dim_v]
+        o_ref[...] = (load_output() * l_inv).astype(o_ref.dtype)
       else:
-        o_ref[...] = o_scratch_ref[...].astype(o_ref.dtype)
+        o_ref[...] = load_output().astype(o_ref.dtype)
       if logsumexp_ref is not None:
         assert logsumexp_ref.shape == (
             (NUM_SUBLANES, bq)
@@ -1121,7 +1136,12 @@ def _splash_attention_forward(
                     else (bq, NUM_LANES),
                     jnp.float32,
                 ),  # l_scratch
-                pltpu.VMEM((bq, head_dim_v), jnp.float32),  # o_scratch
+                pltpu.VMEM(
+                    (head_dim_v, bq)
+                    if config.fwd_output_scratch_seq_minor
+                    else (bq, head_dim_v),
+                    jnp.float32,
+                ),  # o_scratch
             ],
         ),
         compiler_params=pltpu.CompilerParams(

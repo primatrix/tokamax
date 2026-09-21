@@ -42,6 +42,13 @@ def variants(phase="backward"):
   if phase == "forward":
     return [
         ("pr13", {}),
+        ("output_seqminor", dict(fwd_output_scratch_seq_minor=True)),
+        ("pv_transposed", dict(fwd_pv_transposed_output=True)),
+        ("pv_transposed_seqminor", dict(fwd_pv_transposed_output=True, fwd_output_scratch_seq_minor=True)),
+        ("pv_transposed_seqminor_q512", dict(fwd_pv_transposed_output=True, fwd_output_scratch_seq_minor=True, block_q=512)),
+        ("pv_transposed_seqminor_q2048", dict(fwd_pv_transposed_output=True, fwd_output_scratch_seq_minor=True, block_q=2048)),
+        ("pv_transposed_seqminor_c512", dict(fwd_pv_transposed_output=True, fwd_output_scratch_seq_minor=True, block_kv_compute=512)),
+        ("pv_transposed_seqminor_scheduler", dict(fwd_pv_transposed_output=True, fwd_output_scratch_seq_minor=True, use_experimental_scheduler=True)),
         ("rolled", dict(fwd_kv_unroll=False)),
         ("unroll2", dict(fwd_kv_unroll=2)),
         ("unroll4", dict(fwd_kv_unroll=4)),

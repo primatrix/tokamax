@@ -93,6 +93,40 @@ def test_invalid_trace_mode_rejected():
     splash.SplashConfig(block_q=128, block_kv=128, region_trace_mode="invalid")
 
 
+@pytest.mark.parametrize("fixed_shift", [False, True])
+@pytest.mark.parametrize("transposed,seqminor", [(False, True), (True, False), (True, True)])
+@pytest.mark.parametrize("v_layout", [splash.QKVLayout.HEAD_DIM_MINOR, splash.QKVLayout.SEQ_MINOR])
+def test_forward_pv_orientation_preserves_head_dim_72(fixed_shift, transposed, seqminor, v_layout):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
+
+  q, k, v, do = [
+      jax.random.normal(key, (1, 512, 72), jnp.bfloat16)
+      for key in jax.random.split(jax.random.key(27), 4)
+  ]
+  ids = jnp.asarray(np.repeat(np.array([1, 2, 3, 0], np.int32), [256, 240, 8, 8]))
+  segments = base.SegmentIds(ids, ids)
+  cfg = splash.SplashConfig(
+      block_q=128, block_kv=256, block_kv_compute=128,
+      block_q_dkv=128, block_kv_dkv=256, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR,
+      k_layout=splash.QKVLayout.SEQ_MINOR, v_layout=v_layout,
+      softmax_scale=72**-0.5, use_base2_exp=True,
+      max_logit_const=0.0 if fixed_shift else None,
+      interpret=True, **_TUNING,
+  )
+  reference = bench._make_kernel(segments, cfg)
+  output, residuals = bench._forward(reference, q, k, v, segments)
+  expected = bench._backward(reference, residuals, do)
+  candidate = bench._make_kernel(segments, dataclasses.replace(
+      cfg, fwd_pv_transposed_output=transposed, fwd_output_scratch_seq_minor=seqminor,
+  ))
+  actual_output, actual_residuals = bench._forward(candidate, q, k, v, segments)
+  actual = bench._backward(reference, actual_residuals, do)
+  for value, wanted in zip((actual_output, actual_residuals[6], *actual), (output, residuals[6], *expected)):
+    assert np.isfinite(np.asarray(value)).all()
+    np.testing.assert_array_equal(value, wanted)
+
+
 @pytest.mark.parametrize("unroll", [False, 2, 4])
 @pytest.mark.parametrize("kv_block", [256, 512])
 def test_staged_forward_preserves_outputs_and_gradients(unroll, kv_block):
