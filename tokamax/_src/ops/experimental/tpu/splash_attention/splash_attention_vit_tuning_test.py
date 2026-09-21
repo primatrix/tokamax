@@ -48,7 +48,8 @@ def _relative_l2(actual, expected):
 
 
 @pytest.mark.parametrize("mode", ["none", "coarse", "fine"])
-def test_trace_scopes_and_seqminor_scratch_preserve_head_dim_72(mode):
+@pytest.mark.parametrize("do_seq_minor", [False, True])
+def test_trace_scopes_and_seqminor_scratch_preserve_head_dim_72(mode, do_seq_minor):
   """Layout/diagnostic changes must be bitwise exact at the production width."""
   arrays = [
       jax.random.normal(key, (1, 256, 72), jnp.bfloat16)
@@ -76,6 +77,7 @@ def test_trace_scopes_and_seqminor_scratch_preserve_head_dim_72(mode):
   expected = run(config)
   actual = run(dataclasses.replace(
       config, region_trace_mode=mode,
+      bwd_do_seq_minor=do_seq_minor,
       bwd_dq_scratch_seq_minor=True, bwd_dkv_scratch_seq_minor=True,
       bwd_dkv_output_seq_minor=True, bwd_fuse_segment_id_inputs=True,
   ))
@@ -97,6 +99,12 @@ def test_invalid_trace_mode_rejected():
         {"compact_softmax_scratch": True},
         {"bwd_dv_last": True},
         {"bwd_dq_contract_ds_axis0": True},
+        {"bwd_do_seq_minor": True},
+        {
+            "bwd_do_seq_minor": True,
+            "bwd_keep_kv_seq_minor": True,
+            "v_layout": splash.QKVLayout.SEQ_MINOR,
+        },
         {
             "bwd_dq_contract_ds_axis0": True,
             "bwd_keep_kv_seq_minor": True,
@@ -121,6 +129,8 @@ def test_invalid_trace_mode_rejected():
         "compact_scratch",
         "dv_last",
         "dq_contract_axis0",
+        "do_seq_minor",
+        "do_and_v_seq_minor",
         "keep_kv_seq_minor",
         "dp_before_qk",
         "head_group_2",
@@ -181,6 +191,7 @@ def test_tuning_preserves_segmented_outputs_and_all_gradients(
       flag: False
       for flag in (
           "bwd_compact_segment_ids",
+          "bwd_do_seq_minor",
           "bwd_dq_scratch_seq_minor",
           "bwd_dkv_scratch_seq_minor",
           "bwd_dkv_output_seq_minor",

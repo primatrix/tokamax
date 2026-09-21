@@ -203,6 +203,11 @@ def _parser():
   parser.add_argument("--split-major-segments", action="store_true")
   parser.add_argument("--bwd-dq-contract-ds-axis0", action="store_true")
   parser.add_argument("--bwd-keep-kv-seq-minor", action="store_true")
+  parser.add_argument("--bwd-do-seq-minor", action="store_true")
+  parser.add_argument(
+      "--check-bwd-do-seq-minor", action="store_true",
+      help="Require bitwise-equal, finite TPU gradients versus the same config with dO layout disabled.",
+  )
   parser.add_argument("--bwd-dp-before-qk", action="store_true")
   parser.add_argument("--bwd-head-group-size", type=int, default=1)
   parser.add_argument("--use-base2-exp", action="store_true")
@@ -225,6 +230,10 @@ def main():
   args = _parser().parse_args()
   if sum(args.segment_lengths) != args.sequence:
     raise ValueError("segment lengths must sum to sequence")
+  if args.check_bwd_do_seq_minor and (
+      not args.bwd_do_seq_minor or args.split_major_segments
+  ):
+    raise ValueError("dO layout check requires --bwd-do-seq-minor without segment splitting")
   ids_np = np.concatenate(
       [
           *(np.full(n, i, np.int32) for i, n in enumerate(args.segment_lengths[:-1], 1)),
@@ -259,6 +268,7 @@ def main():
       bwd_scheduler=args.bwd_scheduler,
       bwd_dq_contract_ds_axis0=args.bwd_dq_contract_ds_axis0,
       bwd_keep_kv_seq_minor=args.bwd_keep_kv_seq_minor,
+      bwd_do_seq_minor=args.bwd_do_seq_minor,
       bwd_dp_before_qk=args.bwd_dp_before_qk,
       bwd_head_group_size=args.bwd_head_group_size,
       bwd_reuse_bf16_probabilities=args.bwd_reuse_bf16_probabilities,
@@ -341,6 +351,42 @@ def main():
   backward_compile_s = time.perf_counter() - compile_start
   _ready(backward(residuals, do))
 
+  precision_check = None
+  reference_bwd = None
+  if args.check_bwd_do_seq_minor:
+    reference_kernel = _make_kernel(
+        ids, dataclasses.replace(config, bwd_do_seq_minor=False)
+    )
+    reference_backward = jax.jit(
+        lambda residuals, do: _backward(reference_kernel, residuals, do)
+    ).lower(residuals, do).compile()
+    reference_grads = _ready(reference_backward(residuals, do))
+    candidate_grads = _ready(backward(residuals, do))
+
+    @jax.jit
+    def exact_gradient_check(actual, expected):
+      return (
+          jnp.all(jax.lax.bitcast_convert_type(actual, jnp.uint16)
+                  == jax.lax.bitcast_convert_type(expected, jnp.uint16)),
+          jnp.all(jnp.isfinite(actual)) & jnp.all(jnp.isfinite(expected)),
+      )
+
+    precision_check = {}
+    for name, actual, expected in zip(("dq", "dk", "dv"), candidate_grads, reference_grads):
+      if actual.dtype != jnp.bfloat16 or expected.dtype != jnp.bfloat16:
+        raise ValueError("This exact-layout check expects BF16 gradients")
+      equal, finite = _ready(exact_gradient_check(actual, expected))
+      precision_check[name] = {"bitwise_equal": bool(equal), "finite": bool(finite)}
+    if args.output:
+      with open(args.output + ".precision.json", "w", encoding="utf-8") as f:
+        json.dump(precision_check, f, sort_keys=True)
+    if not all(r["bitwise_equal"] and r["finite"] for r in precision_check.values()):
+      raise AssertionError(f"dO layout changes gradients: {precision_check}")
+    reference_bwd = _summary(
+        _measure(reference_backward, (residuals, do), args.warmup, args.repeats)
+    )
+    del candidate_grads, reference_grads, reference_backward
+
   fwd = _summary(_measure(forward, (q, k, v, ids), args.warmup, args.repeats))
   bwd = _summary(_measure(backward, (residuals, do), args.warmup, args.repeats))
   combined_ms = fwd["median_ms"] + bwd["median_ms"]
@@ -373,14 +419,19 @@ def main():
       "backward": bwd,
       "combined_median_ms": combined_ms,
       "profile_dir": args.profile_dir,
+      "precision_check": precision_check,
+      "reference_backward": reference_bwd,
   }
   if args.output:
     with open(args.output, "w", encoding="utf-8") as output_file:
-      for phase, latency in (
+      measurements = [
           ("forward", fwd["median_ms"]),
           ("backward", bwd["median_ms"]),
           ("combined", combined_ms),
-      ):
+      ]
+      if reference_bwd is not None:
+        measurements.append(("backward_reference", reference_bwd["median_ms"]))
+      for phase, latency in measurements:
         output_file.write(
             json.dumps(
                 {

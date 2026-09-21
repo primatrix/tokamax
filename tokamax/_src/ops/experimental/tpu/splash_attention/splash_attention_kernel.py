@@ -167,6 +167,9 @@ class SplashConfig:
   bwd_cast_before_transpose: bool = False
   bwd_dq_contract_ds_axis0: bool = False
   bwd_keep_kv_seq_minor: bool = False
+  # Feed dO directly in sequence-minor physical layout to dP/dV dots.
+  # This changes operand preparation, not the logical contraction or dtype.
+  bwd_do_seq_minor: bool = False
   bwd_dp_before_qk: bool = False
   bwd_reuse_bf16_probabilities: bool = False
   # Keep backward segment IDs scalar per token in VMEM. Partial-mask tiles
@@ -1488,12 +1491,14 @@ def _flash_attention_dkv_kernel(
         do = head_ref(do_ref)[...]
         di = head_ref(di_ref)[:1, :]
 
-      dp_dims = (
-          TT_DIM_NUMBERS
-          if config.bwd_keep_kv_seq_minor
+      v_is_seq_minor = (
+          config.bwd_keep_kv_seq_minor
           and config.v_layout == QKVLayout.SEQ_MINOR
-          else NT_DIM_NUMBERS
       )
+      if config.bwd_do_seq_minor:
+        dp_dims = TN_DIM_NUMBERS if v_is_seq_minor else NN_DIM_NUMBERS
+      else:
+        dp_dims = TT_DIM_NUMBERS if v_is_seq_minor else NT_DIM_NUMBERS
 
       def compute_dp():
         with _attention_scope(config, "splash_bwd_dp_mxu"):
@@ -1560,7 +1565,11 @@ def _flash_attention_dkv_kernel(
 
       def compute_dv():
         with _attention_scope(config, "splash_bwd_dv_mxu_accum"):
-          dv = lax.dot(p_bf16, do, preferred_element_type=jnp.float32)
+          dv = lax.dot_general(
+              p_bf16, do,
+              NT_DIM_NUMBERS if config.bwd_do_seq_minor else NN_DIM_NUMBERS,
+              preferred_element_type=jnp.float32,
+          )
           scratch_ref = head_ref(dv_scratch_ref)
           if config.bwd_dkv_scratch_seq_minor:
             dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[:, slice_k].T
@@ -1953,7 +1962,12 @@ def _splash_attention_bwd_dkv(
     q_segment_spec = kv_segment_spec = None
     q_segment_ids = kv_segment_ids = None
 
-  do_spec = o_spec
+  if config.bwd_do_seq_minor:
+    do_spec = pl.BlockSpec(
+        (head_block, head_dim_v, bq), unravel(lambda h, i, j: (h, 0, i))
+    )
+  else:
+    do_spec = o_spec
 
   logsumexp_index_map = unravel(lambda h, i, j: (h, 0, i))
 
@@ -2107,7 +2121,7 @@ def _splash_attention_bwd_dkv(
       q_segment_ids,
       kv_segment_ids,
       logsumexp,
-      do,
+      do.mT if config.bwd_do_seq_minor else do,
       di,
       mask_info.partial_mask_blocks,
       q_sequence,
