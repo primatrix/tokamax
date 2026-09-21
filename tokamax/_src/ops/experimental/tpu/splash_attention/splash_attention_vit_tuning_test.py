@@ -91,8 +91,10 @@ def test_invalid_trace_mode_rejected():
     splash.SplashConfig(block_q=128, block_kv=128, region_trace_mode="invalid")
 
 
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("kv_block", [256, 512])
 @pytest.mark.parametrize("unroll", [False, 2, 4, 8])
-def test_single_segment_mask_body_preserves_gradients(unroll):
+def test_single_segment_mask_body_preserves_gradients(unroll, staged, kv_block):
   from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
 
   q, k, v, do = [
@@ -103,7 +105,7 @@ def test_single_segment_mask_body_preserves_gradients(unroll):
   segments = base.SegmentIds(ids, ids)
   cfg = splash.SplashConfig(
       block_q=128, block_kv=256, block_kv_compute=128,
-      block_q_dkv=128, block_kv_dkv=256, block_kv_dkv_compute=128,
+      block_q_dkv=128, block_kv_dkv=kv_block, block_kv_dkv_compute=128,
       q_layout=splash.QKVLayout.SEQ_MINOR,
       k_layout=splash.QKVLayout.SEQ_MINOR,
       v_layout=splash.QKVLayout.SEQ_MINOR,
@@ -117,6 +119,7 @@ def test_single_segment_mask_body_preserves_gradients(unroll):
   expected = bench._backward(reference, residuals, do)
   candidate = bench._make_kernel(segments, dataclasses.replace(
       cfg, bwd_single_segment_mask_body=True, bwd_kv_unroll=unroll,
+      bwd_staged_kv_pipeline=staged,
   ))
   actual = bench._backward(candidate, residuals, do)
   for value, wanted in zip(actual, expected):

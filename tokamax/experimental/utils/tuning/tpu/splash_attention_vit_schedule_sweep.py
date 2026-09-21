@@ -52,6 +52,11 @@ def variants(phase="backward"):
   return [
       ("pr13", {}),
       ("seqminor", _EXACT_LAYOUT),
+      ("pipeline_c512", _EXACT_LAYOUT | dict(bwd_single_segment_mask_body=True, bwd_staged_kv_pipeline=True, block_kv_dkv_compute=512)),
+      ("pipeline_c256", _EXACT_LAYOUT | dict(bwd_single_segment_mask_body=True, bwd_staged_kv_pipeline=True, block_kv_dkv_compute=256)),
+      ("pipeline_q2048_c512", _EXACT_LAYOUT | dict(bwd_single_segment_mask_body=True, bwd_staged_kv_pipeline=True, block_q_dkv=2048, block_kv_dkv_compute=512)),
+      ("pipeline_c512_scheduler", _EXACT_LAYOUT | dict(bwd_single_segment_mask_body=True, bwd_staged_kv_pipeline=True, block_kv_dkv_compute=512, bwd_scheduler=True)),
+      ("pipeline_c1024", _EXACT_LAYOUT | dict(bwd_single_segment_mask_body=True, bwd_staged_kv_pipeline=True)),
       ("single_mask_body", _EXACT_LAYOUT | dict(bwd_single_segment_mask_body=True)),
       ("single_mask_body_u2", _EXACT_LAYOUT | dict(bwd_single_segment_mask_body=True, bwd_kv_unroll=2)),
       ("single_mask_body_u4", _EXACT_LAYOUT | dict(bwd_single_segment_mask_body=True, bwd_kv_unroll=4)),
@@ -244,7 +249,12 @@ def main():
         metrics.write(json.dumps(metric, sort_keys=True) + "\n")
         metrics.flush()
       except Exception as error:
-        row.update(status="error", error_type=type(error).__name__, error=str(error)[-5000:])
+        if "compile_started_ns" in row and "compile_finished_ns" not in row:
+          row["compile_finished_ns"] = time.time_ns()
+        message = str(error)
+        if len(message) > 5000:
+          message = message[:2500] + "\n[... omitted ...]\n" + message[-2500:]
+        row.update(status="error", error_type=type(error).__name__, error=message)
       # Recheck the live reference to expose drift during a long compile sweep.
       reference_fn = reference_backward if args.phase == "backward" else reference_forward
       reference_args = (residuals, do) if args.phase == "backward" else (q, k, v, ids)

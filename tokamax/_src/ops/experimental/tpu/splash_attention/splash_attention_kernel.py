@@ -166,6 +166,9 @@ class SplashConfig:
   # Segment-only diagnostic: one masked loop body avoids duplicating the
   # expanded full/partial branches. Full tiles perform redundant exact masking.
   bwd_single_segment_mask_body: bool = False
+  # ViT diagnostic: prepare the next KV block before consuming prior P/dS.
+  # Carried P/dS are cast only where the reference gradient dots already cast.
+  bwd_staged_kv_pipeline: bool = False
   bwd_dq_first: bool = False
   bwd_dv_last: bool = False
   bwd_cast_before_transpose: bool = False
@@ -1489,6 +1492,89 @@ def _flash_attention_dkv_kernel(
       dk_scratch_ref[...] = jnp.zeros_like(dk_scratch_ref)
       dv_scratch_ref[...] = jnp.zeros_like(dv_scratch_ref)
 
+  def run_staged_pipeline(num_iters):
+    # Keep this probe narrow: these are the production ViT arithmetic/layout
+    # choices, not a replacement for all of Splash's supported configurations.
+    if not (
+        head_group_size == 1
+        and config.q_layout == QKVLayout.SEQ_MINOR
+        and config.k_layout == QKVLayout.SEQ_MINOR
+        and config.v_layout == QKVLayout.SEQ_MINOR
+        and config.bwd_do_seq_minor
+        and config.bwd_dq_scratch_seq_minor
+        and config.bwd_dkv_scratch_seq_minor
+        and config.bwd_scale_after_dot
+        and config.bwd_cast_before_transpose
+        and config.bwd_dq_first
+        and not config.bwd_dp_before_qk
+        and not config.bwd_keep_kv_seq_minor
+        and not config.bwd_dq_contract_ds_axis0
+        and not config.bwd_dv_last
+        and not config.bwd_reuse_bf16_probabilities
+        and config.use_base2_exp
+        and config.combine_log2_scale
+        and config.softmax_scale is not None
+        and attn_logits_soft_cap is None
+        and dq_scratch_ref is not None
+        and q_ref.dtype == k_ref.dtype == v_ref.dtype == do_ref.dtype == jnp.bfloat16
+    ):
+      raise ValueError("bwd_staged_kv_pipeline requires the ViT exact-layout configuration")
+
+    def prepare(i):
+      window = pl.ds(i * bkv_compute, bkv_compute)
+      q = q_ref[...]
+      k = k_ref[:, window].T
+      v = v_ref[:, window].T
+      do = do_ref[...]
+      with _attention_scope(config, "splash_bwd_qk_recompute_mxu"):
+        logits = lax.dot_general(k, q, NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        logits *= jnp.float32(config.softmax_scale * LOG2E)
+      with _attention_scope(config, "splash_bwd_mask_softmax"):
+        logits = _apply_mask_and_soft_cap(
+            logits, mask_value, None, q_sequence_ref,
+            q_segment_ids_ref, kv_segment_ids_ref,
+            attn_logits_soft_cap=None, k_slice=window,
+            k_offset=kv_index * bkv + i * bkv_compute,
+            bq=bq, k_in_lanes=False, mask_function=None,
+            has_partial_mask=True,
+        )
+        p = jnp.exp2(logits - logsumexp_ref[:1, :])
+      with _attention_scope(config, "splash_bwd_dp_mxu"):
+        dp = lax.dot_general(v, do, NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
+      with _attention_scope(config, "splash_bwd_softmax_grad"):
+        ds = (dp - di_ref[:1, :]) * p
+      # Do not reuse BF16 P in dS: the reference consumes FP32 probabilities.
+      return p.astype(do.dtype), ds.astype(do.dtype)
+
+    def consume(i, state):
+      window = pl.ds(i * bkv_compute, bkv_compute)
+      p, ds = state
+      q, do = q_ref[...], do_ref[...]
+      k = k_ref[:, window].T
+      with _attention_scope(config, "splash_bwd_dv_mxu_accum"):
+        dv = lax.dot_general(p, do, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        dv = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[:, window].T
+        dv_scratch_ref[:, window] = dv.T
+      with _attention_scope(config, "splash_bwd_dq_mxu_accum"):
+        dq = lax.dot_general(ds.T, k, NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        dq *= jnp.float32(config.softmax_scale)
+        dq_scratch_ref[...] += dq.T
+      with _attention_scope(config, "splash_bwd_dk_mxu_accum"):
+        dk = lax.dot_general(ds, q, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        dk *= jnp.float32(config.softmax_scale)
+        dk = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[:, window].T
+        dk_scratch_ref[:, window] = dk.T
+
+    state = prepare(0)
+
+    def step(i, previous):
+      current = prepare(i)
+      consume(i - 1, previous)
+      return current
+
+    state = lax.fori_loop(1, num_iters, step, state, unroll=False)
+    consume(num_iters - 1, state)
+
   def body(i, _, has_partial_mask=False):
 
     slice_k = pl.ds(i * bkv_compute, bkv_compute)
@@ -1721,6 +1807,8 @@ def _flash_attention_dkv_kernel(
     k_seq_axis += 1
   num_iters = k_ref.shape[k_seq_axis] // bkv_compute
 
+  if config.bwd_staged_kv_pipeline and not config.bwd_single_segment_mask_body:
+    raise ValueError("bwd_staged_kv_pipeline requires a single segment-mask body")
   if config.bwd_single_segment_mask_body:
     if (
         mask_ref is not None
@@ -1733,10 +1821,13 @@ def _flash_attention_dkv_kernel(
     @pl.when(should_run)
     def _():
       with _attention_scope(config, "splash_bwd_kv_loop_partial", coarse=True):
-        lax.fori_loop(
-            0, num_iters, partial(body, has_partial_mask=True), None,
-            unroll=config.bwd_kv_unroll,
-        )
+        if config.bwd_staged_kv_pipeline:
+          run_staged_pipeline(num_iters)
+        else:
+          lax.fori_loop(
+              0, num_iters, partial(body, has_partial_mask=True), None,
+              unroll=config.bwd_kv_unroll,
+          )
   else:
     @pl.when(jnp.logical_and(should_not_mask, should_run))
     def _():
