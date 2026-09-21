@@ -80,6 +80,7 @@ class SegmentIds(NamedTuple):
   q: jax.Array  # [q_seq_len]
   kv: jax.Array  # [kv_seq_len]
 
+
 MaskFunctionType = Callable[..., jax.Array]
 
 
@@ -154,6 +155,24 @@ class SplashConfig:
   # This parameter allows to override this behavior and specifies the number of
   # reduction steps. For now, only 3 or all the kv steps are supported.
   dq_reduction_steps: int | None = None
+  # Opt-in ViT tuning. Defaults preserve the existing execution paths.
+  # Arithmetic reordering may change floating-point rounding.
+  combine_log2_scale: bool = False
+  bwd_kv_unroll: bool = True
+  bwd_dq_first: bool = False
+  bwd_dv_last: bool = False
+  bwd_cast_before_transpose: bool = False
+  bwd_scale_after_dot: bool = False
+  omit_unused_max_logits: bool = False
+  compact_stats_output: bool = False
+  compact_softmax_scratch: bool = False
+  bwd_parallel_heads: bool = False
+  bwd_scheduler: bool | None = None
+  # Caller contract: every full tile in MaskInfo must also be fully allowed
+  # by the runtime segment IDs. Partial tiles retain exact segment checks.
+  segment_mask_on_partial_only: bool = False
+  fwd_vmem_limit_bytes: int | None = None
+  bwd_vmem_limit_bytes: int | None = None
   # An experimental scheduler that sometimes produces better softmax overlap.
   use_experimental_scheduler: bool = False
   # If provided, scale FP32 QK logits inside the kernel. Keeping this optional
@@ -254,7 +273,9 @@ def _apply_mask_and_soft_cap(
         q_sequence = jnp.broadcast_to(q_sequence, (k_slice.size, bq))
 
       assert q_sequence.shape == k_sequence.shape
-      computed_mask = mask_function(q_sequence, k_sequence)  # pytype: disable=wrong-arg-count
+      computed_mask = mask_function(
+          q_sequence, k_sequence
+      )  # pytype: disable=wrong-arg-count
       if computed_mask.dtype != jnp.dtype(jnp.bool_):
         raise ValueError(
             "Mask function must return a boolean-valued array, but got:"
@@ -392,9 +413,28 @@ def flash_attention_kernel(
           sink - jnp.full_like(l_scratch_ref, max_logit_estimate)
       )
 
+  def load_state(ref):
+    if config.compact_softmax_scratch:
+      return jnp.broadcast_to(ref[:1, :].T, (bq, NUM_LANES))
+    return ref[...]
+
+  def store_state(ref, value):
+    ref[...] = (
+        jnp.broadcast_to(value[:, :1].T, (NUM_SUBLANES, bq))
+        if config.compact_softmax_scratch
+        else value
+    )
+
+  def store_output_stat(ref, value):
+    ref[...] = (
+        jnp.broadcast_to(value[:, :1].T, (NUM_SUBLANES, bq))
+        if config.compact_stats_output
+        else value
+    ).astype(ref.dtype)
+
   def body(kv_compute_index, _, has_partial_mask=False):
     slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-    m_prev, l_prev = m_scratch_ref[...], l_scratch_ref[...]
+    m_prev, l_prev = load_state(m_scratch_ref), load_state(l_scratch_ref)
     assert m_prev.shape == (bq, NUM_LANES)
     assert l_prev.shape == (bq, NUM_LANES)
 
@@ -411,9 +451,12 @@ def flash_attention_kernel(
       k = k_ref[:, slice_k]
     qk = lax.dot_general(q, k, qk_dims, preferred_element_type=float32)
     if config.softmax_scale is not None:
-      qk *= jnp.float32(config.softmax_scale)
-      if config.use_base2_exp:
-        qk *= jnp.float32(LOG2E)
+      if config.use_base2_exp and config.combine_log2_scale:
+        qk *= jnp.float32(config.softmax_scale * LOG2E)
+      else:
+        qk *= jnp.float32(config.softmax_scale)
+        if config.use_base2_exp:
+          qk *= jnp.float32(LOG2E)
 
     assert qk.shape == (bq, bkv_compute)
     apply_mask_and_soft_cap = functools.partial(
@@ -422,8 +465,12 @@ def flash_attention_kernel(
         mask_value,
         mask_ref,
         q_sequence_ref,
-        q_segment_ids_ref,
-        kv_segment_ids_ref,
+        q_segment_ids_ref
+        if (not config.segment_mask_on_partial_only or has_partial_mask)
+        else None,
+        kv_segment_ids_ref
+        if (not config.segment_mask_on_partial_only or has_partial_mask)
+        else None,
         attn_logits_soft_cap=attn_logits_soft_cap,
         k_slice=slice_k,
         k_offset=j * bkv + kv_compute_index * bkv_compute,
@@ -461,10 +508,11 @@ def flash_attention_kernel(
     if max_logit_estimate is None:
       alpha = exp(m_prev - m_next)
       l_next = l_curr + alpha * l_prev
-      m_scratch_ref[...], l_scratch_ref[...] = m_next, l_next
+      store_state(m_scratch_ref, m_next)
+      store_state(l_scratch_ref, l_next)
     else:
       alpha = None
-      l_scratch_ref[...] = l_curr + l_prev
+      store_state(l_scratch_ref, l_curr + l_prev)
 
     sv_dims = (
         NN_DIM_NUMBERS if config.v_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
@@ -499,8 +547,8 @@ def flash_attention_kernel(
 
   @pl.when(should_write)
   def end():
-    l = l_scratch_ref[...]
-    m = m_scratch_ref[...]
+    l = load_state(l_scratch_ref)
+    m = load_state(m_scratch_ref)
     if fuse_reciprocal:  # allows fusing reciprocal out of the kernel
       l_inv = jnp.tile(1.0 / l, (1, head_dim_v_repeats))
       l_inv = l_inv[..., : o_scratch_ref.shape[-1]]
@@ -508,16 +556,22 @@ def flash_attention_kernel(
     else:
       o_ref[...] = o_scratch_ref[...].astype(o_ref.dtype)
     if logsumexp_ref is not None:
-      assert logsumexp_ref.shape == (bq, NUM_LANES)
+      assert logsumexp_ref.shape == (
+          (NUM_SUBLANES, bq) if config.compact_stats_output else (bq, NUM_LANES)
+      )
       log = jnp.log2 if config.use_base2_exp else jnp.log
       logsumexp = m + log(l)
-      logsumexp_ref[...] = logsumexp.astype(logsumexp_ref.dtype)
+      store_output_stat(logsumexp_ref, logsumexp)
     if l_linear_ref is not None:
-      assert l_linear_ref.shape == (bq, NUM_LANES)
-      l_linear_ref[...] = l.astype(l_linear_ref.dtype)
+      assert l_linear_ref.shape == (
+          (NUM_SUBLANES, bq) if config.compact_stats_output else (bq, NUM_LANES)
+      )
+      store_output_stat(l_linear_ref, l)
     if max_logits_ref is not None:
-      assert max_logits_ref.shape == (bq, NUM_LANES)
-      max_logits_ref[...] = m.astype(max_logits_ref.dtype)
+      assert max_logits_ref.shape == (
+          (NUM_SUBLANES, bq) if config.compact_stats_output else (bq, NUM_LANES)
+      )
+      store_output_stat(max_logits_ref, m)
 
 
 def _div(dividend: int, divisor: int):
@@ -554,12 +608,14 @@ def _splash_attention_forward(
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
     max_logit_value: jax.Array | None = None,
+    save_max_logits: bool = True,
 ) -> base.SplashCustomReturnType:
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   head_dim_v = v.shape[-1]
   bq, bkv = config.block_q, config.block_kv
   bkv_compute = config.block_kv_compute
   fuse_reciprocal = config.fuse_reciprocal or not save_residuals
+  save_max_logits = save_max_logits or not fuse_reciprocal
   bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)
 
   if is_mqa:
@@ -757,28 +813,46 @@ def _splash_attention_forward(
       pl.BlockSpec((None, bq, head_dim_v), out_index_map),
   ]
   if save_residuals:
-    logsumexp_index_map = unravel(lambda h, i, j, *_: (h, i, 0))
+    logsumexp_index_map = unravel(
+        lambda h, i, j, *_: (h, 0, i)
+        if config.compact_stats_output
+        else (h, i, 0)
+    )
+    stat_shape = (
+        (num_q_heads, NUM_SUBLANES, q_seq_len)
+        if config.compact_stats_output
+        else (num_q_heads, q_seq_len, NUM_LANES)
+    )
+    stat_block = (
+        (None, NUM_SUBLANES, bq)
+        if config.compact_stats_output
+        else (None, bq, NUM_LANES)
+    )
 
     out_shapes += [
         # logsumexp
-        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32)
+        jax.ShapeDtypeStruct(stat_shape, jnp.float32)
         if fuse_reciprocal
         else None,
         # l_linear
-        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32)
+        jax.ShapeDtypeStruct(stat_shape, jnp.float32)
         if not fuse_reciprocal
         else None,
         # max_logits
-        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32),
+        jax.ShapeDtypeStruct(stat_shape, jnp.float32)
+        if save_max_logits
+        else None,
     ]
     out_specs += [
-        pl.BlockSpec((None, bq, NUM_LANES), logsumexp_index_map)
+        pl.BlockSpec(stat_block, logsumexp_index_map)
         if fuse_reciprocal
         else None,
-        pl.BlockSpec((None, bq, NUM_LANES), logsumexp_index_map)
+        pl.BlockSpec(stat_block, logsumexp_index_map)
         if not fuse_reciprocal
         else None,
-        pl.BlockSpec((None, bq, NUM_LANES), logsumexp_index_map),
+        pl.BlockSpec(stat_block, logsumexp_index_map)
+        if save_max_logits
+        else None,
     ]
   else:
     out_shapes += [None, None, None]
@@ -868,13 +942,24 @@ def _splash_attention_forward(
             out_specs=out_specs,
             grid=grid,
             scratch_shapes=[
-                pltpu.VMEM((bq, NUM_LANES), jnp.float32),  # m_scratch
-                pltpu.VMEM((bq, NUM_LANES), jnp.float32),  # l_scratch
+                pltpu.VMEM(
+                    (NUM_SUBLANES, bq)
+                    if config.compact_softmax_scratch
+                    else (bq, NUM_LANES),
+                    jnp.float32,
+                ),  # m_scratch
+                pltpu.VMEM(
+                    (NUM_SUBLANES, bq)
+                    if config.compact_softmax_scratch
+                    else (bq, NUM_LANES),
+                    jnp.float32,
+                ),  # l_scratch
                 pltpu.VMEM((bq, head_dim_v), jnp.float32),  # o_scratch
             ],
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary"),
+            vmem_limit_bytes=config.fwd_vmem_limit_bytes,
             flags={
                 "XLA_TPU_FORCE_LP_LLO_SCHEDULER": (
                     config.use_experimental_scheduler
@@ -917,17 +1002,27 @@ def _splash_attention_forward(
   out = init_if_empty(out, 0.0)
 
   if save_residuals:
-    assert max_logits is not None
-    max_logits = init_if_empty(max_logits[..., 0], mask_value)
+    if max_logits is not None:
+      max_logits = init_if_empty(
+          max_logits[:, 0, :]
+          if config.compact_stats_output
+          else max_logits[..., 0],
+          mask_value,
+      )
 
     if fuse_reciprocal:
       assert logsumexp is not None
-      logsumexp = init_if_empty(logsumexp[..., 0], mask_value)
+      logsumexp = init_if_empty(
+          logsumexp[:, 0, :]
+          if config.compact_stats_output
+          else logsumexp[..., 0],
+          mask_value,
+      )
     else:
       assert l_linear is not None
       log = jnp.log2 if config.use_base2_exp else jnp.log
 
-      l = l_linear[..., 0]
+      l = l_linear[:, 0, :] if config.compact_stats_output else l_linear[..., 0]
       logsumexp = max_logits + log(l)
       out = (out / l[..., None]).astype(out.dtype)
   else:
@@ -1048,6 +1143,7 @@ def _splash_attention_fwd(
       is_mqa=is_mqa,
       config=config,
       save_residuals=True,
+      save_max_logits=save_residuals or not config.omit_unused_max_logits,
       mask_function=mask_function,
       fwd_mask_sparsity=fwd_mask_sparsity,
       max_logit_value=max_logit_value,
@@ -1055,7 +1151,8 @@ def _splash_attention_fwd(
   logsumexp = stats["logsumexp"]  # save in the config base for the bwd pass
   if config.use_base2_exp:  # for user, output values in natural base
     stats["logsumexp"] = stats["logsumexp"] / LOG2E
-    stats["max_logits"] = stats["max_logits"] / LOG2E
+    if stats["max_logits"] is not None:
+      stats["max_logits"] = stats["max_logits"] / LOG2E
   residuals = q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info
   if save_residuals:
     return (out, stats), residuals
@@ -1132,17 +1229,24 @@ def _flash_attention_dq_kernel(
     )
     qk_uncapped = lax.dot_general(q, k, qk_dims, preferred_element_type=float32)
     if config.softmax_scale is not None:
-      qk_uncapped *= jnp.float32(config.softmax_scale)
-      if config.use_base2_exp:
-        qk_uncapped *= jnp.float32(LOG2E)
+      if config.use_base2_exp and config.combine_log2_scale:
+        qk_uncapped *= jnp.float32(config.softmax_scale * LOG2E)
+      else:
+        qk_uncapped *= jnp.float32(config.softmax_scale)
+        if config.use_base2_exp:
+          qk_uncapped *= jnp.float32(LOG2E)
 
     qk = _apply_mask_and_soft_cap(
         qk_uncapped,
         mask_value,
         mask_ref,
         q_sequence_ref,
-        q_segment_ids_ref,
-        kv_segment_ids_ref,
+        q_segment_ids_ref
+        if (not config.segment_mask_on_partial_only or has_partial_mask)
+        else None,
+        kv_segment_ids_ref
+        if (not config.segment_mask_on_partial_only or has_partial_mask)
+        else None,
         attn_logits_soft_cap=attn_logits_soft_cap,
         k_slice=pl.ds(0, bkv),
         k_offset=kv_index * bkv,
@@ -1313,17 +1417,24 @@ def _flash_attention_dkv_kernel(
         k, scaled_q, qk_dims, preferred_element_type=jnp.float32
     )
     if config.softmax_scale is not None:
-      qk_uncapped *= jnp.float32(config.softmax_scale)
-      if config.use_base2_exp:
-        qk_uncapped *= jnp.float32(LOG2E)
+      if config.use_base2_exp and config.combine_log2_scale:
+        qk_uncapped *= jnp.float32(config.softmax_scale * LOG2E)
+      else:
+        qk_uncapped *= jnp.float32(config.softmax_scale)
+        if config.use_base2_exp:
+          qk_uncapped *= jnp.float32(LOG2E)
 
     qk = _apply_mask_and_soft_cap(
         qk_uncapped,
         mask_value,
         mask_ref,
         q_sequence_ref,
-        q_segment_ids_ref,
-        kv_segment_ids_ref,
+        q_segment_ids_ref
+        if (not config.segment_mask_on_partial_only or has_partial_mask)
+        else None,
+        kv_segment_ids_ref
+        if (not config.segment_mask_on_partial_only or has_partial_mask)
+        else None,
         attn_logits_soft_cap=attn_logits_soft_cap,
         k_slice=slice_k,
         k_offset=kv_index * bkv + i * bkv_compute,
@@ -1334,9 +1445,14 @@ def _flash_attention_dkv_kernel(
     )
     exp = jnp.exp2 if config.use_base2_exp else jnp.exp
     p = exp(qk - logsumexp)
-    dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32)
-    dv = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[slice_k, :]
-    dv_scratch_ref[slice_k, :] = dv
+
+    def compute_dv():
+      dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32)
+      dv = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[slice_k, :]
+      dv_scratch_ref[slice_k, :] = dv
+
+    if not config.bwd_dv_last:
+      compute_dv()
 
     dp = lax.dot_general(
         v,
@@ -1349,23 +1465,36 @@ def _flash_attention_dkv_kernel(
       normalized = qk_uncapped / attn_logits_soft_cap
       d = jnp.tanh(normalized)
       ds = ds * (1 - d * d)
-    if config.softmax_scale is not None:
+    if config.softmax_scale is not None and not config.bwd_scale_after_dot:
       ds *= jnp.float32(config.softmax_scale)
-    dk_dims = (
-        NN_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
-    )
-    dk = lax.dot_general(
-        ds.astype(do.dtype), q, dk_dims, preferred_element_type=jnp.float32
-    )
-    dk = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[slice_k, :]
-    dk_scratch_ref[slice_k, :] = dk
+
+    def compute_dk():
+      dk_dims = (
+          NN_DIM_NUMBERS
+          if config.q_layout == HEAD_DIM_MINOR
+          else NT_DIM_NUMBERS
+      )
+      dk = lax.dot_general(
+          ds.astype(do.dtype), q, dk_dims, preferred_element_type=jnp.float32
+      )
+      if config.softmax_scale is not None and config.bwd_scale_after_dot:
+        dk *= jnp.float32(config.softmax_scale)
+      dk = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[slice_k, :]
+      dk_scratch_ref[slice_k, :] = dk
+
+    if not config.bwd_dq_first:
+      compute_dk()
     if dq_scratch_ref is not None or dq_ref is not None:
       dq = lax.dot_general(
-          ds.T.astype(k.dtype),
+          ds.astype(k.dtype).T
+          if config.bwd_cast_before_transpose
+          else ds.T.astype(k.dtype),
           k,
           NN_DIM_NUMBERS,
           preferred_element_type=jnp.float32,
       )
+      if config.softmax_scale is not None and config.bwd_scale_after_dot:
+        dq *= jnp.float32(config.softmax_scale)
       if dq_scratch_ref is not None:
         # Compute block size != memory block size
         dq_scratch_ref[...] += dq
@@ -1375,6 +1504,11 @@ def _flash_attention_dkv_kernel(
           dq_ref[...] = dq_alias[...] + dq.astype(dq_ref.dtype)
         else:
           dq_ref[...] = dq.astype(dq_ref.dtype)
+
+    if config.bwd_dq_first:
+      compute_dk()
+    if config.bwd_dv_last:
+      compute_dv()
 
   if dq_scratch_ref is not None:
     dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
@@ -1389,12 +1523,16 @@ def _flash_attention_dkv_kernel(
 
   @pl.when(jnp.logical_and(should_not_mask, should_run))
   def _():
-    lax.fori_loop(0, num_iters, body, None, unroll=True)
+    lax.fori_loop(0, num_iters, body, None, unroll=config.bwd_kv_unroll)
 
   @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
   def _():
     lax.fori_loop(
-        0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
+        0,
+        num_iters,
+        partial(body, has_partial_mask=True),
+        None,
+        unroll=config.bwd_kv_unroll,
     )
 
   if dq_scratch_ref is not None:
@@ -1821,7 +1959,17 @@ def _splash_attention_bwd_dkv(
         #     megacore
         # 3) for q_seq_len, we are reducing over it to compute dkv
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",) * len(grid)
+            dimension_semantics=(
+                ("parallel", "arbitrary")
+                if config.bwd_parallel_heads
+                and dynamic_grid
+                and q_heads_per_kv_head == 1
+                else ("arbitrary",) * len(grid)
+            ),
+            flags={}
+            if config.bwd_scheduler is None
+            else {"XLA_TPU_FORCE_LP_LLO_SCHEDULER": config.bwd_scheduler},
+            vmem_limit_bytes=config.bwd_vmem_limit_bytes,
         ),
         name=kernel_name,
         cost_estimate=cost_estimate,
@@ -1873,7 +2021,9 @@ def _splash_attention_bwd(
   q, k, v, segment_ids, sinks, o, logsumexp, dkv_mask_info = res
 
   # di: [num_heads, q_seq_len]
-  di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))  # pytype: disable=attribute-error
+  di = jnp.einsum(
+      "hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32)
+  )  # pytype: disable=attribute-error
   dq, dk, dv = _splash_attention_bwd_dkv(
       q,
       k,
