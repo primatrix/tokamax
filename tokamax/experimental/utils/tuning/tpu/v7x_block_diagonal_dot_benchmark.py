@@ -31,10 +31,12 @@ def _separate_kernel(a0_ref, b0_ref, a1_ref, b1_ref, o0_ref, o1_ref):
   )
 
 
-def _packed_kernel(a_ref, b_ref, o_ref):
-  o_ref[...] = lax.dot(
+def _packed_kernel(a_ref, b_ref, o0_ref, o1_ref):
+  packed = lax.dot(
       a_ref[...], b_ref[...], preferred_element_type=jnp.float32
   )
+  o0_ref[...] = packed[:128, :128]
+  o1_ref[...] = packed[128:, 128:]
 
 
 def main():
@@ -105,9 +107,15 @@ def main():
               pl.BlockSpec((256, 144), same_block),
               pl.BlockSpec((144, 256), same_block),
           ],
-          out_specs=pl.BlockSpec((None, 256, 256), output_block),
+          out_specs=[
+              pl.BlockSpec((None, 128, 128), output_block),
+              pl.BlockSpec((None, 128, 128), output_block),
+          ],
       ),
-      out_shape=jax.ShapeDtypeStruct((args.grid, 256, 256), jnp.float32),
+      out_shape=[
+          jax.ShapeDtypeStruct((args.grid, 128, 128), jnp.float32),
+          jax.ShapeDtypeStruct((args.grid, 128, 128), jnp.float32),
+      ],
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("parallel",), vmem_limit_bytes=63 * 1024**2
       ),
