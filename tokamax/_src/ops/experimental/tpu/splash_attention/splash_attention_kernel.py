@@ -232,6 +232,9 @@ class SplashConfig:
   # Share dot/exp/PV between full/partial tiles; branch only around masking.
   # This controls instruction footprint without changing mask semantics.
   fwd_kvmajor_single_loop: bool = False
+  # Branchless shared-loop control: check segment equality on every tile.
+  # Forward-only flag so the backward mask policy is not changed.
+  fwd_kvmajor_mask_all_tiles: bool = False
   # Accuracy/scheduling control: express sum on the reference's logical axis.
   # This does not guarantee identical lowering or floating-point association.
   fwd_kvmajor_sum_in_qmajor: bool = False
@@ -273,6 +276,8 @@ class SplashConfig:
       raise ValueError("sequence-minor forward output requires native normalization")
     if self.fwd_kvmajor_single_loop and not self.fwd_kvmajor_probabilities:
       raise ValueError("shared segment loop requires native KV-major probabilities")
+    if self.fwd_kvmajor_mask_all_tiles and not self.fwd_kvmajor_single_loop:
+      raise ValueError("unconditional forward masking requires a shared KV-major loop")
     if self.block_kv_compute is None:
       object.__setattr__(self, "block_kv_compute", self.block_kv)
     if self.block_kv_dkv_compute is None:
@@ -590,9 +595,11 @@ def flash_attention_kernel(
         kv_ids = kv_segment_ids_ref[:1, window].T
         return jnp.where(kv_ids == q_ids, value, mask_value)
 
-      if config.fwd_kvmajor_single_loop and config.segment_mask_on_partial_only:
+      if (config.fwd_kvmajor_single_loop and config.segment_mask_on_partial_only
+          and not config.fwd_kvmajor_mask_all_tiles):
         logits = lax.cond(should_not_mask, lambda value: value, mask_logits, logits)
-      elif not config.segment_mask_on_partial_only or has_partial_mask:
+      elif (config.fwd_kvmajor_mask_all_tiles
+            or not config.segment_mask_on_partial_only or has_partial_mask):
         logits = mask_logits(logits)
     with _attention_scope(config, "splash_fwd_softmax"):
       probabilities = jnp.exp2(logits - max_logit_estimate)

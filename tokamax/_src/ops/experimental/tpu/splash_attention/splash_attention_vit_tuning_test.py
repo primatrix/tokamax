@@ -341,7 +341,8 @@ def test_native_output_drain_preserves_all_values(kvmajor, single_loop, physical
 
 @pytest.mark.parametrize("seed", [27, 28])
 @pytest.mark.parametrize("q_block", [128, 256])
-def test_shared_segment_loop_against_fp64(seed, q_block):
+@pytest.mark.parametrize("mask_all_tiles", [False, True])
+def test_shared_segment_loop_against_fp64(seed, q_block, mask_all_tiles):
   from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
   from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_accuracy as accuracy
 
@@ -363,6 +364,7 @@ def test_shared_segment_loop_against_fp64(seed, q_block):
   grads = bench._backward(reference, residuals, do)
   candidate = bench._make_kernel(segments, dataclasses.replace(
       cfg, fwd_kvmajor_single_loop=True,
+      fwd_kvmajor_mask_all_tiles=mask_all_tiles,
   ))
   actual_output, actual_residuals = bench._forward(candidate, q, k, v, segments)
   actual_grads = bench._backward(reference, actual_residuals, do)
@@ -419,6 +421,7 @@ def test_joint_runner_matches_public_custom_vjp(drain, fast_backward):
     {"fwd_native_output_normalization": True},
     {"fwd_output_seq_minor": True},
     {"fwd_kvmajor_single_loop": True},
+    {"fwd_kvmajor_mask_all_tiles": True},
 ])
 def test_invalid_native_output_layout_rejected(kwargs):
   with pytest.raises(ValueError, match="requires"):

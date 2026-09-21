@@ -49,6 +49,11 @@ _FWD_KVMAJOR = dict(
 
 _FWD_FAST = _FWD_KVMAJOR | dict(block_q=2048, block_kv_compute=512)
 
+_FWD_BRANCHLESS = _FWD_KVMAJOR | dict(
+    fwd_native_output_normalization=True, fwd_output_seq_minor=True,
+    fwd_kvmajor_single_loop=True, fwd_kvmajor_mask_all_tiles=True,
+)
+
 
 def variants(phase="backward"):
   if phase == "joint":
@@ -64,6 +69,10 @@ def variants(phase="backward"):
   if phase == "forward":
     return [
         ("pr13", {}),
+        ("branchless_q2048_c512", _FWD_BRANCHLESS | dict(block_q=2048, block_kv_compute=512)),
+        ("branchless_q4096_k4096", _FWD_BRANCHLESS | dict(block_q=4096, block_kv=4096)),
+        ("branchless_q4096", _FWD_BRANCHLESS | dict(block_q=4096)),
+        ("branchless_q4096_c512", _FWD_BRANCHLESS | dict(block_q=4096, block_kv_compute=512)),
         ("single_loop", _FWD_FAST | dict(fwd_kvmajor_single_loop=True)),
         ("single_loop_native_drain", _FWD_FAST | dict(fwd_kvmajor_single_loop=True, fwd_native_output_normalization=True)),
         ("single_loop_native_output", _FWD_FAST | dict(fwd_kvmajor_single_loop=True, fwd_native_output_normalization=True, fwd_output_seq_minor=True)),
