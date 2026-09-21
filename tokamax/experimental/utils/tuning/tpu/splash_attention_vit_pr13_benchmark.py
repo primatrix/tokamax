@@ -17,6 +17,7 @@ the rematerialized forward pass.
 import argparse
 import dataclasses
 import json
+import os
 import statistics
 import time
 
@@ -187,6 +188,11 @@ def _parser():
   parser.add_argument("--seed", type=int, default=27)
   parser.add_argument("--variant", default="pr13_best_tiling")
   parser.add_argument("--output")
+  parser.add_argument(
+      "--profile-dir",
+      help="Write an XProf trace after timing the compiled forward/backward.",
+  )
+  parser.add_argument("--profile-repeats", type=int, default=3)
   parser.add_argument("--interpret", action="store_true")
   parser.add_argument("--split-major-segments", action="store_true")
   parser.add_argument("--bwd-dq-contract-ds-axis0", action="store_true")
@@ -329,6 +335,15 @@ def main():
   fwd = _summary(_measure(forward, (q, k, v, ids), args.warmup, args.repeats))
   bwd = _summary(_measure(backward, (residuals, do), args.warmup, args.repeats))
   combined_ms = fwd["median_ms"] + bwd["median_ms"]
+  if args.profile_dir:
+    os.makedirs(args.profile_dir, exist_ok=True)
+    with jax.profiler.trace(args.profile_dir):
+      for step in range(args.profile_repeats):
+        with jax.profiler.StepTraceAnnotation(
+            "vit_splash_fwd_bwd", step_num=step
+        ):
+          _, profile_residuals = _ready(forward(q, k, v, ids))
+          _ready(backward(profile_residuals, do))
   result = {
       "benchmark": "vit_splash_pr13_single_device",
       "variant": args.variant,
@@ -348,6 +363,7 @@ def main():
       "forward": fwd,
       "backward": bwd,
       "combined_median_ms": combined_ms,
+      "profile_dir": args.profile_dir,
   }
   if args.output:
     with open(args.output, "w", encoding="utf-8") as output_file:
