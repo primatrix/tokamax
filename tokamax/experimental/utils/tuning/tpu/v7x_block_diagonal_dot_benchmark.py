@@ -11,6 +11,9 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
 
+_INNER_REPEATS = 16
+
+
 def _measure(fn, args, warmup, repeats):
   for _ in range(warmup):
     jax.block_until_ready(fn(*args))
@@ -43,6 +46,17 @@ def _single_kernel(a_ref, b_ref, o_ref):
   o_ref[...] = lax.dot(
       a_ref[...], b_ref[...], preferred_element_type=jnp.float32
   )
+
+
+def _repeated_kernel(a_ref, b_ref, o_ref):
+  acc = jnp.zeros((128, 128), jnp.float32)
+  for i in range(_INNER_REPEATS):
+    acc += lax.dot(
+        a_ref[i, ...],
+        b_ref[i, ...],
+        preferred_element_type=jnp.float32,
+    )
+  o_ref[...] = acc
 
 
 def main():
@@ -133,6 +147,7 @@ def main():
   )
   packed_ms = _measure(packed, (a_packed, b_packed), args.warmup, args.repeats)
   k_sweep_ms = {}
+  repeated_k_sweep_ms = {}
   for k_dim in (64, 72, 128, 144, 256):
     a = jax.random.normal(jax.random.fold_in(key, k_dim), (128, k_dim), jnp.bfloat16)
     b = jax.random.normal(
@@ -158,6 +173,40 @@ def main():
     k_sweep_ms[str(k_dim)] = _measure(
         single, (a, b), args.warmup, args.repeats
     )
+    a_repeated = jax.random.normal(
+        jax.random.fold_in(key, k_dim + 2000),
+        (_INNER_REPEATS, 128, k_dim),
+        jnp.bfloat16,
+    )
+    b_repeated = jax.random.normal(
+        jax.random.fold_in(key, k_dim + 3000),
+        (_INNER_REPEATS, k_dim, 128),
+        jnp.bfloat16,
+    )
+
+    def same_repeated_block(*_):
+      return 0, 0, 0
+
+    repeated = pl.pallas_call(
+        _repeated_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            grid=(args.grid,),
+            in_specs=[
+                pl.BlockSpec((_INNER_REPEATS, 128, k_dim), same_repeated_block),
+                pl.BlockSpec((_INNER_REPEATS, k_dim, 128), same_repeated_block),
+            ],
+            out_specs=pl.BlockSpec((None, 128, 128), output_block),
+        ),
+        out_shape=jax.ShapeDtypeStruct((args.grid, 128, 128), jnp.float32),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",), vmem_limit_bytes=63 * 1024**2
+        ),
+    )
+    repeated = jax.jit(repeated).lower(a_repeated, b_repeated).compile()
+    repeated_k_sweep_ms[str(k_dim)] = _measure(
+        repeated, (a_repeated, b_repeated), args.warmup, args.repeats
+    )
   result = {
       "variant": "v7x_bf16_block_diagonal_dot",
       "separate_ms": separate_ms,
@@ -165,6 +214,7 @@ def main():
       "packed_speedup": separate_ms / packed_ms,
       "grid": args.grid,
       "k_sweep_ms": k_sweep_ms,
+      "repeated_k_sweep_ms": repeated_k_sweep_ms,
   }
   if args.output:
     with open(args.output, "w", encoding="utf-8") as output_file:
@@ -172,6 +222,10 @@ def main():
           ("separate", separate_ms),
           ("packed", packed_ms),
           *((f"k_{k_dim}", latency) for k_dim, latency in k_sweep_ms.items()),
+          *(
+              (f"repeat16_k_{k_dim}", latency)
+              for k_dim, latency in repeated_k_sweep_ms.items()
+          ),
       ):
         output_file.write(
             json.dumps(
