@@ -64,6 +64,7 @@ def _relative_l2(actual, expected):
         },
         {"bwd_dp_before_qk": True},
         {"bwd_head_group_size": 2},
+        {"bwd_reuse_bf16_probabilities": True},
     ],
     ids=[
         "combined",
@@ -73,6 +74,7 @@ def _relative_l2(actual, expected):
         "keep_kv_seq_minor",
         "dp_before_qk",
         "head_group_2",
+        "reuse_bf16_probabilities",
     ],
 )
 def test_tuning_preserves_segmented_outputs_and_all_gradients(

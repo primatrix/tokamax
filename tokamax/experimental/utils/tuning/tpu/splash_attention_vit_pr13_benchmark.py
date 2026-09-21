@@ -194,6 +194,7 @@ def _parser():
   parser.add_argument("--bwd-dp-before-qk", action="store_true")
   parser.add_argument("--bwd-head-group-size", type=int, default=1)
   parser.add_argument("--use-base2-exp", action="store_true")
+  parser.add_argument("--bwd-reuse-bf16-probabilities", action="store_true")
   parser.add_argument(
       "--bwd-parallel-heads", action=argparse.BooleanOptionalAction, default=False
   )
@@ -243,6 +244,7 @@ def main():
       bwd_keep_kv_seq_minor=args.bwd_keep_kv_seq_minor,
       bwd_dp_before_qk=args.bwd_dp_before_qk,
       bwd_head_group_size=args.bwd_head_group_size,
+      bwd_reuse_bf16_probabilities=args.bwd_reuse_bf16_probabilities,
       interpret=args.interpret,
   )
   kernel = _make_kernel(ids, config)

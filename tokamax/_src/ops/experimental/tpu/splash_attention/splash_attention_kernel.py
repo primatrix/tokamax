@@ -167,6 +167,7 @@ class SplashConfig:
   bwd_dq_contract_ds_axis0: bool = False
   bwd_keep_kv_seq_minor: bool = False
   bwd_dp_before_qk: bool = False
+  bwd_reuse_bf16_probabilities: bool = False
   # Process multiple independent MHA heads in one Pallas program. Dots remain
   # 2D (Mosaic TPU does not support a rank-3 batched dot); the larger program
   # gives the scheduler independent BF16 dot/vector work to interleave.
@@ -1491,9 +1492,14 @@ def _flash_attention_dkv_kernel(
     )
       exp = jnp.exp2 if config.use_base2_exp else jnp.exp
       p = exp(qk - logsumexp)
+      p_bf16 = p.astype(do.dtype)
+      if config.bwd_reuse_bf16_probabilities:
+        # dV already consumes BF16 probabilities. Reuse the same value for dS
+        # to shorten the live range of the full-size FP32 probability tile.
+        p = p_bf16.astype(jnp.float32)
 
       def compute_dv():
-        dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32)
+        dv = lax.dot(p_bf16, do, preferred_element_type=jnp.float32)
         scratch_ref = head_ref(dv_scratch_ref)
         dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[slice_k, :]
         scratch_ref[slice_k, :] = dv
