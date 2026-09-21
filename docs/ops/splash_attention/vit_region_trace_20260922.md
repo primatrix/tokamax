@@ -789,13 +789,65 @@ not establish inner-loop MXU/vector overlap as optimal.
 Evidence: details `an-a6iipk3bno`, regions/final-LLO `an-9qlt4trpqz`, operator
 `an-xmsp4oyowg`, LLO `an-purr19lvhz`.
 
-## Next bounded experiment
+## Native KV-major forward probabilities
 
-Forward remains unchanged at roughly 21 ms. The existing PV-transpose probe
-retains Q-major probabilities and then pays for their preparation/transposes.
-A separate, not-yet-implemented probe should form forward P in `[KV, Q]`
-orientation from QK onward, feed `V @ P` directly, and accumulate `[D, Q]`.
-Keep P FP32, fixed logit shift and all masking semantics; explicitly measure
-the new KV-axis reduction and layout overhead, including code expansion.
-Do not assume that the negative backward Q-major result predicts the forward
-result, or promote a candidate solely because static dot counts shrink.
+Commit `0610663`, experiment `exp-re816zfnid` (artifact `art-bhjrldqdnr`),
+implements default-off `fwd_kvmajor_probabilities`: form P as `[KV, Q]`
+directly from QK and feed `V @ P` with sequence-minor output/state scratch.
+P remains FP32; BF16 inputs, fixed logit shift and segment semantics remain
+unchanged. CPU interpret tests cover both sum expressions and partial
+unrolling. The 159-test kernel/oracle suite passed before this experiment.
+
+| Forward variant | Median ms | Live PR13 ms |
+| --- | ---: | ---: |
+| Native KV-major, Q1024 | 27.037 | 21.242 |
+| Express sum on transposed Q-major P | 96.941 | 21.021 |
+| Native, unroll 4 | 30.749 | 21.069 |
+| Q-major sum, unroll 4 | 57.926 | 20.902 |
+| Native, unroll 8 | 28.619 | 21.025 |
+| Native, compute-KV512 | 21.797 | 21.150 |
+| Native, Q512 | 38.822 | 21.108 |
+| Native, Q2048 | 21.497 | 21.065 |
+| Native, experimental scheduler | 26.985 | 20.882 |
+
+No variant beats PR13. Device trace separates two kinds of regressions:
+
+| Capture | Module ms | KV loops ms | Internal uncovered ms | IMEM bytes, three calls |
+| --- | ---: | ---: | ---: | ---: |
+| PR13 | 20.073 | 18.687 | 0.429 | 79,872 |
+| Native KV-major | 25.842 | 23.787 | 0.435 | 79,872 |
+| Q-major sum | 95.724 | 50.846 | 43.216 | 27,663,487,488 |
+| Native, unroll 4 | 29.267 | 27.218 | 0.422 | 79,872 |
+
+The Q-major sum expression causes instruction-loading/code-expansion
+regression (36,339 IMEM descriptors versus 3). Native KV-major's regression
+is instead primarily inside the KV loop, without that instruction-loading
+confound. Its final body has 5,376 `vmatmul.mubr` and 6,656 `vxpose` ops;
+the reference body has 12,288 and 4,224 respectively. Counts include both
+mask branches and unrolling and are not time/utilization fractions. The
+Q-major sum increases `vxpose` to 23,040 with unchanged matmul count.
+
+All measured arrays are finite but not bitwise. Native Q1024/Q2048 have
+the same precision statistics against PR13: output 6,056 mismatches out
+of 75,497,472, relative L2 `2.23422e-5`; stored base-2 LSE 39,071 mismatches
+out of 1,048,576, max absolute `1.90735e-6`. dQ/dK/dV relative L2 differences
+are `8.23397e-5` / `9.13902e-5` / `7.33053e-5`. Against the independent
+FP32 oracle on heads 0/15/16/31, the worst candidate/reference relative-L2
+error ratios are 1.000002964 (output), 1.001046173 (LSE), 0.999998000 (dQ),
+1.000004494 (dK), and 1.000010185 (dV); per-head max-absolute errors are
+unchanged. These are diagnostic results, not automatic accuracy approval.
+
+Evidence: details `an-sbrdkniwh3`, regions/final-LLO `an-ez9s93lf2r`,
+operator `an-f6049yyh1j`, LLO `an-7actj3l6w8`.
+
+## Next bounded experiment: fused normalization reduction
+
+The next default-off probe appends eight BF16 constant-one rows to V,
+computing `[V; 1] @ P` to produce output and softmax denominator together.
+The extra rows match the compact statistics' sublane layout. P remains
+FP32; this avoids a separate vector traversal/reduction of P but changes
+reduction association, so CPU FP64 tests and independent TPU FP32 checks
+are required. Larger Q2048/4096/8192 tiles independently test amortization.
+No speedup or TPU numerical acceptance is claimed before those runs finish.
+The combined CPU kernel/oracle suite with four new fused-normalizer tests
+passes **163 tests** (118.07 seconds).

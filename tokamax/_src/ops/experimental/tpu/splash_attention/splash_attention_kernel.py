@@ -224,6 +224,9 @@ class SplashConfig:
   # Accuracy/scheduling control: express sum on the reference's logical axis.
   # This does not guarantee identical lowering or floating-point association.
   fwd_kvmajor_sum_in_qmajor: bool = False
+  # Diagnostic: append constant-one rows to V so PV also computes sum(P).
+  # P remains FP32; the normalization reduction's rounding can change.
+  fwd_kvmajor_fuse_normalizer: bool = False
   fwd_kv_unroll: bool | int = True
   # Fixed-logit-shift ViT diagnostic: QK/exp for i before PV/accum for i-1.
   fwd_staged_kv_pipeline: bool = False
@@ -483,6 +486,12 @@ def flash_attention_kernel(
       and q_ref.dtype == k_ref.dtype == v_ref.dtype == jnp.bfloat16
   ):
     raise ValueError("fwd_kvmajor_probabilities requires fixed-shift segmented BF16 ViT attention and sequence-minor scratch")
+  if config.fwd_kvmajor_fuse_normalizer and (
+      not config.fwd_kvmajor_probabilities
+      or config.fwd_kvmajor_sum_in_qmajor
+      or head_dim_v % NUM_SUBLANES
+  ):
+    raise ValueError("fwd_kvmajor_fuse_normalizer requires native KV-major sum and sublane-aligned value width")
 
   @pl.when(should_initialize)
   def init():
@@ -559,17 +568,30 @@ def flash_attention_kernel(
         logits = jnp.where(kv_ids == q_ids, logits, mask_value)
     with _attention_scope(config, "splash_fwd_softmax"):
       probabilities = jnp.exp2(logits - max_logit_estimate)
-      current_l = (
-          jnp.sum(probabilities.T, axis=-1)[None, :]
-          if config.fwd_kvmajor_sum_in_qmajor
-          else jnp.sum(probabilities, axis=0, keepdims=True)
-      )
-      l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
+      if not config.fwd_kvmajor_fuse_normalizer:
+        current_l = (
+            jnp.sum(probabilities.T, axis=-1)[None, :]
+            if config.fwd_kvmajor_sum_in_qmajor
+            else jnp.sum(probabilities, axis=0, keepdims=True)
+        )
+        l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
     with _attention_scope(config, "splash_fwd_pv_mxu"):
       # The reference PV consumes FP32 P; do not introduce a BF16 cast here.
-      output_t = lax.dot_general(v_ref[:, window], probabilities, NN_DIM_NUMBERS)
+      values = v_ref[:, window]
+      if config.fwd_kvmajor_fuse_normalizer:
+        # Duplicate the unit row to match compact l_scratch's sublane layout.
+        # These rows use the same FP32 P and MXU reduction as the output.
+        values = jnp.concatenate(
+            (values, jnp.ones((NUM_SUBLANES, bkv_compute), values.dtype)),
+            axis=0,
+        )
+      output_t = lax.dot_general(values, probabilities, NN_DIM_NUMBERS)
     with _attention_scope(config, "splash_fwd_output_accum"):
-      o_scratch_ref[...] += output_t
+      if config.fwd_kvmajor_fuse_normalizer:
+        o_scratch_ref[...] += output_t[:head_dim_v, :]
+        l_scratch_ref[...] += output_t[head_dim_v:, :]
+      else:
+        o_scratch_ref[...] += output_t
 
   def body(kv_compute_index, carry, has_partial_mask=False):
     if config.fwd_kvmajor_probabilities:

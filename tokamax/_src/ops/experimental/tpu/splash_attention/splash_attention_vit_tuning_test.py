@@ -205,6 +205,42 @@ def test_forward_kvmajor_probabilities(unroll, q_block, reference_sum_axis):
     assert candidate_error <= ref_error * 1.001 + 1e-7
 
 
+@pytest.mark.parametrize("unroll", [True, 4])
+@pytest.mark.parametrize("q_block", [128, 256])
+def test_forward_fused_normalizer_against_fp64(unroll, q_block):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_accuracy as accuracy
+
+  q, k, v, do = [jax.random.normal(key, (1, 512, 72), jnp.bfloat16)
+                 for key in jax.random.split(jax.random.key(27), 4)]
+  ids = jnp.asarray(np.repeat(np.array([1, 2, 3, 0], np.int32), [256, 240, 8, 8]))
+  segments = base.SegmentIds(ids, ids)
+  cfg = splash.SplashConfig(
+      block_q=q_block, block_kv=256, block_kv_compute=128,
+      block_q_dkv=256, block_kv_dkv=256, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR, k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR, softmax_scale=72**-0.5,
+      use_base2_exp=True, max_logit_const=0.0, interpret=True, **_TUNING,
+  )
+  ref = bench._make_kernel(segments, cfg)
+  output, res = bench._forward(ref, q, k, v, segments)
+  grads = bench._backward(ref, res, do)
+  candidate = bench._make_kernel(segments, dataclasses.replace(
+      cfg, fwd_kvmajor_probabilities=True, fwd_kvmajor_fuse_normalizer=True,
+      compact_softmax_scratch=True, fwd_output_scratch_seq_minor=True, fwd_kv_unroll=unroll,
+  ))
+  actual_output, actual_res = bench._forward(candidate, q, k, v, segments)
+  actual_grads = bench._backward(ref, actual_res, do)
+  oracle = accuracy.numpy_attention_and_gradients(q[0], k[0], v[0], do[0], ids, ids)
+  for value, expected, fp64 in zip(
+      (actual_output, *actual_grads), (output, *grads), (oracle[0], *oracle[2:]),
+  ):
+    assert np.isfinite(np.asarray(value)).all()
+    assert _relative_l2(value, expected) < 1e-4
+    assert _relative_l2(value[0], fp64) <= _relative_l2(expected[0], fp64) * 1.001 + 1e-7
+  np.testing.assert_allclose(np.asarray(actual_res[6][0] / splash.LOG2E), oracle[1], rtol=2e-7, atol=1e-6)
+
+
 def test_invalid_trace_mode_rejected():
   with pytest.raises(ValueError, match="Invalid region_trace_mode"):
     splash.SplashConfig(block_q=128, block_kv=128, region_trace_mode="invalid")
