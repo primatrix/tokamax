@@ -1699,10 +1699,8 @@ def _splash_attention_bwd_dkv(
   if head_group_size < 1:
     raise ValueError(f"{head_group_size=} must be positive")
   if head_group_size > 1:
-    if dynamic_grid or is_mqa or q_heads_per_kv_head != 1:
-      raise NotImplementedError(
-          "Backward head grouping currently supports static-grid MHA only"
-      )
+    if is_mqa or q_heads_per_kv_head != 1:
+      raise NotImplementedError("Backward head grouping currently supports MHA only")
     if num_q_heads % head_group_size:
       raise ValueError(
           f"{num_q_heads=} must be divisible by {head_group_size=}"
@@ -1714,12 +1712,12 @@ def _splash_attention_bwd_dkv(
       def index_map(h, grid_idx, rows_ref, cols_ref, *_):
         j = to_i32(rows_ref[grid_idx])
         i = to_i32(cols_ref[grid_idx])
-        return f(h, i, j)
+        return f(h * head_group_size, i, j)
 
       return index_map
 
     grid_size = mask_info.num_active_blocks[0]
-    grid = (num_q_heads, grid_size)
+    grid = (num_q_heads // head_group_size, grid_size)
 
     def mask_index_map(h, grid_idx, rows_ref, cols_ref, mask_next_ref=None, *_):
       del h, rows_ref, cols_ref  # Unused.
