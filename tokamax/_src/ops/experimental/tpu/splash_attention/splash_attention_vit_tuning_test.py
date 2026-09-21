@@ -47,6 +47,48 @@ def _relative_l2(actual, expected):
   )
 
 
+@pytest.mark.parametrize("mode", ["none", "coarse", "fine"])
+def test_trace_scopes_and_seqminor_scratch_preserve_head_dim_72(mode):
+  """Layout/diagnostic changes must be bitwise exact at the production width."""
+  arrays = [
+      jax.random.normal(key, (1, 256, 72), jnp.bfloat16)
+      for key in jax.random.split(jax.random.key(72), 4)
+  ]
+  q, k, v, do = arrays
+  ids = np.repeat(np.array([1, 2], np.int32), [192, 64])
+  segments = base.SegmentIds(jnp.asarray(ids), jnp.asarray(ids))
+  mask = mask_lib.NumpyMask(ids[:, None] == ids[None, :])
+  config = splash.SplashConfig(
+      block_q=128, block_kv=256, block_kv_compute=128,
+      block_q_dkv=128, block_kv_dkv=256, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR,
+      k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR,
+      softmax_scale=72**-0.5, use_base2_exp=True, interpret=True,
+      **_TUNING,
+  )
+
+  def run(cfg):
+    kernel = splash.make_splash_mha_single_device(mask, config=cfg)
+    output, pullback = jax.vjp(lambda q, k, v: kernel(q, k, v, segments), q, k, v)
+    return (output, *pullback(do))
+
+  expected = run(config)
+  actual = run(dataclasses.replace(
+      config, region_trace_mode=mode,
+      bwd_dq_scratch_seq_minor=True, bwd_dkv_scratch_seq_minor=True,
+      bwd_dkv_output_seq_minor=True, bwd_fuse_segment_id_inputs=True,
+  ))
+  for result, reference in zip(actual, expected):
+    assert np.isfinite(np.asarray(result)).all()
+    np.testing.assert_array_equal(result, reference)
+
+
+def test_invalid_trace_mode_rejected():
+  with pytest.raises(ValueError, match="Invalid region_trace_mode"):
+    splash.SplashConfig(block_q=128, block_kv=128, region_trace_mode="invalid")
+
+
 @pytest.mark.parametrize("fuse_reciprocal", [False, True])
 @pytest.mark.parametrize(
     "extra",

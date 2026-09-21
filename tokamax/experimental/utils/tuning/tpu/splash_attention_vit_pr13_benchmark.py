@@ -193,6 +193,10 @@ def _parser():
       help="Write an XProf trace after timing the compiled forward/backward.",
   )
   parser.add_argument("--profile-repeats", type=int, default=3)
+  parser.add_argument(
+      "--region-trace-mode", choices=("none", "coarse", "fine"), default="none",
+      help="In-kernel scope granularity; measure trace overhead before interpreting gaps.",
+  )
   parser.add_argument("--fwd-vmem-limit-mib", type=int, default=60)
   parser.add_argument("--bwd-vmem-limit-mib", type=int, default=63)
   parser.add_argument("--interpret", action="store_true")
@@ -263,6 +267,7 @@ def main():
       bwd_dkv_scratch_seq_minor=args.bwd_dkv_scratch_seq_minor,
       bwd_dkv_output_seq_minor=args.bwd_dkv_output_seq_minor,
       bwd_fuse_segment_id_inputs=args.bwd_fuse_segment_id_inputs,
+      region_trace_mode=args.region_trace_mode,
       interpret=args.interpret,
   )
   kernel = _make_kernel(ids, config)

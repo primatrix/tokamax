@@ -16,6 +16,7 @@
 """Implementation of Sparse Flash Attention, a.k.a. "Splash" attention."""
 
 from collections.abc import Callable
+import contextlib
 import dataclasses
 import enum
 import functools
@@ -202,8 +203,14 @@ class SplashConfig:
   # If provided, scale FP32 QK logits inside the kernel. Keeping this optional
   # preserves the legacy path, where callers pre-scale Q before invoking Splash.
   softmax_scale: float | None = None
+  # Diagnostic only: fine scopes can perturb the compiled pipeline when
+  # custom-call region tracing is enabled. Coarse scopes leave inner-loop
+  # MXU/vector scheduling unannotated. Keep all in-kernel scopes opt-in.
+  region_trace_mode: str = "none"
 
   def __post_init__(self):
+    if self.region_trace_mode not in ("none", "coarse", "fine"):
+      raise ValueError(f"Invalid region_trace_mode: {self.region_trace_mode}")
     if self.block_kv_compute is None:
       object.__setattr__(self, "block_kv_compute", self.block_kv)
     if self.block_kv_dkv_compute is None:
@@ -240,6 +247,14 @@ class SplashConfig:
         block_kv_dq=128,
         fuse_reciprocal=True,
     )
+
+
+def _attention_scope(config: SplashConfig, name: str, *, coarse: bool = False):
+  if config.region_trace_mode == "fine" or (
+      coarse and config.region_trace_mode == "coarse"
+  ):
+    return jax.named_scope(name)
+  return contextlib.nullcontext()
 
 
 to_i32 = lambda x: x.astype(jnp.int32)
@@ -420,7 +435,7 @@ def flash_attention_kernel(
 
   @pl.when(should_initialize)
   def init():
-    with jax.named_scope("splash_fwd_init"):
+    with _attention_scope(config, "splash_fwd_init", coarse=True):
       o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
 
       sink = None
@@ -466,7 +481,7 @@ def flash_attention_kernel(
 
   def body(kv_compute_index, _, has_partial_mask=False):
     slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-    with jax.named_scope("splash_fwd_load_qk_state"):
+    with _attention_scope(config, "splash_fwd_load_qk_state"):
       m_prev, l_prev = load_state(m_scratch_ref), load_state(l_scratch_ref)
       assert m_prev.shape == (bq, NUM_LANES)
       assert l_prev.shape == (bq, NUM_LANES)
@@ -478,7 +493,7 @@ def flash_attention_kernel(
     qk_dims = (
         NT_DIM_NUMBERS if config.k_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
     )
-    with jax.named_scope("splash_fwd_qk_mxu"):
+    with _attention_scope(config, "splash_fwd_qk_mxu"):
       if config.k_layout == HEAD_DIM_MINOR:
         k = k_ref[slice_k, :]
       else:
@@ -513,10 +528,10 @@ def flash_attention_kernel(
         has_partial_mask=has_partial_mask,
     )
 
-    with jax.named_scope("splash_fwd_mask"):
+    with _attention_scope(config, "splash_fwd_mask"):
       qk = apply_mask_and_soft_cap()
 
-    with jax.named_scope("splash_fwd_softmax"):
+    with _attention_scope(config, "splash_fwd_softmax"):
       if max_logit_estimate is None:
         m_curr = qk.max(axis=-1)[:, None]  # pytype: disable=attribute-error
         assert m_curr.shape == (bq, 1)
@@ -555,14 +570,14 @@ def flash_attention_kernel(
     sv_dims = (
         NN_DIM_NUMBERS if config.v_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
     )
-    with jax.named_scope("splash_fwd_pv_mxu"):
+    with _attention_scope(config, "splash_fwd_pv_mxu"):
       if config.v_layout == HEAD_DIM_MINOR:
         v = v_ref[slice_k, :]
       else:
         v = v_ref[:, slice_k]
       o_curr = lax.dot_general(s_curr, v, sv_dims)
 
-    with jax.named_scope("splash_fwd_output_accum"):
+    with _attention_scope(config, "splash_fwd_output_accum"):
       if max_logit_estimate is None:
         alpha_o = jnp.tile(alpha, (1, head_dim_v_repeats))
         alpha_o = alpha_o[..., : o_scratch_ref.shape[-1]]
@@ -577,17 +592,19 @@ def flash_attention_kernel(
 
   @pl.when(should_not_mask)
   def _():
-    lax.fori_loop(0, num_iters, body, None, unroll=True)
+    with _attention_scope(config, "splash_fwd_kv_loop", coarse=True):
+      lax.fori_loop(0, num_iters, body, None, unroll=True)
 
   @pl.when(jnp.logical_not(should_not_mask))
   def _():
-    lax.fori_loop(
-        0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
-    )
+    with _attention_scope(config, "splash_fwd_kv_loop_partial", coarse=True):
+      lax.fori_loop(
+          0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
+      )
 
   @pl.when(should_write)
   def end():
-    with jax.named_scope("splash_fwd_output_drain"):
+    with _attention_scope(config, "splash_fwd_output_drain", coarse=True):
       l = load_state(l_scratch_ref)
       m = load_state(m_scratch_ref)
       if fuse_reciprocal:  # allows fusing reciprocal out of the kernel
@@ -1435,7 +1452,7 @@ def _flash_attention_dkv_kernel(
 
   @pl.when(should_initialize)
   def init():
-    with jax.named_scope("splash_bwd_dkv_init"):
+    with _attention_scope(config, "splash_bwd_dkv_init", coarse=True):
       dk_scratch_ref[...] = jnp.zeros_like(dk_scratch_ref)
       dv_scratch_ref[...] = jnp.zeros_like(dv_scratch_ref)
 
@@ -1450,7 +1467,7 @@ def _flash_attention_dkv_kernel(
       # Keep the head selection as a transformed Ref. Loading the head first
       # would turn the subsequent KV-loop slice into a dynamic_slice primitive,
       # which Mosaic TPU does not lower.
-      with jax.named_scope("splash_bwd_load_inputs"):
+      with _attention_scope(config, "splash_bwd_load_inputs"):
         q = head_ref(q_ref)[...]
         if config.use_base2_exp and config.softmax_scale is None:
           scaled_q = q * LOG2E
@@ -1464,7 +1481,7 @@ def _flash_attention_dkv_kernel(
         value = ref[:, slice_k]
         return value if config.bwd_keep_kv_seq_minor else value.T
 
-      with jax.named_scope("splash_bwd_load_inputs"):
+      with _attention_scope(config, "splash_bwd_load_inputs"):
         k = _load_kv(k_ref, config.k_layout)
         v = _load_kv(v_ref, config.v_layout)
         logsumexp = head_ref(logsumexp_ref)[:1, :]
@@ -1479,7 +1496,7 @@ def _flash_attention_dkv_kernel(
       )
 
       def compute_dp():
-        with jax.named_scope("splash_bwd_dp_mxu"):
+        with _attention_scope(config, "splash_bwd_dp_mxu"):
           return lax.dot_general(
               v,
               do,
@@ -1501,7 +1518,7 @@ def _flash_attention_dkv_kernel(
             if config.q_layout == HEAD_DIM_MINOR
             else NN_DIM_NUMBERS
         )
-      with jax.named_scope("splash_bwd_qk_recompute_mxu"):
+      with _attention_scope(config, "splash_bwd_qk_recompute_mxu"):
         qk_uncapped = lax.dot_general(
             k, scaled_q, qk_dims, preferred_element_type=jnp.float32
         )
@@ -1513,7 +1530,7 @@ def _flash_attention_dkv_kernel(
             if config.use_base2_exp:
               qk_uncapped *= jnp.float32(LOG2E)
 
-      with jax.named_scope("splash_bwd_mask_softmax"):
+      with _attention_scope(config, "splash_bwd_mask_softmax"):
         qk = _apply_mask_and_soft_cap(
             qk_uncapped,
             mask_value,
@@ -1542,7 +1559,7 @@ def _flash_attention_dkv_kernel(
           p = p_bf16.astype(jnp.float32)
 
       def compute_dv():
-        with jax.named_scope("splash_bwd_dv_mxu_accum"):
+        with _attention_scope(config, "splash_bwd_dv_mxu_accum"):
           dv = lax.dot(p_bf16, do, preferred_element_type=jnp.float32)
           scratch_ref = head_ref(dv_scratch_ref)
           if config.bwd_dkv_scratch_seq_minor:
@@ -1555,7 +1572,7 @@ def _flash_attention_dkv_kernel(
       if not config.bwd_dv_last:
         compute_dv()
 
-      with jax.named_scope("splash_bwd_softmax_grad"):
+      with _attention_scope(config, "splash_bwd_softmax_grad"):
         if dp is None:
           dp = compute_dp()
         ds = (dp - di) * p
@@ -1567,7 +1584,7 @@ def _flash_attention_dkv_kernel(
           ds *= jnp.float32(config.softmax_scale)
 
       def compute_dk():
-        with jax.named_scope("splash_bwd_dk_mxu_accum"):
+        with _attention_scope(config, "splash_bwd_dk_mxu_accum"):
           dk_dims = (
               NN_DIM_NUMBERS
               if config.q_layout == HEAD_DIM_MINOR
@@ -1592,7 +1609,7 @@ def _flash_attention_dkv_kernel(
       if not config.bwd_dq_first:
         compute_dk()
       if dq_scratch_ref is not None or dq_ref is not None:
-        with jax.named_scope("splash_bwd_dq_mxu_accum"):
+        with _attention_scope(config, "splash_bwd_dq_mxu_accum"):
           if config.bwd_dq_contract_ds_axis0:
             dq_dims = (
                 TT_DIM_NUMBERS
@@ -1651,13 +1668,13 @@ def _flash_attention_dkv_kernel(
       per_head(head_offset)
 
   if dq_scratch_ref is not None:
-    with jax.named_scope("splash_bwd_dq_init"):
+    with _attention_scope(config, "splash_bwd_dq_init", coarse=True):
       dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
   elif dq_alias is not None:
-    with jax.named_scope("splash_bwd_dq_init"):
+    with _attention_scope(config, "splash_bwd_dq_init", coarse=True):
       dq_ref[...] = dq_alias[...]
   else:
-    with jax.named_scope("splash_bwd_dq_init"):
+    with _attention_scope(config, "splash_bwd_dq_init", coarse=True):
       dq_ref[...] = jnp.zeros_like(dq_ref)
 
   k_seq_axis = 0 if config.k_layout is HEAD_DIM_MINOR else 1
@@ -1667,20 +1684,22 @@ def _flash_attention_dkv_kernel(
 
   @pl.when(jnp.logical_and(should_not_mask, should_run))
   def _():
-    lax.fori_loop(0, num_iters, body, None, unroll=config.bwd_kv_unroll)
+    with _attention_scope(config, "splash_bwd_kv_loop", coarse=True):
+      lax.fori_loop(0, num_iters, body, None, unroll=config.bwd_kv_unroll)
 
   @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
   def _():
-    lax.fori_loop(
-        0,
-        num_iters,
-        partial(body, has_partial_mask=True),
-        None,
-        unroll=config.bwd_kv_unroll,
-    )
+    with _attention_scope(config, "splash_bwd_kv_loop_partial", coarse=True):
+      lax.fori_loop(
+          0,
+          num_iters,
+          partial(body, has_partial_mask=True),
+          None,
+          unroll=config.bwd_kv_unroll,
+      )
 
   if dq_scratch_ref is not None:
-    with jax.named_scope("splash_bwd_dq_output_drain"):
+    with _attention_scope(config, "splash_bwd_dq_output_drain", coarse=True):
       dq_scratch = dq_scratch_ref[...]
       if config.bwd_dq_scratch_seq_minor:
         dq_scratch = jnp.swapaxes(dq_scratch, -1, -2)
@@ -1703,7 +1722,7 @@ def _flash_attention_dkv_kernel(
 
     @pl.when(should_write)
     def _():
-      with jax.named_scope("splash_bwd_dkv_output_drain"):
+      with _attention_scope(config, "splash_bwd_dkv_output_drain", coarse=True):
         dk = format_dkv_output(dk_scratch_ref)
         dv = format_dkv_output(dv_scratch_ref)
         dk_ref[...] = dk.astype(dk_ref.dtype)
@@ -1715,7 +1734,7 @@ def _flash_attention_dkv_kernel(
 
     @pl.when(jnp.logical_and(should_write, first_q_head_in_kv_group))
     def _():
-      with jax.named_scope("splash_bwd_dkv_output_drain"):
+      with _attention_scope(config, "splash_bwd_dkv_output_drain", coarse=True):
         dk = dk_scratch_ref[...]
         dv = dv_scratch_ref[...]
         if config.bwd_dkv_scratch_seq_minor:
@@ -1726,7 +1745,7 @@ def _flash_attention_dkv_kernel(
 
     @pl.when(jnp.logical_and(should_write, _not(first_q_head_in_kv_group)))
     def _():
-      with jax.named_scope("splash_bwd_dkv_output_drain"):
+      with _attention_scope(config, "splash_bwd_dkv_output_drain", coarse=True):
         dk = dk_scratch_ref[...]
         dv = dv_scratch_ref[...]
         if config.bwd_dkv_scratch_seq_minor:
