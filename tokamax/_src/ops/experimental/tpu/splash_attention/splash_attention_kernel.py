@@ -195,6 +195,9 @@ class SplashConfig:
   omit_unused_max_logits: bool = False
   compact_stats_output: bool = False
   compact_softmax_scratch: bool = False
+  # Keep inner-loop softmax/output state as SSA loop carry. Scratch is still
+  # used across memory tiles, but not explicitly loaded/stored each compute tile.
+  fwd_loop_carry: bool = False
   bwd_parallel_heads: bool = False
   bwd_scheduler: bool | None = None
   # Caller contract: every full tile in MaskInfo must also be fully allowed
@@ -483,10 +486,13 @@ def flash_attention_kernel(
         else value
     ).astype(ref.dtype)
 
-  def body(kv_compute_index, _, has_partial_mask=False):
+  def body(kv_compute_index, carry, has_partial_mask=False):
     slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
     with _attention_scope(config, "splash_fwd_load_qk_state"):
-      m_prev, l_prev = load_state(m_scratch_ref), load_state(l_scratch_ref)
+      if config.fwd_loop_carry:
+        m_prev, l_prev, _ = carry
+      else:
+        m_prev, l_prev = load_state(m_scratch_ref), load_state(l_scratch_ref)
       assert m_prev.shape == (bq, NUM_LANES)
       assert l_prev.shape == (bq, NUM_LANES)
 
@@ -565,11 +571,14 @@ def flash_attention_kernel(
       if max_logit_estimate is None:
         alpha = exp(m_prev - m_next)
         l_next = l_curr + alpha * l_prev
-        store_state(m_scratch_ref, m_next)
-        store_state(l_scratch_ref, l_next)
+        if not config.fwd_loop_carry:
+          store_state(m_scratch_ref, m_next)
+          store_state(l_scratch_ref, l_next)
       else:
         alpha = None
-        store_state(l_scratch_ref, l_curr + l_prev)
+        l_next = l_curr + l_prev
+        if not config.fwd_loop_carry:
+          store_state(l_scratch_ref, l_next)
 
     sv_dims = (
         NN_DIM_NUMBERS if config.v_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
@@ -582,29 +591,46 @@ def flash_attention_kernel(
       o_curr = lax.dot_general(s_curr, v, sv_dims)
 
     with _attention_scope(config, "splash_fwd_output_accum"):
+      o_prev = carry[2] if config.fwd_loop_carry else o_scratch_ref[...]
       if max_logit_estimate is None:
         alpha_o = jnp.tile(alpha, (1, head_dim_v_repeats))
         alpha_o = alpha_o[..., : o_scratch_ref.shape[-1]]
-        o_scratch_ref[...] = alpha_o * o_scratch_ref[...] + o_curr
+        o_next = alpha_o * o_prev + o_curr
       else:
-        o_scratch_ref[...] = o_scratch_ref[...] + o_curr
+        o_next = o_prev + o_curr
+      if config.fwd_loop_carry:
+        return m_prev if m_next is None else m_next, l_next, o_next
+      o_scratch_ref[...] = o_next
 
   assert bkv % bkv_compute == 0
   num_iters = (
       k_ref.shape[0 if config.k_layout == HEAD_DIM_MINOR else 1] // bkv_compute
   )
 
+  def run_inner_loop(has_partial_mask):
+    loop_body = partial(body, has_partial_mask=has_partial_mask)
+    if config.fwd_loop_carry:
+      initial = (
+          load_state(m_scratch_ref),
+          load_state(l_scratch_ref),
+          o_scratch_ref[...],
+      )
+      m, l, o = lax.fori_loop(0, num_iters, loop_body, initial, unroll=True)
+      store_state(m_scratch_ref, m)
+      store_state(l_scratch_ref, l)
+      o_scratch_ref[...] = o
+    else:
+      lax.fori_loop(0, num_iters, loop_body, None, unroll=True)
+
   @pl.when(should_not_mask)
   def _():
     with _attention_scope(config, "splash_fwd_kv_loop", coarse=True):
-      lax.fori_loop(0, num_iters, body, None, unroll=True)
+      run_inner_loop(False)
 
   @pl.when(jnp.logical_not(should_not_mask))
   def _():
     with _attention_scope(config, "splash_fwd_kv_loop_partial", coarse=True):
-      lax.fori_loop(
-          0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
-      )
+      run_inner_loop(True)
 
   @pl.when(should_write)
   def end():

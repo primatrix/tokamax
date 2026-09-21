@@ -7,7 +7,8 @@
 
 Non-bitwise candidates are measured for diagnosis but are never marked accepted.
 Backward tiling changes replace the residual MaskInfo, not just the config.
-Forward activations and residual statistics are shared unchanged in this sweep.
+Backward screens share forward activations and residual statistics unchanged.
+Forward screens also validate outputs, residual statistics, and all gradients.
 """
 
 import argparse
@@ -35,7 +36,19 @@ _EXACT_LAYOUT = dict(
 )
 
 
-def variants():
+def variants(phase="backward"):
+  if phase == "forward":
+    return [
+        ("pr13", {}),
+        ("loop_carry", dict(fwd_loop_carry=True)),
+        ("loop_carry_compact", dict(fwd_loop_carry=True, compact_softmax_scratch=True)),
+        ("q2048_carry", dict(fwd_loop_carry=True, block_q=2048)),
+        ("q512_carry", dict(fwd_loop_carry=True, block_q=512)),
+        ("c512_carry", dict(fwd_loop_carry=True, block_kv_compute=512)),
+        ("q2048_c512_carry", dict(fwd_loop_carry=True, block_q=2048, block_kv_compute=512)),
+        ("scheduler_carry", dict(fwd_loop_carry=True, use_experimental_scheduler=True)),
+        ("scheduler", dict(use_experimental_scheduler=True)),
+    ]
   return [
       ("pr13", {}),
       ("seqminor", _EXACT_LAYOUT),
@@ -56,8 +69,9 @@ def variants():
 def _error_statistics(actual, expected):
   a, b = actual.astype(jnp.float32), expected.astype(jnp.float32)
   difference = a - b
-  actual_bits = jax.lax.bitcast_convert_type(actual, jnp.uint16)
-  expected_bits = jax.lax.bitcast_convert_type(expected, jnp.uint16)
+  bits_dtype = jnp.uint16 if actual.dtype == jnp.bfloat16 else jnp.uint32
+  actual_bits = jax.lax.bitcast_convert_type(actual, bits_dtype)
+  expected_bits = jax.lax.bitcast_convert_type(expected, bits_dtype)
   return (
       jnp.sum(actual_bits != expected_bits, dtype=jnp.int32),
       jnp.all(jnp.isfinite(a)) & jnp.all(jnp.isfinite(b)),
@@ -67,11 +81,15 @@ def _error_statistics(actual, expected):
   )
 
 
-def precision_statistics(actual, expected):
+def precision_statistics(actual, expected, names=("dq", "dk", "dv")):
+  if len(actual) != len(expected) or len(actual) != len(names):
+    raise ValueError("Precision inputs and names must have matching lengths")
   report = {}
-  for name, value, reference in zip(("dq", "dk", "dv"), actual, expected):
-    if value.dtype != jnp.bfloat16 or reference.dtype != jnp.bfloat16:
-      raise ValueError("The scheduling screen expects BF16 gradient outputs")
+  for name, value, reference in zip(names, actual, expected):
+    if value.shape != reference.shape:
+      raise ValueError(f"Shape mismatch for {name}: {value.shape} vs {reference.shape}")
+    if value.dtype not in (jnp.bfloat16, jnp.float32) or value.dtype != reference.dtype:
+      raise ValueError("The scheduling screen expects matching BF16/F32 arrays")
     mismatches, finite, max_abs, rel_l2 = bench._ready(
         _error_statistics(value, reference)
     )
@@ -108,6 +126,7 @@ def _config(args):
 
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument("--phase", choices=("forward", "backward"), default="backward")
   parser.add_argument("--sequence", type=int, default=32768)
   parser.add_argument("--heads", type=int, default=32, help="Merged batch*heads")
   parser.add_argument("--head-dim", type=int, default=72)
@@ -123,7 +142,7 @@ def main():
   args = parser.parse_args()
   if args.sequence < 256 or args.sequence & (args.sequence - 1):
     raise ValueError("sequence must be a power of two >= 256")
-  available = dict(variants())
+  available = dict(variants(args.phase))
   selected = args.variants or list(available)
   if set(selected) - available.keys():
     raise ValueError(f"Unknown variants: {set(selected) - available.keys()}")
@@ -145,7 +164,6 @@ def main():
       lambda q, k, v, ids: bench._forward(reference_kernel, q, k, v, ids)
   ).lower(q, k, v, ids).compile()
   forward_output, residuals = bench._ready(reference_forward(q, k, v, ids))
-  del forward_output
   reference_backward = jax.jit(
       lambda res, do: bench._backward(reference_kernel, res, do)
   ).lower(residuals, do).compile()
@@ -161,30 +179,48 @@ def main():
       overrides = available[name].copy()
       # Small CPU smoke tests retain legal blocks without altering production.
       if args.interpret:
-        for field in ("block_q_dkv", "block_kv_dkv_compute"):
+        for field in ("block_q", "block_kv_compute", "block_q_dkv", "block_kv_dkv_compute"):
           if field in overrides:
             overrides[field] = min(overrides[field], args.sequence // 2)
       candidate_cfg = dataclasses.replace(cfg, **overrides)
-      row = dict(variant=name, seed=args.seed, merged_heads=args.heads,
+      row = dict(variant=name, phase=args.phase, seed=args.seed, merged_heads=args.heads,
                  seq_len=args.sequence, head_dim=args.head_dim, dtype="bfloat16",
                  config=dataclasses.asdict(candidate_cfg),
                  reference_forward=forward_timing, device=str(jax.devices()[0]))
       candidate = None
       try:
         kernel = bench._make_kernel(ids, candidate_cfg)
-        candidate_residuals = (*residuals[:-1], kernel.dkv_mask_info)
         started = time.perf_counter()
-        candidate = jax.jit(
-            lambda res, do: bench._backward(kernel, res, do)
-        ).lower(candidate_residuals, do).compile()
+        if args.phase == "backward":
+          candidate_residuals = (*residuals[:-1], kernel.dkv_mask_info)
+          candidate_args = (candidate_residuals, do)
+          candidate = jax.jit(
+              lambda res, do: bench._backward(kernel, res, do)
+          ).lower(*candidate_args).compile()
+        else:
+          candidate_args = (q, k, v, ids)
+          candidate = jax.jit(
+              lambda q, k, v, ids: bench._forward(kernel, q, k, v, ids)
+          ).lower(*candidate_args).compile()
         row["compile_seconds"] = time.perf_counter() - started
-        candidate_grads = bench._ready(candidate(candidate_residuals, do))
+        if args.phase == "backward":
+          candidate_grads = bench._ready(candidate(*candidate_args))
+          output_precision = {}
+        else:
+          candidate_output, candidate_residuals = bench._ready(candidate(*candidate_args))
+          output_precision = precision_statistics(
+              (candidate_output, candidate_residuals[6]),
+              (forward_output, residuals[6]), names=("output", "logsumexp"),
+          )
+          candidate_grads = bench._ready(reference_backward(candidate_residuals, do))
+          del candidate_output
         row["precision"] = precision_statistics(candidate_grads, reference_grads)
+        row["precision"].update(output_precision)
         del candidate_grads
         exact = all(x["bitwise_equal"] and x["finite"] for x in row["precision"].values())
         row["numerical_status"] = "bitwise_equal" if exact else "needs_accuracy_review"
-        row["backward"] = bench._summary(bench._measure(
-            candidate, (candidate_residuals, do), args.warmup, args.repeats
+        row[args.phase] = bench._summary(bench._measure(
+            candidate, candidate_args, args.warmup, args.repeats
         ))
         row["status"] = "measured"
         if name in args.profile_variants:
@@ -192,9 +228,9 @@ def main():
           profile_dir.mkdir(parents=True, exist_ok=True)
           with jax.profiler.trace(str(profile_dir)):
             for step in range(args.profile_repeats):
-              with jax.profiler.StepTraceAnnotation("vit_splash_bwd", step_num=step):
-                bench._ready(candidate(candidate_residuals, do))
-        metric = dict(variant=name, phase="backward", latency_ms=row["backward"]["median_ms"],
+              with jax.profiler.StepTraceAnnotation("vit_splash_" + args.phase, step_num=step):
+                bench._ready(candidate(*candidate_args))
+        metric = dict(variant=name, phase=args.phase, latency_ms=row[args.phase]["median_ms"],
                       seq_len=args.sequence, merged_heads=args.heads, head_dim=args.head_dim,
                       dtype="bfloat16", seed=args.seed, bitwise_equal=exact)
         metrics.write(json.dumps(metric, sort_keys=True) + "\n")
@@ -202,11 +238,13 @@ def main():
       except Exception as error:
         row.update(status="error", error_type=type(error).__name__, error=str(error)[-5000:])
       # Recheck the live reference to expose drift during a long compile sweep.
-      row["reference_backward"] = bench._summary(bench._measure(
-          reference_backward, (residuals, do), 1, max(3, args.repeats // 2)
+      reference_fn = reference_backward if args.phase == "backward" else reference_forward
+      reference_args = (residuals, do) if args.phase == "backward" else (q, k, v, ids)
+      row["reference_" + args.phase] = bench._summary(bench._measure(
+          reference_fn, reference_args, 1, max(3, args.repeats // 2)
       ))
       if row["status"] == "measured":
-        row["speedup"] = row["reference_backward"]["median_ms"] / row["backward"]["median_ms"]
+        row["speedup"] = row["reference_" + args.phase]["median_ms"] / row[args.phase]["median_ms"]
       details.write(json.dumps(row, default=str, sort_keys=True) + "\n")
       details.flush()
       print(json.dumps(row, default=str, sort_keys=True), flush=True)
