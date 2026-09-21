@@ -37,6 +37,10 @@ _EXACT_LAYOUT = dict(
     bwd_do_seq_minor=True,
 )
 
+_DQ_DK_FIRST = _EXACT_LAYOUT | dict(
+    bwd_dq_transposed_output=True, bwd_dq_first=False,
+)
+
 
 def variants(phase="backward"):
   if phase == "forward":
@@ -74,6 +78,15 @@ def variants(phase="backward"):
       ("dp_early", _EXACT_LAYOUT | dict(bwd_dp_before_qk=True)),
       ("dq_transposed", _EXACT_LAYOUT | dict(bwd_dq_transposed_output=True)),
       ("dq_transposed_dk_first", _EXACT_LAYOUT | dict(bwd_dq_transposed_output=True, bwd_dq_first=False)),
+      ("dq_dk_first_single", _DQ_DK_FIRST | dict(bwd_single_segment_mask_body=True)),
+      ("dq_dk_first_single_u2", _DQ_DK_FIRST | dict(bwd_single_segment_mask_body=True, bwd_kv_unroll=2)),
+      ("dq_dk_first_single_u4", _DQ_DK_FIRST | dict(bwd_single_segment_mask_body=True, bwd_kv_unroll=4)),
+      ("dq_dk_first_q2048", _DQ_DK_FIRST | dict(block_q_dkv=2048)),
+      ("dq_dk_first_c512", _DQ_DK_FIRST | dict(block_kv_dkv_compute=512)),
+      ("dq_dk_first_transpose_dk", _DQ_DK_FIRST | dict(bwd_dk_transposed_output=True)),
+      ("dq_dk_first_transpose_dv", _DQ_DK_FIRST | dict(bwd_dv_transposed_output=True)),
+      ("dq_dk_first_transpose_all", _DQ_DK_FIRST | dict(bwd_dk_transposed_output=True, bwd_dv_transposed_output=True)),
+      ("dq_dk_first_transpose_all_single_u2", _DQ_DK_FIRST | dict(bwd_dk_transposed_output=True, bwd_dv_transposed_output=True, bwd_single_segment_mask_body=True, bwd_kv_unroll=2)),
       ("dq_transposed_dv_last", _EXACT_LAYOUT | dict(bwd_dq_transposed_output=True, bwd_dv_last=True)),
       ("dq_transposed_dp_early", _EXACT_LAYOUT | dict(bwd_dq_transposed_output=True, bwd_dp_before_qk=True)),
       ("dq_transposed_scheduler", _EXACT_LAYOUT | dict(bwd_dq_transposed_output=True, bwd_scheduler=True)),

@@ -36,6 +36,8 @@ def main():
   parser.add_argument("--output-dir", required=True)
   parser.add_argument("--sequence", type=int, default=32768)
   parser.add_argument("--heads", type=int, default=32)
+  parser.add_argument("--cpu-fp64", action="store_true",
+                      help="Validate every output element against independent CPU FP64")
   args = parser.parse_args()
   out = Path(args.output_dir) / "benchmark"
   out.mkdir(parents=True, exist_ok=True)
@@ -46,6 +48,10 @@ def main():
                              [args.sequence // 2, args.sequence // 2 - 16, 8, 8]))
   variants = [("original", -jnp.inf, False), ("finite_mask", -1e30, False),
               ("barriers", -jnp.inf, True), ("finite_mask_barriers", -1e30, True)]
+  host_values = None
+  if args.cpu_fp64:
+    host_values = accuracy.numpy_attention_and_gradients(q, k, v, do, ids, ids)
+    print(json.dumps(dict(status="cpu_fp64_oracle_complete", head=0)), flush=True)
   with (out / "oracle-diagnostic.jsonl").open("w") as stream, (out / "metrics.jsonl").open("w") as metrics:
     for name, mask_value, barrier_stages in variants:
       row = dict(variant=name, seq_len=args.sequence, head=0, seed=27,
@@ -57,6 +63,16 @@ def main():
         row["health"] = {key: health(value) for key, value in zip(
             ("output", "logsumexp", "dq", "dk", "dv"), values)}
         row["status"] = "finite" if all(x["nonfinite_count"] == 0 for x in row["health"].values()) else "nonfinite"
+        if host_values is not None:
+          row["cpu_fp64_error"] = {}
+          for key, value, expected in zip(("output", "logsumexp", "dq", "dk", "dv"), values, host_values):
+            actual = np.asarray(value, dtype=np.float64)
+            difference = actual - expected
+            row["cpu_fp64_error"][key] = dict(
+                finite=bool(np.isfinite(actual).all() and np.isfinite(expected).all()),
+                max_abs=float(np.max(np.abs(difference))),
+                relative_l2=float(np.linalg.norm(difference) / max(np.linalg.norm(expected), 1e-30)),
+            )
       except Exception as error:
         row.update(status="error", error=str(error)[:3000])
       stream.write(json.dumps(row) + "\n")

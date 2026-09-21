@@ -88,6 +88,41 @@ def test_trace_scopes_and_seqminor_scratch_preserve_head_dim_72(mode, do_seq_min
     np.testing.assert_array_equal(result, reference)
 
 
+@pytest.mark.parametrize("dk_transposed,dv_transposed", [(True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("seqminor", [False, True])
+@pytest.mark.parametrize("dq_first", [False, True])
+def test_dkv_orientation_preserves_head_dim_72(dk_transposed, dv_transposed, seqminor, dq_first):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
+
+  q, k, v, do = [
+      jax.random.normal(key, (1, 512, 72), jnp.bfloat16)
+      for key in jax.random.split(jax.random.key(27), 4)
+  ]
+  ids = jnp.asarray(np.repeat(np.array([1, 2, 3, 0], np.int32), [256, 240, 8, 8]))
+  segments = base.SegmentIds(ids, ids)
+  cfg = splash.SplashConfig(
+      block_q=128, block_kv=256, block_kv_compute=128,
+      block_q_dkv=128, block_kv_dkv=256, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR if seqminor else splash.QKVLayout.HEAD_DIM_MINOR,
+      k_layout=splash.QKVLayout.SEQ_MINOR, v_layout=splash.QKVLayout.SEQ_MINOR,
+      softmax_scale=72**-0.5, use_base2_exp=True, max_logit_const=0.0,
+      bwd_dq_scratch_seq_minor=True, bwd_dkv_scratch_seq_minor=seqminor,
+      bwd_dkv_output_seq_minor=seqminor, bwd_do_seq_minor=seqminor,
+      interpret=True, **(_TUNING | dict(bwd_dq_first=dq_first)),
+  )
+  reference = bench._make_kernel(segments, cfg)
+  _, residuals = bench._forward(reference, q, k, v, segments)
+  expected = bench._backward(reference, residuals, do)
+  candidate = bench._make_kernel(segments, dataclasses.replace(
+      cfg, bwd_dq_transposed_output=True,
+      bwd_dk_transposed_output=dk_transposed, bwd_dv_transposed_output=dv_transposed,
+  ))
+  actual = bench._backward(candidate, residuals, do)
+  for value, wanted in zip(actual, expected):
+    assert np.isfinite(np.asarray(value)).all()
+    np.testing.assert_array_equal(value, wanted)
+
+
 def test_invalid_trace_mode_rejected():
   with pytest.raises(ValueError, match="Invalid region_trace_mode"):
     splash.SplashConfig(block_q=128, block_kv=128, region_trace_mode="invalid")

@@ -176,6 +176,10 @@ class SplashConfig:
   # Diagnostic: produce dQ.T directly, avoiding the large dS transpose.
   # Reassociation can change TPU rounding; never infer accuracy from CPU alone.
   bwd_dq_transposed_output: bool = False
+  # Independent diagnostic controls for the other two gradient contractions.
+  # Keep BF16 dot inputs and FP32 accumulation exactly as in the normal path.
+  bwd_dk_transposed_output: bool = False
+  bwd_dv_transposed_output: bool = False
   bwd_keep_kv_seq_minor: bool = False
   # Feed dO directly in sequence-minor physical layout to dP/dV dots.
   # This changes operand preparation, not the logical contraction or dtype.
@@ -1597,6 +1601,8 @@ def _flash_attention_dkv_kernel(
         and not config.bwd_keep_kv_seq_minor
         and not config.bwd_dq_contract_ds_axis0
         and not config.bwd_dq_transposed_output
+        and not config.bwd_dk_transposed_output
+        and not config.bwd_dv_transposed_output
         and not config.bwd_dv_last
         and not config.bwd_reuse_bf16_probabilities
         and config.use_base2_exp
@@ -1769,11 +1775,18 @@ def _flash_attention_dkv_kernel(
 
       def compute_dv():
         with _attention_scope(config, "splash_bwd_dv_mxu_accum"):
-          dv = lax.dot_general(
-              p_bf16, do,
-              NT_DIM_NUMBERS if config.bwd_do_seq_minor else NN_DIM_NUMBERS,
-              preferred_element_type=jnp.float32,
-          )
+          if config.bwd_dv_transposed_output:
+            dv = lax.dot_general(
+                do, p_bf16,
+                NT_DIM_NUMBERS if config.bwd_do_seq_minor else TT_DIM_NUMBERS,
+                preferred_element_type=jnp.float32,
+            ).T
+          else:
+            dv = lax.dot_general(
+                p_bf16, do,
+                NT_DIM_NUMBERS if config.bwd_do_seq_minor else NN_DIM_NUMBERS,
+                preferred_element_type=jnp.float32,
+            )
           scratch_ref = head_ref(dv_scratch_ref)
           if config.bwd_dkv_scratch_seq_minor:
             dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[:, slice_k].T
@@ -1798,17 +1811,24 @@ def _flash_attention_dkv_kernel(
 
       def compute_dk():
         with _attention_scope(config, "splash_bwd_dk_mxu_accum"):
-          dk_dims = (
-              NN_DIM_NUMBERS
-              if config.q_layout == HEAD_DIM_MINOR
-              else NT_DIM_NUMBERS
-          )
-          dk = lax.dot_general(
-              ds.astype(do.dtype),
-              q,
-              dk_dims,
-              preferred_element_type=jnp.float32,
-          )
+          if config.bwd_dk_transposed_output:
+            dk = lax.dot_general(
+                q, ds.astype(do.dtype),
+                TT_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS,
+                preferred_element_type=jnp.float32,
+            ).T
+          else:
+            dk_dims = (
+                NN_DIM_NUMBERS
+                if config.q_layout == HEAD_DIM_MINOR
+                else NT_DIM_NUMBERS
+            )
+            dk = lax.dot_general(
+                ds.astype(do.dtype),
+                q,
+                dk_dims,
+                preferred_element_type=jnp.float32,
+            )
           if config.softmax_scale is not None and config.bwd_scale_after_dot:
             dk *= jnp.float32(config.softmax_scale)
           scratch_ref = head_ref(dk_scratch_ref)

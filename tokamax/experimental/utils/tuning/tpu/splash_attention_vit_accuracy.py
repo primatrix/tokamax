@@ -13,13 +13,58 @@ Splash residuals, BF16 probability casts or the candidate's custom backward.
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+
+
+def numpy_attention_and_gradients(q, k, v, do, q_ids, kv_ids, *, block_q=512):
+  """CPU FP64 oracle, independent of TPU lowering, for reference validation.
+
+  Segments are evaluated separately, exactly matching the equality mask.
+  This avoids computing masked cross-segment pairs without dropping any key
+  allowed for a query. Intended for untimed diagnostics on one full head.
+  """
+  q, k, v, do = (np.asarray(x, dtype=np.float64) for x in (q, k, v, do))
+  q_ids, kv_ids = np.asarray(q_ids), np.asarray(kv_ids)
+  if block_q <= 0:
+    raise ValueError("block_q must be positive")
+  output, lse = np.zeros_like(do), np.zeros(q.shape[0], np.float64)
+  dq, dk, dv = np.zeros_like(q), np.zeros_like(k), np.zeros_like(v)
+  scale = q.shape[1] ** -0.5
+  for segment in np.unique(q_ids):
+    queries, keys = np.flatnonzero(q_ids == segment), np.flatnonzero(kv_ids == segment)
+    if not len(keys):
+      raise ValueError("Every query segment must have at least one key")
+    ks, vs = k[keys], v[keys]
+    dks, dvs = np.zeros_like(ks), np.zeros_like(vs)
+    for start in range(0, len(queries), block_q):
+      rows = queries[start:start + block_q]
+      qi, doi = q[rows], do[rows]
+      logits = (qi @ ks.T) * scale
+      maximum = np.max(logits, axis=-1, keepdims=True)
+      p = np.exp(logits - maximum)
+      denominator = np.sum(p, axis=-1, keepdims=True)
+      p /= denominator
+      oi = p @ vs
+      dp = doi @ vs.T
+      ds = p * (dp - np.sum(doi * oi, axis=-1, keepdims=True))
+      output[rows], lse[rows] = oi, (maximum + np.log(denominator))[:, 0]
+      dq[rows] = (ds @ ks) * scale
+      dks += (ds.T @ qi) * scale
+      dvs += p.T @ doi
+    dk[keys], dv[keys] = dks, dvs
+  return output, lse, dq, dk, dv
 
 
 def fp32_attention_and_gradients(
     q, k, v, do, q_ids, kv_ids, *, block_q=512,
-    mask_value=-jnp.inf, barrier_stages=False,
+    mask_value=-jnp.inf, barrier_stages=True,
 ):
-  """Returns output, natural-log LSE, dQ, dK, dV for one head in FP32."""
+  """Returns output, natural-log LSE, dQ, dK, dV for one head in FP32.
+
+  Keep stage barriers in the independent oracle: on TPU, the fused version
+  with infinite segment masking produces NaNs despite finite inputs and
+  nonempty attention rows. Barriers preserve the formula and its dtypes.
+  """
   if q.ndim != 2 or k.ndim != 2 or v.ndim != 2 or do.ndim != 2:
     raise ValueError("Expected one head with rank-2 arrays")
   if block_q <= 0 or q.shape[0] % block_q:

@@ -42,6 +42,11 @@ def test_oracle_matches_dense_float64_autodiff(input_scale, block_q, mask_value,
     )
     for actual, expected in zip(result, (output, lse, *grads)):
       np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=1e-5)
+    host_result = accuracy.numpy_attention_and_gradients(
+        q, k, v, do, ids, ids, block_q=block_q,
+    )
+    for actual, expected in zip(host_result, (output, lse, *grads)):
+      np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-12)
 
 
 def test_statistics_keep_oracle_precision():
