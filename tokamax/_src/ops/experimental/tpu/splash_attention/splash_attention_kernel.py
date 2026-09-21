@@ -163,6 +163,9 @@ class SplashConfig:
   combine_log2_scale: bool = False
   # Integers use lax.fori_loop's partial-unroll factor (1 is rolled).
   bwd_kv_unroll: bool | int = True
+  # Segment-only diagnostic: one masked loop body avoids duplicating the
+  # expanded full/partial branches. Full tiles perform redundant exact masking.
+  bwd_single_segment_mask_body: bool = False
   bwd_dq_first: bool = False
   bwd_dv_last: bool = False
   bwd_cast_before_transpose: bool = False
@@ -1718,21 +1721,38 @@ def _flash_attention_dkv_kernel(
     k_seq_axis += 1
   num_iters = k_ref.shape[k_seq_axis] // bkv_compute
 
-  @pl.when(jnp.logical_and(should_not_mask, should_run))
-  def _():
-    with _attention_scope(config, "splash_bwd_kv_loop", coarse=True):
-      lax.fori_loop(0, num_iters, body, None, unroll=config.bwd_kv_unroll)
+  if config.bwd_single_segment_mask_body:
+    if (
+        mask_ref is not None
+        or mask_function is not None
+        or q_segment_ids_ref is None
+        or kv_segment_ids_ref is None
+    ):
+      raise ValueError("bwd_single_segment_mask_body requires segment-only masks")
 
-  @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
-  def _():
-    with _attention_scope(config, "splash_bwd_kv_loop_partial", coarse=True):
-      lax.fori_loop(
-          0,
-          num_iters,
-          partial(body, has_partial_mask=True),
-          None,
-          unroll=config.bwd_kv_unroll,
-      )
+    @pl.when(should_run)
+    def _():
+      with _attention_scope(config, "splash_bwd_kv_loop_partial", coarse=True):
+        lax.fori_loop(
+            0, num_iters, partial(body, has_partial_mask=True), None,
+            unroll=config.bwd_kv_unroll,
+        )
+  else:
+    @pl.when(jnp.logical_and(should_not_mask, should_run))
+    def _():
+      with _attention_scope(config, "splash_bwd_kv_loop", coarse=True):
+        lax.fori_loop(0, num_iters, body, None, unroll=config.bwd_kv_unroll)
+
+    @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
+    def _():
+      with _attention_scope(config, "splash_bwd_kv_loop_partial", coarse=True):
+        lax.fori_loop(
+            0,
+            num_iters,
+            partial(body, has_partial_mask=True),
+            None,
+            unroll=config.bwd_kv_unroll,
+        )
 
   if dq_scratch_ref is not None:
     with _attention_scope(config, "splash_bwd_dq_output_drain", coarse=True):

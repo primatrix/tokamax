@@ -52,6 +52,10 @@ def variants(phase="backward"):
   return [
       ("pr13", {}),
       ("seqminor", _EXACT_LAYOUT),
+      ("single_mask_body", _EXACT_LAYOUT | dict(bwd_single_segment_mask_body=True)),
+      ("single_mask_body_u2", _EXACT_LAYOUT | dict(bwd_single_segment_mask_body=True, bwd_kv_unroll=2)),
+      ("single_mask_body_u4", _EXACT_LAYOUT | dict(bwd_single_segment_mask_body=True, bwd_kv_unroll=4)),
+      ("single_mask_body_u8", _EXACT_LAYOUT | dict(bwd_single_segment_mask_body=True, bwd_kv_unroll=8)),
       ("unroll2", _EXACT_LAYOUT | dict(bwd_kv_unroll=2)),
       ("unroll4", _EXACT_LAYOUT | dict(bwd_kv_unroll=4)),
       ("compute512", _EXACT_LAYOUT | dict(block_kv_dkv_compute=512)),
