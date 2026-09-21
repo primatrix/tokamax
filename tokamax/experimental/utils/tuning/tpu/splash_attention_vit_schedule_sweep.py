@@ -41,11 +41,26 @@ _DQ_DK_FIRST = _EXACT_LAYOUT | dict(
     bwd_dq_transposed_output=True, bwd_dq_first=False,
 )
 
+_FWD_KVMAJOR = dict(
+    fwd_kvmajor_probabilities=True,
+    compact_softmax_scratch=True, fwd_output_scratch_seq_minor=True,
+)
+
 
 def variants(phase="backward"):
   if phase == "forward":
     return [
         ("pr13", {}),
+        ("kvmajor", _FWD_KVMAJOR),
+        ("kvmajor_qsum", _FWD_KVMAJOR | dict(fwd_kvmajor_sum_in_qmajor=True)),
+        ("kvmajor_qsum_u4", _FWD_KVMAJOR | dict(fwd_kvmajor_sum_in_qmajor=True, fwd_kv_unroll=4)),
+        ("kvmajor_u2", _FWD_KVMAJOR | dict(fwd_kv_unroll=2)),
+        ("kvmajor_u4", _FWD_KVMAJOR | dict(fwd_kv_unroll=4)),
+        ("kvmajor_u8", _FWD_KVMAJOR | dict(fwd_kv_unroll=8)),
+        ("kvmajor_c512", _FWD_KVMAJOR | dict(block_kv_compute=512)),
+        ("kvmajor_q512", _FWD_KVMAJOR | dict(block_q=512)),
+        ("kvmajor_q2048", _FWD_KVMAJOR | dict(block_q=2048)),
+        ("kvmajor_scheduler", _FWD_KVMAJOR | dict(use_experimental_scheduler=True)),
         ("output_seqminor", dict(fwd_output_scratch_seq_minor=True)),
         ("pv_transposed", dict(fwd_pv_transposed_output=True)),
         ("pv_transposed_seqminor", dict(fwd_pv_transposed_output=True, fwd_output_scratch_seq_minor=True)),

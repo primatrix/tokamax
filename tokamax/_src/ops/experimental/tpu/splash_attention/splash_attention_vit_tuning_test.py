@@ -158,6 +158,53 @@ def test_qmajor_probabilities_preserve_asymmetric_tiles(dq_transposed, order):
     np.testing.assert_array_equal(value, wanted)
 
 
+@pytest.mark.parametrize("unroll", [True, 2, 4])
+@pytest.mark.parametrize("q_block", [128, 256])
+@pytest.mark.parametrize("reference_sum_axis", [False, True])
+def test_forward_kvmajor_probabilities(unroll, q_block, reference_sum_axis):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_accuracy as accuracy
+
+  q, k, v, do = [
+      jax.random.normal(key, (1, 512, 72), jnp.bfloat16)
+      for key in jax.random.split(jax.random.key(27), 4)
+  ]
+  ids = jnp.asarray(np.repeat(np.array([1, 2, 3, 0], np.int32), [256, 240, 8, 8]))
+  segments = base.SegmentIds(ids, ids)
+  cfg = splash.SplashConfig(
+      block_q=q_block, block_kv=256, block_kv_compute=128,
+      block_q_dkv=256, block_kv_dkv=256, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR, k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR,
+      softmax_scale=72**-0.5, use_base2_exp=True, max_logit_const=0.0,
+      interpret=True, **_TUNING,
+  )
+  reference = bench._make_kernel(segments, cfg)
+  output, residuals = bench._forward(reference, q, k, v, segments)
+  expected = bench._backward(reference, residuals, do)
+  candidate = bench._make_kernel(segments, dataclasses.replace(
+      cfg, fwd_kvmajor_probabilities=True, compact_softmax_scratch=True,
+      fwd_output_scratch_seq_minor=True, fwd_kv_unroll=unroll,
+      fwd_kvmajor_sum_in_qmajor=reference_sum_axis,
+  ))
+  actual_output, actual_residuals = bench._forward(candidate, q, k, v, segments)
+  actual = bench._backward(reference, actual_residuals, do)
+  for value in (actual_output, actual_residuals[6], *actual):
+    assert np.isfinite(np.asarray(value)).all()
+  np.testing.assert_array_equal(actual_output, output)
+  np.testing.assert_array_equal(actual[2], expected[2])
+  # Both sum expressions lower non-bitwise on CPU for this orientation. This
+  # is a diagnostic reassociation, not a bitwise optimization. Bound LSE
+  # rounding and test against independent FP64; TPU acceptance stays separate.
+  np.testing.assert_array_max_ulp(np.asarray(actual_residuals[6]), np.asarray(residuals[6]), maxulp=1)
+  oracle = accuracy.numpy_attention_and_gradients(q[0], k[0], v[0], do[0], ids, ids)
+  for value, wanted, high_precision in zip(actual, expected, oracle[2:]):
+    assert _relative_l2(value, wanted) < 1e-4
+    ref_error = _relative_l2(wanted[0], high_precision)
+    candidate_error = _relative_l2(value[0], high_precision)
+    assert candidate_error <= ref_error * 1.001 + 1e-7
+
+
 def test_invalid_trace_mode_rejected():
   with pytest.raises(ValueError, match="Invalid region_trace_mode"):
     splash.SplashConfig(block_q=128, block_kv=128, region_trace_mode="invalid")

@@ -218,6 +218,12 @@ class SplashConfig:
   # PV still consumes the original FP32 probabilities.
   fwd_pv_transposed_output: bool = False
   fwd_output_scratch_seq_minor: bool = False
+  # Fixed-shift ViT diagnostic: produce P as [KV, Q] from QK onward,
+  # feed V @ P directly, and keep output/state scratch sequence-minor.
+  fwd_kvmajor_probabilities: bool = False
+  # Accuracy/scheduling control: express sum on the reference's logical axis.
+  # This does not guarantee identical lowering or floating-point association.
+  fwd_kvmajor_sum_in_qmajor: bool = False
   fwd_kv_unroll: bool | int = True
   # Fixed-logit-shift ViT diagnostic: QK/exp for i before PV/accum for i-1.
   fwd_staged_kv_pipeline: bool = False
@@ -463,6 +469,21 @@ def flash_attention_kernel(
   if config.use_base2_exp and max_logit_estimate is not None:
     max_logit_estimate *= LOG2E
 
+  if config.fwd_kvmajor_probabilities and not (
+      config.max_logit_const == 0.0 and max_logit_value_ref is None
+      and sinks_ref is None and attn_logits_soft_cap is None
+      and config.use_base2_exp and config.combine_log2_scale
+      and config.softmax_scale is not None
+      and config.compact_softmax_scratch and config.fwd_output_scratch_seq_minor
+      and not config.fwd_loop_carry and not config.fwd_staged_kv_pipeline
+      and not config.fwd_pv_transposed_output
+      and config.q_layout == config.k_layout == config.v_layout == QKVLayout.SEQ_MINOR
+      and mask_ref is None and mask_function is None
+      and q_segment_ids_ref is not None and kv_segment_ids_ref is not None
+      and q_ref.dtype == k_ref.dtype == v_ref.dtype == jnp.bfloat16
+  ):
+    raise ValueError("fwd_kvmajor_probabilities requires fixed-shift segmented BF16 ViT attention and sequence-minor scratch")
+
   @pl.when(should_initialize)
   def init():
     with _attention_scope(config, "splash_fwd_init", coarse=True):
@@ -523,7 +544,37 @@ def flash_attention_kernel(
         else value
     ).astype(ref.dtype)
 
+  def kvmajor_body(kv_compute_index, has_partial_mask):
+    window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
+    with _attention_scope(config, "splash_fwd_qk_mxu"):
+      logits = lax.dot_general(
+          k_ref[:, window], q_ref[...], TN_DIM_NUMBERS,
+          preferred_element_type=jnp.float32,
+      )
+      logits *= jnp.float32(config.softmax_scale * LOG2E)
+    with _attention_scope(config, "splash_fwd_mask"):
+      if not config.segment_mask_on_partial_only or has_partial_mask:
+        q_ids = q_segment_ids_ref[:, :1].T
+        kv_ids = kv_segment_ids_ref[:1, window].T
+        logits = jnp.where(kv_ids == q_ids, logits, mask_value)
+    with _attention_scope(config, "splash_fwd_softmax"):
+      probabilities = jnp.exp2(logits - max_logit_estimate)
+      current_l = (
+          jnp.sum(probabilities.T, axis=-1)[None, :]
+          if config.fwd_kvmajor_sum_in_qmajor
+          else jnp.sum(probabilities, axis=0, keepdims=True)
+      )
+      l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
+    with _attention_scope(config, "splash_fwd_pv_mxu"):
+      # The reference PV consumes FP32 P; do not introduce a BF16 cast here.
+      output_t = lax.dot_general(v_ref[:, window], probabilities, NN_DIM_NUMBERS)
+    with _attention_scope(config, "splash_fwd_output_accum"):
+      o_scratch_ref[...] += output_t
+
   def body(kv_compute_index, carry, has_partial_mask=False):
+    if config.fwd_kvmajor_probabilities:
+      kvmajor_body(kv_compute_index, has_partial_mask)
+      return
     slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
     with _attention_scope(config, "splash_fwd_load_qk_state"):
       if config.fwd_loop_carry:
