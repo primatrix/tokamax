@@ -1452,3 +1452,23 @@ Keep the FP32 addition order and BF16 dot boundaries, compare against the
 same Q-tile control, and recheck both oracle errors and VMEM/code footprint.
 This is a proposed experiment, not an implemented or measured gain. The
 current evidence does not establish that MXU/vector overlap is optimal.
+
+## Nested Q sweep and dK/dV accumulator reuse
+
+The next implementation adds default-off `bwd_qtile_nested` and
+`bwd_qtile_accumulator_carry`. For each compute-KV block, the nested path
+visits all Q subtiles before proceeding to the next KV block. The carry
+path loads that block's existing FP32 dK/dV accumulators once, preserves
+the source addition order over Q subtiles, and stores once at the end.
+dQ still accumulates directly in its original scratch slice. BF16 dot
+operands, FP32 P through dS, softmax/scale expressions, outer DMA tiles,
+and final gradient reduction/formatting are unchanged.
+
+The nested-but-scratch-updating control separates loop restructuring from
+accumulator reuse. Only the inner Q loop is unrolled; the outer compute-KV
+loop stays rolled. Existing flat-loop paths and all defaults are unchanged.
+Both sequential and staged inner-Q schedules have CPU tests; the initial
+TPU screen focuses on sequential schedules to isolate accumulator reuse.
+This does not guarantee that the compiler keeps accumulators in registers
+or that the larger live range is profitable. Independent precision checks,
+timings and trace/compiler evidence remain required before promotion.

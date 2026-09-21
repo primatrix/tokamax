@@ -198,7 +198,8 @@ def test_dv_between_gradient_consumers(layout, dq_first, dp_early):
 @pytest.mark.parametrize("compute_q", [128, 256])
 @pytest.mark.parametrize("pipeline", [False, True])
 @pytest.mark.parametrize("unroll", [False, 2, 4])
-def test_backward_internal_q_tiles_against_fp64(seed, compute_q, pipeline, unroll):
+@pytest.mark.parametrize("loop_mode", ["flat", "nested", "carry"])
+def test_backward_internal_q_tiles_against_fp64(seed, compute_q, pipeline, unroll, loop_mode):
   from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
   from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_accuracy as accuracy
   from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_schedule_sweep as sweep
@@ -221,10 +222,12 @@ def test_backward_internal_q_tiles_against_fp64(seed, compute_q, pipeline, unrol
   candidate = bench._make_kernel(segments, dataclasses.replace(
       cfg, bwd_block_q_compute=compute_q, bwd_qtile_pipeline=pipeline,
       bwd_kv_unroll=unroll,
+      bwd_qtile_nested=loop_mode != "flat",
+      bwd_qtile_accumulator_carry=loop_mode == "carry",
   ))
   actual = bench._backward(candidate, residuals, do)
   oracle = accuracy.numpy_attention_and_gradients(q[0], k[0], v[0], do[0], ids, ids)
-  if pipeline or unroll:
+  if pipeline or unroll or loop_mode != "flat":
     sequential = bench._make_kernel(segments, dataclasses.replace(
         cfg, bwd_block_q_compute=compute_q, bwd_qtile_pipeline=False,
         bwd_kv_unroll=False,
@@ -244,6 +247,8 @@ def test_backward_internal_q_tiles_against_fp64(seed, compute_q, pipeline, unrol
     dict(block_q_dkv=512, bwd_block_q_compute=64),
     dict(block_q_dkv=512, bwd_block_q_compute=384),
     dict(bwd_qtile_pipeline=True),
+    dict(bwd_qtile_nested=True),
+    dict(block_q_dkv=256, bwd_block_q_compute=128, bwd_qtile_accumulator_carry=True),
     dict(block_q_dkv=256, bwd_block_q_compute=128, bwd_staged_kv_pipeline=True),
 ])
 def test_invalid_backward_q_compute_tile_rejected(kwargs):

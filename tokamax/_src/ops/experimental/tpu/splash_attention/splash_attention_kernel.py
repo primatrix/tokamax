@@ -173,6 +173,10 @@ class SplashConfig:
   # ranges. Optional producer/consumer carry holds only BF16 P and dS.
   bwd_block_q_compute: int | None = None
   bwd_qtile_pipeline: bool = False
+  # Nested KV/Q compute loops permit reusing each dK/dV accumulator across
+  # the inner Q sweep. Keep a scratch-updating nested control for ablation.
+  bwd_qtile_nested: bool = False
+  bwd_qtile_accumulator_carry: bool = False
   bwd_dq_first: bool = False
   bwd_dv_last: bool = False
   # Complete the gradient-consumer ordering screen without changing dots.
@@ -280,6 +284,10 @@ class SplashConfig:
       raise ValueError("backward Q compute tile must be lane-aligned and divide block_q_dkv")
     if self.bwd_qtile_pipeline and self.bwd_block_q_compute is None:
       raise ValueError("Q-tile pipeline requires bwd_block_q_compute")
+    if self.bwd_qtile_nested and self.bwd_block_q_compute is None:
+      raise ValueError("nested Q-tile loops require bwd_block_q_compute")
+    if self.bwd_qtile_accumulator_carry and not self.bwd_qtile_nested:
+      raise ValueError("Q-tile accumulator carry requires nested Q-tile loops")
     if self.bwd_block_q_compute is not None and self.bwd_staged_kv_pipeline:
       raise ValueError("Q compute tiling cannot use the legacy KV pipeline")
     if self.fwd_native_output_normalization and not (
@@ -1895,22 +1903,30 @@ def _flash_attention_dkv_kernel(
       # boundaries, so the carried state does not lower softmax precision.
       return p.astype(do_ref.dtype), ds
 
-    def consume(i, state):
+    def consume(i, state, accumulators=None):
       q_window, kv_window = windows(i)
       p, ds = state
+      if config.bwd_qtile_accumulator_carry:
+        dk_acc, dv_acc = accumulators
       with _attention_scope(config, "splash_bwd_dv_mxu_accum"):
         dv = lax.dot_general(
             p, do_ref[:, q_window], NT_DIM_NUMBERS,
             preferred_element_type=jnp.float32,
         )
-        dv_scratch_ref[:, kv_window] += dv.T
+        if config.bwd_qtile_accumulator_carry:
+          dv_acc = dv_acc + dv.T
+        else:
+          dv_scratch_ref[:, kv_window] += dv.T
       with _attention_scope(config, "splash_bwd_dk_mxu_accum"):
         dk = lax.dot_general(
             ds, q_ref[:, q_window], NT_DIM_NUMBERS,
             preferred_element_type=jnp.float32,
         )
         dk *= jnp.float32(config.softmax_scale)
-        dk_scratch_ref[:, kv_window] += dk.T
+        if config.bwd_qtile_accumulator_carry:
+          dk_acc = dk_acc + dk.T
+        else:
+          dk_scratch_ref[:, kv_window] += dk.T
       with _attention_scope(config, "splash_bwd_dq_mxu_accum"):
         dq = lax.dot_general(
             k_ref[:, kv_window], ds, NN_DIM_NUMBERS,
@@ -1918,6 +1934,50 @@ def _flash_attention_dkv_kernel(
         )
         dq *= jnp.float32(config.softmax_scale)
         dq_scratch_ref[:, q_window] += dq
+      if config.bwd_qtile_accumulator_carry:
+        return dk_acc, dv_acc
+
+    if config.bwd_qtile_nested:
+      def kv_step(kv_index, _):
+        first = kv_index * q_inner_steps
+        kv_window = pl.ds(kv_index * bkv_compute, bkv_compute)
+        accumulators = None
+        if config.bwd_qtile_accumulator_carry:
+          with _attention_scope(config, "splash_bwd_qtile_acc_init"):
+            accumulators = (
+                dk_scratch_ref[:, kv_window], dv_scratch_ref[:, kv_window],
+            )
+
+        if config.bwd_qtile_pipeline:
+          def q_step(q_index, state):
+            previous, acc = state
+            current = prepare(first + q_index)
+            acc = consume(first + q_index - 1, previous, acc)
+            return current, acc
+
+          state, accumulators = lax.fori_loop(
+              1, q_inner_steps, q_step, (prepare(first), accumulators),
+              unroll=config.bwd_kv_unroll,
+          )
+          accumulators = consume(first + q_inner_steps - 1, state, accumulators)
+        else:
+          def q_step(q_index, acc):
+            i = first + q_index
+            return consume(i, prepare(i), acc)
+
+          accumulators = lax.fori_loop(
+              0, q_inner_steps, q_step, accumulators,
+              unroll=config.bwd_kv_unroll,
+          )
+
+        if config.bwd_qtile_accumulator_carry:
+          with _attention_scope(config, "splash_bwd_qtile_acc_drain"):
+            dk_scratch_ref[:, kv_window], dv_scratch_ref[:, kv_window] = accumulators
+
+      # Only the inner Q loop is unrolled. This bounds code expansion and
+      # preserves the original Q-subtile accumulation order for each KV tile.
+      lax.fori_loop(0, num_kv_iters, kv_step, None, unroll=False)
+      return
 
     if config.bwd_qtile_pipeline:
       def step(i, previous):
