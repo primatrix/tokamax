@@ -79,7 +79,8 @@ def test_tuning_preserves_segmented_outputs_and_all_gradients(
     fuse_reciprocal, extra
 ):
   keys = jax.random.split(jax.random.key(42), 4)
-  num_heads = 2 if extra.get("bwd_head_group_size", 1) > 1 else 1
+  # Four heads cover two distinct grouped-head BlockSpec windows.
+  num_heads = 4 if extra.get("bwd_head_group_size", 1) > 1 else 1
   q, k, v, do = [
       jax.random.normal(key, (num_heads, 256, 128), jnp.bfloat16)
       for key in keys

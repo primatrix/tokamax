@@ -1704,7 +1704,7 @@ def _splash_attention_bwd_dkv(
       def index_map(h, grid_idx, rows_ref, cols_ref, *_):
         j = to_i32(rows_ref[grid_idx])
         i = to_i32(cols_ref[grid_idx])
-        return f(h * head_group_size, i, j)
+        return f(h, i, j)
 
       return index_map
 
@@ -1717,9 +1717,7 @@ def _splash_attention_bwd_dkv(
       return next_m, 0, 0
 
   else:
-    unravel = (
-        lambda f: lambda j, h, i, *_: f(h * head_group_size, i, j)
-    )
+    unravel = lambda f: lambda j, h, i, *_: f(h, i, j)
     grid = (kv_steps, num_q_heads // head_group_size, q_steps)
 
     def mask_index_map(j, h, i, rows_ref, cols_ref, mask_next_ref=None, *_):
