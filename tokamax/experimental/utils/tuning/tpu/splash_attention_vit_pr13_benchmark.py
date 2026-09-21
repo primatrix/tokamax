@@ -193,6 +193,7 @@ def _parser():
   parser.add_argument("--bwd-keep-kv-seq-minor", action="store_true")
   parser.add_argument("--bwd-dp-before-qk", action="store_true")
   parser.add_argument("--bwd-head-group-size", type=int, default=1)
+  parser.add_argument("--use-base2-exp", action="store_true")
   parser.add_argument(
       "--bwd-parallel-heads", action=argparse.BooleanOptionalAction, default=False
   )
@@ -225,7 +226,8 @@ def main():
       v_layout=splash.QKVLayout.SEQ_MINOR,
       softmax_scale=args.head_dim**-0.5,
       max_logit_const=0.0,
-      use_base2_exp=False,
+      use_base2_exp=args.use_base2_exp,
+      combine_log2_scale=args.use_base2_exp,
       bwd_kv_unroll=False,
       bwd_dq_first=True,
       bwd_cast_before_transpose=True,
