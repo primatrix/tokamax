@@ -171,6 +171,9 @@ class SplashConfig:
   # Keep backward segment IDs scalar per token in VMEM. Partial-mask tiles
   # broadcast them only when constructing the elementwise segment mask.
   bwd_compact_segment_ids: bool = False
+  # Store FP32 dK/dV accumulators with sequence as the minor dimension. This
+  # avoids padding a non-MXU-facing head dimension in VMEM.
+  bwd_dkv_scratch_seq_minor: bool = False
   # Process multiple independent MHA heads in one Pallas program. Dots remain
   # 2D (Mosaic TPU does not support a rank-3 batched dot); the larger program
   # gives the scheduler independent BF16 dot/vector work to interleave.
@@ -1511,8 +1514,12 @@ def _flash_attention_dkv_kernel(
       def compute_dv():
         dv = lax.dot(p_bf16, do, preferred_element_type=jnp.float32)
         scratch_ref = head_ref(dv_scratch_ref)
-        dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[slice_k, :]
-        scratch_ref[slice_k, :] = dv
+        if config.bwd_dkv_scratch_seq_minor:
+          dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[:, slice_k].T
+          scratch_ref[:, slice_k] = dv.T
+        else:
+          dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[slice_k, :]
+          scratch_ref[slice_k, :] = dv
 
       if not config.bwd_dv_last:
         compute_dv()
@@ -1539,8 +1546,12 @@ def _flash_attention_dkv_kernel(
         if config.softmax_scale is not None and config.bwd_scale_after_dot:
           dk *= jnp.float32(config.softmax_scale)
         scratch_ref = head_ref(dk_scratch_ref)
-        dk = dk.astype(dk_scratch_ref.dtype) + scratch_ref[slice_k, :]
-        scratch_ref[slice_k, :] = dk
+        if config.bwd_dkv_scratch_seq_minor:
+          dk = dk.astype(dk_scratch_ref.dtype) + scratch_ref[:, slice_k].T
+          scratch_ref[:, slice_k] = dk.T
+        else:
+          dk = dk.astype(dk_scratch_ref.dtype) + scratch_ref[slice_k, :]
+          scratch_ref[slice_k, :] = dk
 
       if not config.bwd_dq_first:
         compute_dk()
@@ -1636,8 +1647,13 @@ def _flash_attention_dkv_kernel(
 
     @pl.when(should_write)
     def _():
-      dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
-      dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
+      dk = dk_scratch_ref[...]
+      dv = dv_scratch_ref[...]
+      if config.bwd_dkv_scratch_seq_minor:
+        dk = jnp.swapaxes(dk, -1, -2)
+        dv = jnp.swapaxes(dv, -1, -2)
+      dk_ref[...] = dk.astype(dk_ref.dtype)
+      dv_ref[...] = dv.astype(dv_ref.dtype)
 
   else:
     q_head = pl.program_id(0)
@@ -1645,13 +1661,23 @@ def _flash_attention_dkv_kernel(
 
     @pl.when(jnp.logical_and(should_write, first_q_head_in_kv_group))
     def _():
-      dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
-      dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
+      dk = dk_scratch_ref[...]
+      dv = dv_scratch_ref[...]
+      if config.bwd_dkv_scratch_seq_minor:
+        dk = jnp.swapaxes(dk, -1, -2)
+        dv = jnp.swapaxes(dv, -1, -2)
+      dk_ref[...] = dk.astype(dk_ref.dtype)
+      dv_ref[...] = dv.astype(dv_ref.dtype)
 
     @pl.when(jnp.logical_and(should_write, _not(first_q_head_in_kv_group)))
     def _():
-      dk_ref[...] = dk_alias[...] + dk_scratch_ref[...].astype(dk_ref.dtype)
-      dv_ref[...] = dv_alias[...] + dv_scratch_ref[...].astype(dv_ref.dtype)
+      dk = dk_scratch_ref[...]
+      dv = dv_scratch_ref[...]
+      if config.bwd_dkv_scratch_seq_minor:
+        dk = jnp.swapaxes(dk, -1, -2)
+        dv = jnp.swapaxes(dv, -1, -2)
+      dk_ref[...] = dk_alias[...] + dk.astype(dk_ref.dtype)
+      dv_ref[...] = dv_alias[...] + dv.astype(dv_ref.dtype)
 
 
 def _splash_attention_bwd_dkv(
@@ -1994,15 +2020,31 @@ def _splash_attention_bwd_dkv(
   scratch_shapes = [
       dq_scratch,
       pltpu.VMEM(
-          (bkv, head_dim_qk)
+          (
+              (head_dim_qk, bkv)
+              if config.bwd_dkv_scratch_seq_minor
+              else (bkv, head_dim_qk)
+          )
           if head_group_size == 1
-          else (head_group_size, bkv, head_dim_qk),
+          else (
+              (head_group_size, head_dim_qk, bkv)
+              if config.bwd_dkv_scratch_seq_minor
+              else (head_group_size, bkv, head_dim_qk)
+          ),
           jnp.float32,
       ),
       pltpu.VMEM(
-          (bkv, head_dim_v)
+          (
+              (head_dim_v, bkv)
+              if config.bwd_dkv_scratch_seq_minor
+              else (bkv, head_dim_v)
+          )
           if head_group_size == 1
-          else (head_group_size, bkv, head_dim_v),
+          else (
+              (head_group_size, head_dim_v, bkv)
+              if config.bwd_dkv_scratch_seq_minor
+              else (head_group_size, bkv, head_dim_v)
+          ),
           jnp.float32,
       ),
   ]

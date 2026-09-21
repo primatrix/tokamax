@@ -66,6 +66,7 @@ def _relative_l2(actual, expected):
         {"bwd_head_group_size": 2},
         {"bwd_reuse_bf16_probabilities": True},
         {"bwd_compact_segment_ids": True},
+        {"bwd_dkv_scratch_seq_minor": True},
     ],
     ids=[
         "combined",
@@ -77,6 +78,7 @@ def _relative_l2(actual, expected):
         "head_group_2",
         "reuse_bf16_probabilities",
         "compact_segment_ids",
+        "dkv_scratch_seq_minor",
     ],
 )
 def test_tuning_preserves_segmented_outputs_and_all_gradients(
@@ -124,8 +126,19 @@ def test_tuning_preserves_segmented_outputs_and_all_gradients(
     assert np.isfinite(np.asarray(actual_grad)).all()
     assert _relative_l2(actual_grad, expected_grad) < 0.01
 
-  if extra.get("bwd_compact_segment_ids", False):
-    noncompact = dataclasses.replace(tuned, bwd_compact_segment_ids=False)
+  exact_flag = next(
+      (
+          flag
+          for flag in (
+              "bwd_compact_segment_ids",
+              "bwd_dkv_scratch_seq_minor",
+          )
+          if extra.get(flag, False)
+      ),
+      None,
+  )
+  if exact_flag is not None:
+    noncompact = dataclasses.replace(tuned, **{exact_flag: False})
     noncompact_out, noncompact_pullback = jax.vjp(run(noncompact), q, k, v)
     np.testing.assert_array_equal(actual, noncompact_out)
     for actual_grad, noncompact_grad in zip(
