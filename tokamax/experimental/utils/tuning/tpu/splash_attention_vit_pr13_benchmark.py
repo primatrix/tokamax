@@ -193,6 +193,8 @@ def _parser():
       help="Write an XProf trace after timing the compiled forward/backward.",
   )
   parser.add_argument("--profile-repeats", type=int, default=3)
+  parser.add_argument("--fwd-vmem-limit-mib", type=int, default=60)
+  parser.add_argument("--bwd-vmem-limit-mib", type=int, default=63)
   parser.add_argument("--interpret", action="store_true")
   parser.add_argument("--split-major-segments", action="store_true")
   parser.add_argument("--bwd-dq-contract-ds-axis0", action="store_true")
@@ -246,8 +248,8 @@ def main():
       compact_stats_output=True,
       omit_unused_max_logits=True,
       segment_mask_on_partial_only=True,
-      fwd_vmem_limit_bytes=60 * 1024**2,
-      bwd_vmem_limit_bytes=63 * 1024**2,
+      fwd_vmem_limit_bytes=args.fwd_vmem_limit_mib * 1024**2,
+      bwd_vmem_limit_bytes=args.bwd_vmem_limit_mib * 1024**2,
       bwd_parallel_heads=args.bwd_parallel_heads,
       bwd_scheduler=args.bwd_scheduler,
       bwd_dq_contract_ds_axis0=args.bwd_dq_contract_ds_axis0,
