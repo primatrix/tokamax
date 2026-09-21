@@ -50,8 +50,13 @@ def _relative_l2(actual, expected):
 @pytest.mark.parametrize("fuse_reciprocal", [False, True])
 @pytest.mark.parametrize(
     "extra",
-    [{}, {"compact_softmax_scratch": True}, {"bwd_dv_last": True}],
-    ids=["combined", "compact_scratch", "dv_last"],
+    [
+        {},
+        {"compact_softmax_scratch": True},
+        {"bwd_dv_last": True},
+        {"bwd_dq_contract_ds_axis0": True},
+    ],
+    ids=["combined", "compact_scratch", "dv_last", "dq_contract_axis0"],
 )
 def test_tuning_preserves_segmented_outputs_and_all_gradients(
     fuse_reciprocal, extra

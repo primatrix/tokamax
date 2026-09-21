@@ -44,6 +44,7 @@ NUM_SUBLANES = 8
 # We predefine some useful dimension numbers for dot_general
 NN_DIM_NUMBERS = (((1,), (0,)), ((), ()))  # standard matmul
 NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))  # RHS transposed
+TN_DIM_NUMBERS = (((0,), (0,)), ((), ()))  # LHS transposed
 
 LOG2E = math.log2(math.e)
 LOG2E_INV = 1 / LOG2E
@@ -162,6 +163,7 @@ class SplashConfig:
   bwd_dq_first: bool = False
   bwd_dv_last: bool = False
   bwd_cast_before_transpose: bool = False
+  bwd_dq_contract_ds_axis0: bool = False
   bwd_scale_after_dot: bool = False
   omit_unused_max_logits: bool = False
   compact_stats_output: bool = False
@@ -1485,14 +1487,22 @@ def _flash_attention_dkv_kernel(
     if not config.bwd_dq_first:
       compute_dk()
     if dq_scratch_ref is not None or dq_ref is not None:
-      dq = lax.dot_general(
-          ds.astype(k.dtype).T
-          if config.bwd_cast_before_transpose
-          else ds.T.astype(k.dtype),
-          k,
-          NN_DIM_NUMBERS,
-          preferred_element_type=jnp.float32,
-      )
+      if config.bwd_dq_contract_ds_axis0:
+        dq = lax.dot_general(
+            ds.astype(k.dtype),
+            k,
+            TN_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
+      else:
+        dq = lax.dot_general(
+            ds.astype(k.dtype).T
+            if config.bwd_cast_before_transpose
+            else ds.T.astype(k.dtype),
+            k,
+            NN_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
       if config.softmax_scale is not None and config.bwd_scale_after_dot:
         dq *= jnp.float32(config.softmax_scale)
       if dq_scratch_ref is not None:
