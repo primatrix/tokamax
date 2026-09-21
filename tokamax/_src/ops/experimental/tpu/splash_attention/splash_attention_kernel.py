@@ -167,6 +167,10 @@ class SplashConfig:
   bwd_dq_contract_ds_axis0: bool = False
   bwd_keep_kv_seq_minor: bool = False
   bwd_dp_before_qk: bool = False
+  # Process multiple independent MHA heads in one Pallas program. Dots remain
+  # 2D (Mosaic TPU does not support a rank-3 batched dot); the larger program
+  # gives the scheduler independent BF16 dot/vector work to interleave.
+  bwd_head_group_size: int = 1
   bwd_scale_after_dot: bool = False
   omit_unused_max_logits: bool = False
   compact_stats_output: bool = False
@@ -1347,6 +1351,7 @@ def _flash_attention_dkv_kernel(
   attn_logits_soft_cap = config.attn_logits_soft_cap
   if attn_logits_soft_cap is not None and config.use_base2_exp:
     attn_logits_soft_cap *= LOG2E
+  head_group_size = config.bwd_head_group_size
 
   if active_rows_ref is not None:
     assert bounds_start_ref is not None
@@ -1398,63 +1403,71 @@ def _flash_attention_dkv_kernel(
   def body(i, _, has_partial_mask=False):
 
     slice_k = pl.ds(i * bkv_compute, bkv_compute)
-    q = q_ref[...]  # We keep q potentially transposed, since it's always RHS
-    if config.use_base2_exp and config.softmax_scale is None:
-      scaled_q = q * LOG2E
-    else:
-      scaled_q = q
 
-    def _load_kv(ref, layout):
-      if layout == HEAD_DIM_MINOR:
-        return ref[slice_k, :]
-      value = ref[:, slice_k]
-      return value if config.bwd_keep_kv_seq_minor else value.T
+    def per_head(head_offset):
+      def head(ref):
+        return ref[...] if head_group_size == 1 else ref[head_offset, ...]
 
-    k = _load_kv(k_ref, config.k_layout)
-    v = _load_kv(v_ref, config.v_layout)
-    logsumexp = logsumexp_ref[:1, :]
-    do = do_ref[...]
-    di = di_ref[:1, :]
-
-    dp_dims = (
-        TT_DIM_NUMBERS
-        if config.bwd_keep_kv_seq_minor
-        and config.v_layout == QKVLayout.SEQ_MINOR
-        else NT_DIM_NUMBERS
-    )
-
-    def compute_dp():
-      return lax.dot_general(
-          v,
-          do,
-          dp_dims,
-          preferred_element_type=jnp.float32,
-      )
-
-    dp = compute_dp() if config.bwd_dp_before_qk else None
-
-    if config.bwd_keep_kv_seq_minor and config.k_layout == QKVLayout.SEQ_MINOR:
-      qk_dims = (
-          TT_DIM_NUMBERS
-          if config.q_layout == HEAD_DIM_MINOR
-          else TN_DIM_NUMBERS
-      )
-    else:
-      qk_dims = (
-          NT_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
-      )
-    qk_uncapped = lax.dot_general(
-        k, scaled_q, qk_dims, preferred_element_type=jnp.float32
-    )
-    if config.softmax_scale is not None:
-      if config.use_base2_exp and config.combine_log2_scale:
-        qk_uncapped *= jnp.float32(config.softmax_scale * LOG2E)
+      q = head(q_ref)  # We keep q potentially transposed, since it's always RHS
+      if config.use_base2_exp and config.softmax_scale is None:
+        scaled_q = q * LOG2E
       else:
-        qk_uncapped *= jnp.float32(config.softmax_scale)
-        if config.use_base2_exp:
-          qk_uncapped *= jnp.float32(LOG2E)
+        scaled_q = q
 
-    qk = _apply_mask_and_soft_cap(
+      def _load_kv(ref, layout):
+        ref = head(ref)
+        if layout == HEAD_DIM_MINOR:
+          return ref[slice_k, :]
+        value = ref[:, slice_k]
+        return value if config.bwd_keep_kv_seq_minor else value.T
+
+      k = _load_kv(k_ref, config.k_layout)
+      v = _load_kv(v_ref, config.v_layout)
+      logsumexp = head(logsumexp_ref)[:1, :]
+      do = head(do_ref)
+      di = head(di_ref)[:1, :]
+
+      dp_dims = (
+          TT_DIM_NUMBERS
+          if config.bwd_keep_kv_seq_minor
+          and config.v_layout == QKVLayout.SEQ_MINOR
+          else NT_DIM_NUMBERS
+      )
+
+      def compute_dp():
+        return lax.dot_general(
+            v,
+            do,
+            dp_dims,
+            preferred_element_type=jnp.float32,
+        )
+
+      dp = compute_dp() if config.bwd_dp_before_qk else None
+
+      if config.bwd_keep_kv_seq_minor and config.k_layout == QKVLayout.SEQ_MINOR:
+        qk_dims = (
+            TT_DIM_NUMBERS
+            if config.q_layout == HEAD_DIM_MINOR
+            else TN_DIM_NUMBERS
+        )
+      else:
+        qk_dims = (
+            NT_DIM_NUMBERS
+            if config.q_layout == HEAD_DIM_MINOR
+            else NN_DIM_NUMBERS
+        )
+      qk_uncapped = lax.dot_general(
+          k, scaled_q, qk_dims, preferred_element_type=jnp.float32
+      )
+      if config.softmax_scale is not None:
+        if config.use_base2_exp and config.combine_log2_scale:
+          qk_uncapped *= jnp.float32(config.softmax_scale * LOG2E)
+        else:
+          qk_uncapped *= jnp.float32(config.softmax_scale)
+          if config.use_base2_exp:
+            qk_uncapped *= jnp.float32(LOG2E)
+
+      qk = _apply_mask_and_soft_cap(
         qk_uncapped,
         mask_value,
         mask_ref,
@@ -1473,82 +1486,110 @@ def _flash_attention_dkv_kernel(
         mask_function=mask_function,
         has_partial_mask=has_partial_mask,
     )
-    exp = jnp.exp2 if config.use_base2_exp else jnp.exp
-    p = exp(qk - logsumexp)
+      exp = jnp.exp2 if config.use_base2_exp else jnp.exp
+      p = exp(qk - logsumexp)
 
-    def compute_dv():
-      dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32)
-      dv = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[slice_k, :]
-      dv_scratch_ref[slice_k, :] = dv
-
-    if not config.bwd_dv_last:
-      compute_dv()
-
-    if dp is None:
-      dp = compute_dp()
-    ds = (dp - di) * p
-    if attn_logits_soft_cap is not None:
-      normalized = qk_uncapped / attn_logits_soft_cap
-      d = jnp.tanh(normalized)
-      ds = ds * (1 - d * d)
-    if config.softmax_scale is not None and not config.bwd_scale_after_dot:
-      ds *= jnp.float32(config.softmax_scale)
-
-    def compute_dk():
-      dk_dims = (
-          NN_DIM_NUMBERS
-          if config.q_layout == HEAD_DIM_MINOR
-          else NT_DIM_NUMBERS
-      )
-      dk = lax.dot_general(
-          ds.astype(do.dtype), q, dk_dims, preferred_element_type=jnp.float32
-      )
-      if config.softmax_scale is not None and config.bwd_scale_after_dot:
-        dk *= jnp.float32(config.softmax_scale)
-      dk = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[slice_k, :]
-      dk_scratch_ref[slice_k, :] = dk
-
-    if not config.bwd_dq_first:
-      compute_dk()
-    if dq_scratch_ref is not None or dq_ref is not None:
-      if config.bwd_dq_contract_ds_axis0:
-        dq_dims = (
-            TT_DIM_NUMBERS
-            if config.bwd_keep_kv_seq_minor
-            and config.k_layout == QKVLayout.SEQ_MINOR
-            else TN_DIM_NUMBERS
-        )
-        dq = lax.dot_general(
-            ds.astype(k.dtype),
-            k,
-            dq_dims,
-            preferred_element_type=jnp.float32,
-        )
-      else:
-        dq = lax.dot_general(
-            ds.astype(k.dtype).T
-            if config.bwd_cast_before_transpose
-            else ds.T.astype(k.dtype),
-            k,
-            NN_DIM_NUMBERS,
-            preferred_element_type=jnp.float32,
-        )
-      if config.softmax_scale is not None and config.bwd_scale_after_dot:
-        dq *= jnp.float32(config.softmax_scale)
-      if dq_scratch_ref is not None:
-        # Compute block size != memory block size
-        dq_scratch_ref[...] += dq
-      else:
-        # Compute block size == memory block size
-        if dq_alias is not None:
-          dq_ref[...] = dq_alias[...] + dq.astype(dq_ref.dtype)
+      def compute_dv():
+        dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32)
+        if head_group_size == 1:
+          dv = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[slice_k, :]
+          dv_scratch_ref[slice_k, :] = dv
         else:
-          dq_ref[...] = dq.astype(dq_ref.dtype)
+          dv = (
+              dv.astype(dv_scratch_ref.dtype)
+              + dv_scratch_ref[head_offset, slice_k, :]
+          )
+          dv_scratch_ref[head_offset, slice_k, :] = dv
 
-    if config.bwd_dq_first:
-      compute_dk()
-    if config.bwd_dv_last:
-      compute_dv()
+      if not config.bwd_dv_last:
+        compute_dv()
+
+      if dp is None:
+        dp = compute_dp()
+      ds = (dp - di) * p
+      if attn_logits_soft_cap is not None:
+        normalized = qk_uncapped / attn_logits_soft_cap
+        d = jnp.tanh(normalized)
+        ds = ds * (1 - d * d)
+      if config.softmax_scale is not None and not config.bwd_scale_after_dot:
+        ds *= jnp.float32(config.softmax_scale)
+
+      def compute_dk():
+        dk_dims = (
+            NN_DIM_NUMBERS
+            if config.q_layout == HEAD_DIM_MINOR
+            else NT_DIM_NUMBERS
+        )
+        dk = lax.dot_general(
+            ds.astype(do.dtype), q, dk_dims, preferred_element_type=jnp.float32
+        )
+        if config.softmax_scale is not None and config.bwd_scale_after_dot:
+          dk *= jnp.float32(config.softmax_scale)
+        if head_group_size == 1:
+          dk = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[slice_k, :]
+          dk_scratch_ref[slice_k, :] = dk
+        else:
+          dk = (
+              dk.astype(dk_scratch_ref.dtype)
+              + dk_scratch_ref[head_offset, slice_k, :]
+          )
+          dk_scratch_ref[head_offset, slice_k, :] = dk
+
+      if not config.bwd_dq_first:
+        compute_dk()
+      if dq_scratch_ref is not None or dq_ref is not None:
+        if config.bwd_dq_contract_ds_axis0:
+          dq_dims = (
+              TT_DIM_NUMBERS
+              if config.bwd_keep_kv_seq_minor
+              and config.k_layout == QKVLayout.SEQ_MINOR
+              else TN_DIM_NUMBERS
+          )
+          dq = lax.dot_general(
+              ds.astype(k.dtype),
+              k,
+              dq_dims,
+              preferred_element_type=jnp.float32,
+          )
+        else:
+          dq = lax.dot_general(
+              ds.astype(k.dtype).T
+              if config.bwd_cast_before_transpose
+              else ds.T.astype(k.dtype),
+              k,
+              NN_DIM_NUMBERS,
+              preferred_element_type=jnp.float32,
+          )
+        if config.softmax_scale is not None and config.bwd_scale_after_dot:
+          dq *= jnp.float32(config.softmax_scale)
+        if dq_scratch_ref is not None:
+          # Compute block size != memory block size
+          if head_group_size == 1:
+            dq_scratch_ref[...] += dq
+          else:
+            dq_scratch_ref[head_offset, ...] += dq
+        else:
+          # Compute block size == memory block size
+          if head_group_size == 1:
+            if dq_alias is not None:
+              dq_ref[...] = dq_alias[...] + dq.astype(dq_ref.dtype)
+            else:
+              dq_ref[...] = dq.astype(dq_ref.dtype)
+          else:
+            if dq_alias is not None:
+              dq_ref[head_offset, ...] = (
+                  dq_alias[head_offset, ...] + dq.astype(dq_ref.dtype)
+              )
+            else:
+              dq_ref[head_offset, ...] = dq.astype(dq_ref.dtype)
+
+      if config.bwd_dq_first:
+        compute_dk()
+      if config.bwd_dv_last:
+        compute_dv()
+
+    for head_offset in range(head_group_size):
+      per_head(head_offset)
 
   if dq_scratch_ref is not None:
     dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
@@ -1557,9 +1598,10 @@ def _flash_attention_dkv_kernel(
   else:
     dq_ref[...] = jnp.zeros_like(dq_ref)
 
-  num_iters = (
-      k_ref.shape[0 if config.k_layout is HEAD_DIM_MINOR else 1] // bkv_compute
-  )
+  k_seq_axis = 0 if config.k_layout is HEAD_DIM_MINOR else 1
+  if head_group_size > 1:
+    k_seq_axis += 1
+  num_iters = k_ref.shape[k_seq_axis] // bkv_compute
 
   @pl.when(jnp.logical_and(should_not_mask, should_run))
   def _():
@@ -1653,6 +1695,18 @@ def _splash_attention_bwd_dkv(
   kv_steps = kv_seq_len // bkv
   q_steps = q_seq_len // bq
   q_heads_per_kv_head = num_q_heads // num_kv_heads
+  head_group_size = config.bwd_head_group_size
+  if head_group_size < 1:
+    raise ValueError(f"{head_group_size=} must be positive")
+  if head_group_size > 1:
+    if dynamic_grid or is_mqa or q_heads_per_kv_head != 1:
+      raise NotImplementedError(
+          "Backward head grouping currently supports static-grid MHA only"
+      )
+    if num_q_heads % head_group_size:
+      raise ValueError(
+          f"{num_q_heads=} must be divisible by {head_group_size=}"
+      )
 
   if dynamic_grid:
 
@@ -1673,8 +1727,10 @@ def _splash_attention_bwd_dkv(
       return next_m, 0, 0
 
   else:
-    unravel = lambda f: lambda j, h, i, *_: f(h, i, j)
-    grid = (kv_steps, num_q_heads, q_steps)
+    unravel = (
+        lambda f: lambda j, h, i, *_: f(h * head_group_size, i, j)
+    )
+    grid = (kv_steps, num_q_heads // head_group_size, q_steps)
 
     def mask_index_map(j, h, i, rows_ref, cols_ref, mask_next_ref=None, *_):
       del h, rows_ref, cols_ref  # Unused.
@@ -1698,14 +1754,18 @@ def _splash_attention_bwd_dkv(
   k_index_map = unravel(create_kv_index_map(config.k_layout))
   v_index_map = unravel(create_kv_index_map(config.v_layout))
 
+  head_block = None if head_group_size == 1 else head_group_size
   q_spec = pl.BlockSpec(
-      from_head_minor((None, bq, head_dim_qk), config.q_layout), q_index_map
+      from_head_minor((head_block, bq, head_dim_qk), config.q_layout),
+      q_index_map,
   )
 
-  o_spec = pl.BlockSpec((None, bq, head_dim_v), o_index_map)
+  o_spec = pl.BlockSpec((head_block, bq, head_dim_v), o_index_map)
   k_spec = pl.BlockSpec(
       from_head_minor(
-          (bkv, head_dim_qk) if is_mqa else (None, bkv, head_dim_qk),
+          (bkv, head_dim_qk)
+          if is_mqa
+          else (head_block, bkv, head_dim_qk),
           config.k_layout,
       ),
       k_index_map,
@@ -1713,7 +1773,9 @@ def _splash_attention_bwd_dkv(
 
   v_spec = pl.BlockSpec(
       from_head_minor(
-          (bkv, head_dim_v) if is_mqa else (None, bkv, head_dim_v),
+          (bkv, head_dim_v)
+          if is_mqa
+          else (head_block, bkv, head_dim_v),
           config.v_layout,
       ),
       v_index_map,
@@ -1727,12 +1789,16 @@ def _splash_attention_bwd_dkv(
   dkv_index_map = unravel(create_dkv_index_map)
 
   dk_spec = pl.BlockSpec(
-      (bkv, head_dim_qk) if is_mqa else (None, bkv, head_dim_qk),
+      (bkv, head_dim_qk)
+      if is_mqa
+      else (head_block, bkv, head_dim_qk),
       dkv_index_map,
   )
 
   dv_spec = pl.BlockSpec(
-      (bkv, head_dim_v) if is_mqa else (None, bkv, head_dim_v),
+      (bkv, head_dim_v)
+      if is_mqa
+      else (head_block, bkv, head_dim_v),
       dkv_index_map,
   )
   mask_spec = pl.BlockSpec((None, bkv, bq), mask_index_map)
@@ -1761,12 +1827,16 @@ def _splash_attention_bwd_dkv(
   # TODO: Remove the sublane expansion once Mosaic has all retilings
   logsumexp_shape = (num_q_heads, NUM_SUBLANES, q_seq_len)
   logsumexp = jnp.broadcast_to(jnp.expand_dims(logsumexp, -2), logsumexp_shape)
-  logsumexp_spec = pl.BlockSpec((None, NUM_SUBLANES, bq), logsumexp_index_map)
+  logsumexp_spec = pl.BlockSpec(
+      (head_block, NUM_SUBLANES, bq), logsumexp_index_map
+  )
   assert logsumexp.ndim == len(logsumexp_spec.block_shape)
 
   # TODO: Remove the sublane expansion once Mosaic has all retilings
   di = jnp.broadcast_to(jnp.expand_dims(di, -2), logsumexp_shape)
-  di_spec = pl.BlockSpec((None, NUM_SUBLANES, bq), logsumexp_index_map)
+  di_spec = pl.BlockSpec(
+      (head_block, NUM_SUBLANES, bq), logsumexp_index_map
+  )
   assert di.ndim == len(di_spec.block_shape)
 
   in_specs = [
@@ -1800,13 +1870,17 @@ def _splash_attention_bwd_dkv(
   dq = dq_alias_spec = None
   if dq_reduction_steps == 3:
     dq_index_map = unravel(lambda h, i, j: (j % 3, h, i, 0))
-    dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
+    dq_spec = pl.BlockSpec(
+        (None, head_block, bq, head_dim_qk), dq_index_map
+    )
     dq_alias_spec = dq_spec
     dq_shape = jax.ShapeDtypeStruct((3, *q.shape), q.dtype)
     dq = jnp.zeros_like(dq_shape)
   else:
     dq_index_map = unravel(lambda h, i, j: (j, h, i, 0))
-    dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
+    dq_spec = pl.BlockSpec(
+        (None, head_block, bq, head_dim_qk), dq_index_map
+    )
     # Only accumulate in fp32 if there's a small number of reduction steps.
     q_dtype = q.dtype if kv_steps <= 4 else jnp.float32
     dq_shape = jax.ShapeDtypeStruct((kv_steps, *q.shape), q_dtype)
@@ -1816,7 +1890,12 @@ def _splash_attention_bwd_dkv(
   if bkv == bkv_compute:
     dq_scratch = None
   else:
-    dq_scratch = pltpu.VMEM((bq, head_dim_qk), jnp.float32)
+    dq_scratch = pltpu.VMEM(
+        (bq, head_dim_qk)
+        if head_group_size == 1
+        else (head_group_size, bq, head_dim_qk),
+        jnp.float32,
+    )
 
   if dynamic_grid and q_heads_per_kv_head != 1:
     # in/out aliasing to accumulate within kv groups.
@@ -1901,8 +1980,18 @@ def _splash_attention_bwd_dkv(
 
   scratch_shapes = [
       dq_scratch,
-      pltpu.VMEM((bkv, head_dim_qk), jnp.float32),
-      pltpu.VMEM((bkv, head_dim_v), jnp.float32),
+      pltpu.VMEM(
+          (bkv, head_dim_qk)
+          if head_group_size == 1
+          else (head_group_size, bkv, head_dim_qk),
+          jnp.float32,
+      ),
+      pltpu.VMEM(
+          (bkv, head_dim_v)
+          if head_group_size == 1
+          else (head_group_size, bkv, head_dim_v),
+          jnp.float32,
+      ),
   ]
 
   def _bwd_cost_estimate(

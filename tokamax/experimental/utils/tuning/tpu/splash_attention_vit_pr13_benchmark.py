@@ -192,6 +192,7 @@ def _parser():
   parser.add_argument("--bwd-dq-contract-ds-axis0", action="store_true")
   parser.add_argument("--bwd-keep-kv-seq-minor", action="store_true")
   parser.add_argument("--bwd-dp-before-qk", action="store_true")
+  parser.add_argument("--bwd-head-group-size", type=int, default=1)
   parser.add_argument(
       "--bwd-parallel-heads", action=argparse.BooleanOptionalAction, default=False
   )
@@ -239,6 +240,7 @@ def main():
       bwd_dq_contract_ds_axis0=args.bwd_dq_contract_ds_axis0,
       bwd_keep_kv_seq_minor=args.bwd_keep_kv_seq_minor,
       bwd_dp_before_qk=args.bwd_dp_before_qk,
+      bwd_head_group_size=args.bwd_head_group_size,
       interpret=args.interpret,
   )
   kernel = _make_kernel(ids, config)

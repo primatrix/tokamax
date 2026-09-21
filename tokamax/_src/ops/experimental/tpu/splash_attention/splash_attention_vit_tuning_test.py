@@ -63,6 +63,7 @@ def _relative_l2(actual, expected):
             "v_layout": splash.QKVLayout.SEQ_MINOR,
         },
         {"bwd_dp_before_qk": True},
+        {"bwd_head_group_size": 2},
     ],
     ids=[
         "combined",
@@ -71,14 +72,17 @@ def _relative_l2(actual, expected):
         "dq_contract_axis0",
         "keep_kv_seq_minor",
         "dp_before_qk",
+        "head_group_2",
     ],
 )
 def test_tuning_preserves_segmented_outputs_and_all_gradients(
     fuse_reciprocal, extra
 ):
   keys = jax.random.split(jax.random.key(42), 4)
+  num_heads = 2 if extra.get("bwd_head_group_size", 1) > 1 else 1
   q, k, v, do = [
-      jax.random.normal(key, (1, 256, 128), jnp.bfloat16) for key in keys
+      jax.random.normal(key, (num_heads, 256, 128), jnp.bfloat16)
+      for key in keys
   ]
   q, k = q * 0.25, k * 0.25
   ids = np.repeat(np.array([1, 2], np.int32), [192, 64])
@@ -118,7 +122,7 @@ def test_tuning_preserves_segmented_outputs_and_all_gradients(
   _, expected_stats = run(config, save_residuals=True)(q, k, v)
   for name in ("max_logits", "logsumexp"):
     assert actual_stats[name] is not None
-    assert actual_stats[name].shape == (1, 256)
+    assert actual_stats[name].shape == (num_heads, 256)
     np.testing.assert_allclose(
         actual_stats[name], expected_stats[name], rtol=1e-5, atol=1e-5
     )
