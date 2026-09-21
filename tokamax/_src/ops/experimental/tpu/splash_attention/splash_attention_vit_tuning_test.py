@@ -131,7 +131,8 @@ def test_invalid_trace_mode_rejected():
 @pytest.mark.parametrize("fixed_shift", [False, True])
 @pytest.mark.parametrize("transposed,seqminor", [(False, True), (True, False), (True, True)])
 @pytest.mark.parametrize("v_layout", [splash.QKVLayout.HEAD_DIM_MINOR, splash.QKVLayout.SEQ_MINOR])
-def test_forward_pv_orientation_preserves_head_dim_72(fixed_shift, transposed, seqminor, v_layout):
+@pytest.mark.parametrize("unroll", [True, 4])
+def test_forward_pv_orientation_preserves_head_dim_72(fixed_shift, transposed, seqminor, v_layout, unroll):
   from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
 
   q, k, v, do = [
@@ -154,6 +155,7 @@ def test_forward_pv_orientation_preserves_head_dim_72(fixed_shift, transposed, s
   expected = bench._backward(reference, residuals, do)
   candidate = bench._make_kernel(segments, dataclasses.replace(
       cfg, fwd_pv_transposed_output=transposed, fwd_output_scratch_seq_minor=seqminor,
+      fwd_kv_unroll=unroll,
   ))
   actual_output, actual_residuals = bench._forward(candidate, q, k, v, segments)
   actual = bench._backward(reference, actual_residuals, do)

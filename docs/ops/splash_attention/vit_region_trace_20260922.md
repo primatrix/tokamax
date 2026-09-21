@@ -155,10 +155,12 @@ loops. The device module is 48.147 ms, versus 48.403 ms in the previous capture;
 the roughly 0.27 ms difference is outside the loop and is consistent with
 avoiding the dO layout copy, not improving internal MXU/vector overlap.
 
-The stage-mapped final-LLO audit `an-70ah1z3gru` finds 10240 of 13824 static
-`llo.vxpose` occurrences in the dQ scope for the exact-layout baseline. These
-include both mask branches and are **not dynamic instruction counts or a
-latency fraction**. They motivate a separate opt-in `bwd_dq_transposed_output`
+The stage-mapped final-LLO audit `an-70ah1z3gru` assigns 10240 of 13824 static
+transpose-family matches to the dQ scope for the exact-layout baseline. That
+early parser normalizes `llo.vxpose` and its result-readout operation into one
+family; these are not 13824 independent transpose instructions. They also
+include both mask branches and are **not dynamic counts or a latency
+fraction**. They motivate a separate opt-in `bwd_dq_transposed_output`
 trial: compute `dQ.T = K.T @ dS`, then accumulate in the existing sequence-minor
 scratch, rather than forming the large dS transpose for `dQ = dS.T @ K`.
 The reference check disables only this orientation change, retaining the same
@@ -480,3 +482,158 @@ useful experiment must reduce live ranges or layout work while retaining the
 effective unrolling schedule, rather than assuming that a larger carried
 tile will create useful overlap. Arithmetic changes remain subject to
 separate numerical review; CPU equality alone cannot certify TPU behavior.
+
+## Revisit dQ orientation with complete scheduling controls
+
+Commit `f6d44aa` restores default-off `bwd_dq_transposed_output` for a diagnostic
+screen that records numerical errors and timings even when the bitwise check
+does not pass. This is not promotion of the earlier rejected candidate, nor a
+relaxation of accuracy requirements. The original attempt stopped before
+timing and could not establish whether this direction was worth investigating.
+The source/CPU suite now has 77 passing kernel tests, including head width 72.
+
+`exp-9tk3m3tvck`, artifact `art-9vgcbvvihf`, uses the same production shape,
+runtime and 20-sample method, with unchanged forward residuals. The critical
+matched controls are:
+
+| Variant | Backward ms | Live PR13 ms | Precision versus PR13 |
+| --- | ---: | ---: | --- |
+| Layouts only, dQ first | 49.322 | 49.926 | Bitwise |
+| Layouts only, dK first | 49.735 | 49.973 | Bitwise |
+| Transposed dQ, dQ first | 58.044 | 50.246 | dQ/dV non-bitwise |
+| Transposed dQ, dK first | 44.999 | 49.817 | Only dQ non-bitwise |
+
+The last candidate is a screening speedup of 1.1071x, not the 20–30% target.
+It differs in 303 of 75,497,472 dQ elements; dQ relative L2 is `6.34282e-6`
+and maximum absolute difference `1.22070e-4`. dK/dV are bitwise and all values
+finite. Candidate precision remains under review. Plain transposed dQ also
+changes 5721 dV values (relative L2 `1.49402e-5`) and is slower.
+
+Other controls: moving dV last without transposition is 51.291 ms; moving dP
+early without transposition is 57.828 ms. Transposition with dV last or dP
+early measures 48.174 or 47.896 ms; scheduler and single-mask-body variants
+remain about 57.8 ms. Thus transposition alone is insufficient; the order of
+consuming dS is consequential for the compiled schedule.
+
+The coarse device evidence corroborates an internal-loop improvement:
+
+| Profile | Device module ms | KV loops ms | Uncovered internal ms |
+| --- | ---: | ---: | ---: |
+| Layouts only | 48.150 | 46.706 | 0.197 |
+| Transposed dQ, dQ first | 56.638 | 55.186 | 0.203 |
+| Transposed dQ, dK first | 43.917 | 42.475 | 0.198 |
+
+All captures have only 3 TCS Any2IMEM descriptors / 79872 bytes. Final-body
+static `llo.vxpose` counts fall from 6912 to 3968 (counting result readout
+separately); `llo.vmatmul.mubr` counts fall from 10240 to 8832. The two
+transposed orderings have the same instruction counts despite their large
+runtime difference, so operation-count savings alone do not explain success.
+
+Hardware issued-instruction counters strengthen the compiler-body evidence.
+Across three calls, the summed DIE0 BF16 VREG matmul count on MXU0+MXU1 drops
+from 62,914,560 to 54,263,808 (13.75% fewer) for either transposed ordering.
+Per-XLU transpose counts drop from 18,788,352 to 8,368,128. These are dynamic
+instruction counts, not cycle utilization or time fractions. The dK-first
+ordering distributes matmul issues 28,311,552 / 25,952,256 across MXU0/1;
+dQ-first distributes them evenly at 27,131,904 each, yet is slower.
+
+Evidence: detailed metrics `an-nupwjcci8e`, device/counter/final-LLO audit
+`an-m9z2g48d7n`, operator `an-tj5xy698y4`, LLO inventory `an-0aq7is1i9u`.
+
+## Independent numerical reference
+
+Commit `7945d86` adds an untimed FP32 attention/gradient oracle for selected
+full-length heads. It uses all keys per query chunk, FP32 softmax and gradient
+arithmetic, and highest-precision XLA matmuls. It does not reuse Splash's
+forward residuals, BF16 probability casts, or custom backward. Natural-log
+LSE is compared after converting Splash's base-2 residual statistic.
+
+Seven tests validate the oracle against independent dense FP64 autodiff at
+head width 72, two query block sizes, and input scales 0.25/1/2, including
+segment 0. Backward and forward CLI smoke tests also complete at sequence 512.
+Together with the kernel tests, 84 tests pass. These tests validate the
+reference implementation, not production-shape TPU numerical acceptance.
+`--oracle-heads` records both baseline and candidate error against this oracle;
+it deliberately does not change `needs_accuracy_review` to acceptance.
+
+### TPU oracle failure and stage-isolation diagnostic
+
+`exp-9giz2uwx42` (`5077115`, 30 samples) repeats transposed-dQ/dK-first at
+45.264 ms versus live PR13 50.048 ms (1.1057x). The dQ mismatch statistics
+repeat exactly; dK/dV remain bitwise. The other unroll candidates in this
+screen retain **dQ-first**, so their negative results do not test unrolling
+on the fast dK-first schedule. Single-body unroll-2/4 gives 51.249/52.718 ms;
+ordinary unroll-2/4 gives 66.875/58.949 ms. Unroll-2 has 65.525 ms device
+duration but only 48.691 ms in KV loops; the single-body version recovers
+50.156 ms device duration with 48.707 ms loops.
+
+The independent FP32 reference is invalid in this run: its dQ/dK are
+nonfinite on all four sampled heads. Baseline/candidate gradients themselves
+are finite. Do not use the NaN error fields as precision acceptance.
+Evidence: details `an-0ok99or7wa`, regions `an-28mp6gz5bg`, operator
+`an-pjn1f3dxnn`, LLO `an-yayxcwarct`.
+
+`exp-0yldvlqyf6` (`7006fa7`, artifact `art-dc9q50pz61`) isolates the reference
+on one full-length head with identical seed-27 input generation:
+
+| Reference | Nonfinite O | Nonfinite dQ | Nonfinite dK | LSE / dV |
+| --- | ---: | ---: | ---: | --- |
+| Original, negative-infinity mask | 1,179,648 | 1,179,648 | 2,359,296 | Finite |
+| Finite mask (-1e30) | 0 | 0 | 0 | Finite |
+| Negative-infinity mask + stage barriers | 0 | 0 | 0 | Finite |
+| Finite mask + stage barriers | 0 | 0 | 0 | Finite |
+
+The original O/dQ failures begin at query row 16384. Barriers preserve the
+equations, dtypes, and infinite mask; the result implicates compiled fusion,
+but does not identify the exact failing compiler transformation. Do not
+claim that finite values alone establish numerical correctness. A strict
+finite check now rejects invalid references before benchmarking. Commit
+`28a157b` enables barriers by default and adds independent CPU/NumPy FP64
+reference validation on the exact TPU-generated full head. That full-head
+cross-check is pending in `exp-r3ryu5qvp6` at this point. Local validation is
+127 passing tests, including the twelve dK/dV orientation cases; the 26
+oracle tests also validate NumPy against dense FP64 autodiff.
+
+Oracle-health analyses: details `an-0y7ukdkw0a`, operator `an-gxgj72824k`.
+
+## Forward PV orientation: instruction-loading regression
+
+`exp-spb936izpj` (`60b8750`, artifact `art-m57a7l9w2v`) transposes the PV
+contraction without casting FP32 probabilities to BF16. Output scratch
+orientation is independently controlled. Defaults remain unchanged.
+
+| Variant | Forward ms | Live PR13 ms | Precision versus PR13 |
+| --- | ---: | ---: | --- |
+| PR13 control | 21.036 | 21.386 | Bitwise |
+| Sequence-minor output scratch | 91.288 | 20.968 | Bitwise |
+| PV transposed | 91.989 | 20.695 | Bitwise |
+| Both | 118.143 | 21.050 | Bitwise |
+| Both, Q512 | 91.974 | 21.299 | Bitwise |
+| Both, Q2048 | 83.430 | 20.834 | Bitwise |
+| Both, compute KV512 | 33.199 | 20.621 | Needs review |
+| Both, experimental scheduler | 117.676 | 20.919 | Bitwise |
+
+The bitwise checks include output, LSE, dQ, dK, and dV on the full shape.
+This is a negative screen, not a retained optimization.
+
+| Capture | Device ms | KV-loop ms | Internal uncovered ms | TCS IMEM bytes, 3 calls |
+| --- | ---: | ---: | ---: | ---: |
+| PR13 | 20.071 | 18.687 | 0.429 | 79,872 |
+| PV transposed | 90.649 | 50.729 | 38.915 | 26,830,094,848 |
+| Both | 116.773 | 70.034 | 45.617 | 36,116,313,600 |
+
+TCS Any2IMEM descriptor counts are 3 / 36,335 / 36,882. This corroborates an
+instruction-loading problem in addition to slower inner loops. No positive-
+duration TC Overlay events were decoded, so the byte counters and scope
+gaps are evidence, not a precise overlay-time decomposition.
+
+Final forward-body `llo.vmatmul.mubr` counts fall from 12,288 (initial
+reference compile) to 5,376 for the transposed variants, but `llo.vxpose`
+counts rise from 4,224 to 12,416 / 28,928. Sequence-minor scratch alone raises
+transposes to 20,736 without changing MXU matmul counts. These static counts
+show why reduced dot issue work does not imply a faster complete kernel.
+Partial-unroll controls are needed to separate code expansion from the
+underlying PV schedule before closing this direction.
+
+Evidence: details `an-6924vtlmtq`, regions/counters/final-LLO `an-915yfg2e51`,
+operator `an-6s2a2bppgp`, LLO `an-8t7snn4y9r`.
