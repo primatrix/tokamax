@@ -251,7 +251,7 @@ def test_forward_kvmajor_probabilities(unroll, q_block, reference_sum_axis):
 
 @pytest.mark.parametrize("unroll", [True, 4])
 @pytest.mark.parametrize("q_block", [128, 256])
-def test_forward_fused_normalizer_against_fp64(unroll, q_block):
+def test_forward_fused_normalizer_against_fp64(unroll, q_block, monkeypatch):
   from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
   from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_accuracy as accuracy
 
@@ -269,11 +269,24 @@ def test_forward_fused_normalizer_against_fp64(unroll, q_block):
   ref = bench._make_kernel(segments, cfg)
   output, res = bench._forward(ref, q, k, v, segments)
   grads = bench._backward(ref, res, do)
+  # Interpret mode cannot reproduce TPU's default matmul approximation.
+  # Separately guard the contraction request; TPU oracle checks remain required.
+  original_dot = splash.lax.dot_general
+  normalizer_precisions = []
+
+  def record_dot(lhs, rhs, *args, **kwargs):
+    if lhs.shape == (80, 128) and rhs.dtype == jnp.float32:
+      normalizer_precisions.append(kwargs.get("precision"))
+    return original_dot(lhs, rhs, *args, **kwargs)
+
+  monkeypatch.setattr(splash.lax, "dot_general", record_dot)
   candidate = bench._make_kernel(segments, dataclasses.replace(
       cfg, fwd_kvmajor_probabilities=True, fwd_kvmajor_fuse_normalizer=True,
       compact_softmax_scratch=True, fwd_output_scratch_seq_minor=True, fwd_kv_unroll=unroll,
   ))
   actual_output, actual_res = bench._forward(candidate, q, k, v, segments)
+  assert normalizer_precisions
+  assert all(p == splash.lax.Precision.HIGHEST for p in normalizer_precisions)
   actual_grads = bench._backward(ref, actual_res, do)
   oracle = accuracy.numpy_attention_and_gradients(q[0], k[0], v[0], do[0], ids, ids)
   for value, expected, fp64 in zip(

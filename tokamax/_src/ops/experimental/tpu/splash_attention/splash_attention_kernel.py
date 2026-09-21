@@ -227,7 +227,8 @@ class SplashConfig:
   # This does not guarantee identical lowering or floating-point association.
   fwd_kvmajor_sum_in_qmajor: bool = False
   # Diagnostic: append constant-one rows to V so PV also computes sum(P).
-  # P remains FP32; the normalization reduction's rounding can change.
+  # Requires HIGHEST contraction precision, not just an FP32 P array: the
+  # default TPU matmul approximation is not accurate enough for the denominator.
   fwd_kvmajor_fuse_normalizer: bool = False
   fwd_kv_unroll: bool | int = True
   # Fixed-logit-shift ViT diagnostic: QK/exp for i before PV/accum for i-1.
@@ -589,7 +590,14 @@ def flash_attention_kernel(
             (values, jnp.ones((NUM_SUBLANES, bkv_compute), values.dtype)),
             axis=0,
         )
-      output_t = lax.dot_general(values, probabilities, NN_DIM_NUMBERS)
+      output_t = lax.dot_general(
+          values, probabilities, NN_DIM_NUMBERS,
+          preferred_element_type=jnp.float32,
+          precision=(
+              lax.Precision.HIGHEST
+              if config.fwd_kvmajor_fuse_normalizer else None
+          ),
+      )
     with _attention_scope(config, "splash_fwd_output_accum"):
       if config.fwd_kvmajor_fuse_normalizer:
         o_scratch_ref[...] += output_t[:head_dim_v, :]

@@ -867,3 +867,49 @@ candidate as its starting point and varies dV position and dP preparation.
 Forward tiling controls also include reduced KV memory blocks and partial
 unrolling, so a larger Q tile can be tested without simultaneously expanding
 the fully-unrolled body. No additional TPU gain is claimed yet.
+
+## Fused normalizer: default contraction fails TPU accuracy
+
+`exp-b511scebng` (`fdb6cef`, artifact `art-imuncig1o3`) completed. Native
+Q2048/4096/8192 take 21.465 / 32.507 / 27.568 ms. Fused normalization takes
+26.370 ms at Q1024, 20.816 ms at Q2048, 31.251 ms at Q4096, and 26.858 ms
+at Q8192. Q4096 with unroll 8 reaches 19.342 ms versus live PR13 21.281 ms,
+but **this is rejected, not a usable optimization**, because the denominator
+does not preserve FP32-reduction accuracy on TPU.
+
+For fused Q2048, output/dQ/dK/dV relative L2 differences from PR13 are
+0.0010281 / 0.0018805 / 0.0017851 / 0.0015005. Stored base-2 LSE differs in
+1,027,851 of 1,048,576 elements, max absolute 0.00309324. Against independent
+FP32 reference heads, the worst natural-LSE L2-error ratio is 53.4589x and
+max-absolute-error ratio 855.75x. Gradient L2-error ratios are 1.03724x (dQ),
+1.05213x (dK), 1.04360x (dV); worst max-absolute ratios reach 1.03867x,
+1.21562x, 1.33895x. The 19.342 ms variant has essentially the same regression.
+Passing CPU interpret tests did not catch this TPU contraction behavior.
+
+Local JAX 0.11 Mosaic lowering leaves the contraction precision attribute
+unset for DEFAULT, while HIGHEST requests `#tpu.contract_precision<fp32>`.
+An FP32 P array alone does not enforce the latter. The corrected probe now
+explicitly requests HIGHEST for the fused output/denominator contraction;
+the original separate vector reduction and non-fused PV are unchanged.
+Its CPU suite passes 176 tests (128.09 seconds), plus four focused tests
+assert that the denominator dot explicitly requests HIGHEST. TPU accuracy
+and speed still require a new source-pinned run.
+
+Coarse trace confirms an independent code-footprint regression at Q4096:
+
+| Variant | Device ms | KV loops ms | Internal uncovered ms | IMEM bytes, three calls |
+| --- | ---: | ---: | ---: | ---: |
+| PR13 | 20.074 | 18.687 | 0.428 | 79,872 |
+| Native Q2048 | 20.469 | 18.706 | 0.209 | 14,006,784 |
+| Native Q4096 | 31.308 | 17.926 | 11.809 | 9,976,869,888 |
+| Rejected fused Q2048 | 19.615 | 17.851 | 0.210 | 13,337,088 |
+| Rejected fused Q4096 | 29.823 | 16.510 | 11.743 | 9,702,053,376 |
+
+Q4096 has 9,714 instruction-load descriptors, versus 12 at Q2048 and 3 for
+PR13. Native/fused versions have identical final-body matmul/transpose
+counts at matched tiles; fusion removed vector reduction work, not dot
+count. The corrected next experiment controls contraction accuracy and code
+footprint separately. These captures do not measure fine-grained overlap.
+
+Evidence: details `an-olchn8c8oh`, regions/final-LLO `an-akbm0kgcz0`,
+operator `an-mup5nz5vi2`, LLO `an-wy9n9h3iux`.
