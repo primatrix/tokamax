@@ -218,6 +218,7 @@ def main():
       k_layout=splash.QKVLayout.SEQ_MINOR,
       v_layout=splash.QKVLayout.SEQ_MINOR,
       softmax_scale=args.head_dim**-0.5,
+      max_logit_const=0.0,
       use_base2_exp=False,
       bwd_kv_unroll=False,
       bwd_dq_first=True,
