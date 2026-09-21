@@ -158,6 +158,50 @@ def test_qmajor_probabilities_preserve_asymmetric_tiles(dq_transposed, order):
     np.testing.assert_array_equal(value, wanted)
 
 
+@pytest.mark.parametrize("layout", ["reference", "transposed", "qmajor"])
+@pytest.mark.parametrize("dq_first", [False, True])
+@pytest.mark.parametrize("dp_early", [False, True])
+def test_dv_between_gradient_consumers(layout, dq_first, dp_early):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
+
+  q, k, v, do = [jax.random.normal(key, (1, 512, 72), jnp.bfloat16)
+                 for key in jax.random.split(jax.random.key(27), 4)]
+  ids = jnp.asarray(np.repeat(np.array([1, 2, 3, 0], np.int32), [256, 240, 8, 8]))
+  segments = base.SegmentIds(ids, ids)
+  cfg = splash.SplashConfig(
+      block_q=128, block_kv=256, block_kv_compute=128,
+      block_q_dkv=256, block_kv_dkv=256, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR, k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR, softmax_scale=72**-0.5,
+      use_base2_exp=True, max_logit_const=0.0,
+      bwd_dq_scratch_seq_minor=True, bwd_dkv_scratch_seq_minor=True,
+      bwd_dkv_output_seq_minor=True, bwd_do_seq_minor=True,
+      bwd_fuse_segment_id_inputs=True, interpret=True, **_TUNING,
+  )
+  reference = bench._make_kernel(segments, cfg)
+  _, residuals = bench._forward(reference, q, k, v, segments)
+  expected = bench._backward(reference, residuals, do)
+  candidate = bench._make_kernel(segments, dataclasses.replace(
+      cfg, bwd_dq_transposed_output=True,
+      bwd_dq_first=dq_first, bwd_dp_before_qk=dp_early,
+      bwd_dv_between_dq_dk=True,
+      bwd_dk_transposed_output=layout == "transposed",
+      bwd_dv_transposed_output=layout == "transposed",
+      bwd_qmajor_probabilities=layout == "qmajor",
+  ))
+  for value, wanted in zip(bench._backward(candidate, residuals, do), expected):
+    assert np.isfinite(np.asarray(value)).all()
+    np.testing.assert_array_equal(value, wanted)
+
+
+def test_conflicting_dv_order_rejected():
+  with pytest.raises(ValueError, match="dV cannot be both"):
+    splash.SplashConfig(
+        block_q=128, block_kv=128,
+        bwd_dv_last=True, bwd_dv_between_dq_dk=True,
+    )
+
+
 @pytest.mark.parametrize("unroll", [True, 2, 4])
 @pytest.mark.parametrize("q_block", [128, 256])
 @pytest.mark.parametrize("reference_sum_axis", [False, True])

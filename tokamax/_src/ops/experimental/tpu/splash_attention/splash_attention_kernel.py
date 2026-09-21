@@ -171,6 +171,8 @@ class SplashConfig:
   bwd_staged_kv_pipeline: bool = False
   bwd_dq_first: bool = False
   bwd_dv_last: bool = False
+  # Complete the gradient-consumer ordering screen without changing dots.
+  bwd_dv_between_dq_dk: bool = False
   bwd_cast_before_transpose: bool = False
   bwd_dq_contract_ds_axis0: bool = False
   # Diagnostic: produce dQ.T directly, avoiding the large dS transpose.
@@ -250,6 +252,8 @@ class SplashConfig:
   def __post_init__(self):
     if self.region_trace_mode not in ("none", "coarse", "fine"):
       raise ValueError(f"Invalid region_trace_mode: {self.region_trace_mode}")
+    if self.bwd_dv_between_dq_dk and self.bwd_dv_last:
+      raise ValueError("dV cannot be both between dQ/dK and last")
     if self.block_kv_compute is None:
       object.__setattr__(self, "block_kv_compute", self.block_kv)
     if self.block_kv_dkv_compute is None:
@@ -1681,6 +1685,7 @@ def _flash_attention_dkv_kernel(
         and not config.bwd_dv_transposed_output
         and not config.bwd_qmajor_probabilities
         and not config.bwd_dv_last
+        and not config.bwd_dv_between_dq_dk
         and not config.bwd_reuse_bf16_probabilities
         and config.use_base2_exp
         and config.combine_log2_scale
@@ -1791,7 +1796,7 @@ def _flash_attention_dkv_kernel(
         dv_t = lax.dot_general(do, p_bf16, NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
         dv_scratch_ref[:, window] += dv_t.astype(dv_scratch_ref.dtype)
 
-    if not config.bwd_dv_last:
+    if not config.bwd_dv_last and not config.bwd_dv_between_dq_dk:
       compute_dv()
     with _attention_scope(config, "splash_bwd_softmax_grad"):
       if dp is None:
@@ -1806,6 +1811,8 @@ def _flash_attention_dkv_kernel(
 
     if not config.bwd_dq_first:
       compute_dk()
+      if config.bwd_dv_between_dq_dk:
+        compute_dv()
     with _attention_scope(config, "splash_bwd_dq_mxu_accum"):
       if config.bwd_dq_transposed_output:
         dq_t = lax.dot_general(k, ds, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
@@ -1814,6 +1821,8 @@ def _flash_attention_dkv_kernel(
       dq_t *= jnp.float32(config.softmax_scale)
       dq_scratch_ref[...] += dq_t
     if config.bwd_dq_first:
+      if config.bwd_dv_between_dq_dk:
+        compute_dv()
       compute_dk()
     if config.bwd_dv_last:
       compute_dv()
@@ -1947,7 +1956,7 @@ def _flash_attention_dkv_kernel(
             dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[slice_k, :]
             scratch_ref[slice_k, :] = dv
 
-      if not config.bwd_dv_last:
+      if not config.bwd_dv_last and not config.bwd_dv_between_dq_dk:
         compute_dv()
 
       with _attention_scope(config, "splash_bwd_softmax_grad"):
@@ -1993,6 +2002,8 @@ def _flash_attention_dkv_kernel(
 
       if not config.bwd_dq_first:
         compute_dk()
+        if config.bwd_dv_between_dq_dk:
+          compute_dv()
       if dq_scratch_ref is not None or dq_ref is not None:
         with _attention_scope(config, "splash_bwd_dq_mxu_accum"):
           if config.bwd_dq_transposed_output:
@@ -2058,6 +2069,8 @@ def _flash_attention_dkv_kernel(
                 dq_out_ref[...] = dq.astype(dq_ref.dtype)
 
       if config.bwd_dq_first:
+        if config.bwd_dv_between_dq_dk:
+          compute_dv()
         compute_dk()
       if config.bwd_dv_last:
         compute_dv()

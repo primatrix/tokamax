@@ -851,3 +851,19 @@ are required. Larger Q2048/4096/8192 tiles independently test amortization.
 No speedup or TPU numerical acceptance is claimed before those runs finish.
 The combined CPU kernel/oracle suite with four new fused-normalizer tests
 passes **163 tests** (118.07 seconds).
+
+### Completing gradient-consumer ordering controls
+
+An additional default-off `bwd_dv_between_dq_dk` control allows dV between
+dK/dQ, instead of only before or after both. This completes all six consumer
+orders without altering dot operands, accumulation dtypes, or residuals.
+The staged pipeline rejects this unsupported combination; contradictory
+middle/last options fail configuration validation. Twelve new CPU cases
+cover both dQ/dK orders, early/late dP, and original/transposed/Q-major
+layouts. With the invalid-option test, **176 tests pass** (124.34 seconds).
+
+The next backward screen uses the existing fast transposed-dQ/dK-first
+candidate as its starting point and varies dV position and dP preparation.
+Forward tiling controls also include reduced KV memory blocks and partial
+unrolling, so a larger Q tile can be tested without simultaneously expanding
+the fully-unrolled body. No additional TPU gain is claimed yet.
