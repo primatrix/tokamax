@@ -118,6 +118,10 @@ are loop -> next loop (0.232 ms across the full/partial combinations) and
 output -> initialization (0.192 ms). Backward dQ output -> next initialization
 totals 0.148 ms; dK/dV output -> initialization totals 0.049 ms.
 
+In the coarse capture the generic XLA `net-router-barrier` event spans the
+forward kernel, just as `sf-local-wait` spans backward. Neither event label
+alone establishes network communication or device idleness.
+
 Therefore outer tile transitions/output boundaries are not the main exposed
 latency in this configuration. This **does not mean inner-loop MXU/vector
 overlap is perfect**: nearly all of that work is inside a coarse loop region.
@@ -135,6 +139,30 @@ its backward BlockSpec is head-dimension-minor. The opt-in `bwd_do_seq_minor`
 trial feeds `[head_dim, Q]` directly to equivalent dP/dV contractions. It keeps
 the arithmetic/dtypes and all tiling unchanged. Accept this only after an
 on-TPU bitwise gradient check and a same-config timing comparison.
+
+### dO layout result
+
+`exp-p9hpmj75rg` (source `99cc365`, artifact `art-xx9fh7kcjj`) passed the full
+production-shape on-TPU bitwise checks for dQ, dK and dV; all are finite. The
+same-process reference backward median is 49.941 ms and the sequence-minor dO
+median is 49.672 ms (20 samples each), only about 0.5% apart. This is not a
+meaningful progress claim toward the 40–50% goal; the option remains disabled
+by default. Evidence: `an-8874gr5eti/evidence.json`, operator analysis
+`an-jixi3p0um6`, region analysis `an-l9f02389hp`.
+
+The coarse loop span is essentially unchanged: 46.705 ms inside backward KV
+loops. The device module is 48.147 ms, versus 48.403 ms in the previous capture;
+the roughly 0.27 ms difference is outside the loop and is consistent with
+avoiding the dO layout copy, not improving internal MXU/vector overlap.
+
+The stage-mapped final-LLO audit `an-70ah1z3gru` finds 10240 of 13824 static
+`llo.vxpose` occurrences in the dQ scope for the exact-layout baseline. These
+include both mask branches and are **not dynamic instruction counts or a
+latency fraction**. They motivate a separate opt-in `bwd_dq_transposed_output`
+trial: compute `dQ.T = K.T @ dS`, then accumulate in the existing sequence-minor
+scratch, rather than forming the large dS transpose for `dQ = dS.T @ K`.
+The reference check disables only this orientation change, retaining the same
+other tuning/layout flags.
 
 ## Validation and next decision
 
