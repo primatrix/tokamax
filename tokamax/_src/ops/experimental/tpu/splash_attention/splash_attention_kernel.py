@@ -45,6 +45,7 @@ NUM_SUBLANES = 8
 NN_DIM_NUMBERS = (((1,), (0,)), ((), ()))  # standard matmul
 NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))  # RHS transposed
 TN_DIM_NUMBERS = (((0,), (0,)), ((), ()))  # LHS transposed
+TT_DIM_NUMBERS = (((0,), (1,)), ((), ()))  # Both operands transposed
 
 LOG2E = math.log2(math.e)
 LOG2E_INV = 1 / LOG2E
@@ -164,6 +165,7 @@ class SplashConfig:
   bwd_dv_last: bool = False
   bwd_cast_before_transpose: bool = False
   bwd_dq_contract_ds_axis0: bool = False
+  bwd_keep_kv_seq_minor: bool = False
   bwd_scale_after_dot: bool = False
   omit_unused_max_logits: bool = False
   compact_stats_output: bool = False
@@ -1404,7 +1406,8 @@ def _flash_attention_dkv_kernel(
     def _load_kv(ref, layout):
       if layout == HEAD_DIM_MINOR:
         return ref[slice_k, :]
-      return ref[:, slice_k].T
+      value = ref[:, slice_k]
+      return value if config.bwd_keep_kv_seq_minor else value.T
 
     k = _load_kv(k_ref, config.k_layout)
     v = _load_kv(v_ref, config.v_layout)
@@ -1412,9 +1415,16 @@ def _flash_attention_dkv_kernel(
     do = do_ref[...]
     di = di_ref[:1, :]
 
-    qk_dims = (
-        NT_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
-    )
+    if config.bwd_keep_kv_seq_minor and config.k_layout == QKVLayout.SEQ_MINOR:
+      qk_dims = (
+          TT_DIM_NUMBERS
+          if config.q_layout == HEAD_DIM_MINOR
+          else TN_DIM_NUMBERS
+      )
+    else:
+      qk_dims = (
+          NT_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
+      )
     qk_uncapped = lax.dot_general(
         k, scaled_q, qk_dims, preferred_element_type=jnp.float32
     )
@@ -1456,10 +1466,16 @@ def _flash_attention_dkv_kernel(
     if not config.bwd_dv_last:
       compute_dv()
 
+    dp_dims = (
+        TT_DIM_NUMBERS
+        if config.bwd_keep_kv_seq_minor
+        and config.v_layout == QKVLayout.SEQ_MINOR
+        else NT_DIM_NUMBERS
+    )
     dp = lax.dot_general(
         v,
         do,
-        NT_DIM_NUMBERS,
+        dp_dims,
         preferred_element_type=jnp.float32,
     )
     ds = (dp - di) * p
@@ -1488,10 +1504,16 @@ def _flash_attention_dkv_kernel(
       compute_dk()
     if dq_scratch_ref is not None or dq_ref is not None:
       if config.bwd_dq_contract_ds_axis0:
+        dq_dims = (
+            TT_DIM_NUMBERS
+            if config.bwd_keep_kv_seq_minor
+            and config.k_layout == QKVLayout.SEQ_MINOR
+            else TN_DIM_NUMBERS
+        )
         dq = lax.dot_general(
             ds.astype(k.dtype),
             k,
-            TN_DIM_NUMBERS,
+            dq_dims,
             preferred_element_type=jnp.float32,
         )
       else:

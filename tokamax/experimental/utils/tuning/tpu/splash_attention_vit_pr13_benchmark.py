@@ -190,6 +190,7 @@ def _parser():
   parser.add_argument("--interpret", action="store_true")
   parser.add_argument("--split-major-segments", action="store_true")
   parser.add_argument("--bwd-dq-contract-ds-axis0", action="store_true")
+  parser.add_argument("--bwd-keep-kv-seq-minor", action="store_true")
   parser.add_argument(
       "--bwd-parallel-heads", action=argparse.BooleanOptionalAction, default=False
   )
@@ -235,6 +236,7 @@ def main():
       bwd_parallel_heads=args.bwd_parallel_heads,
       bwd_scheduler=args.bwd_scheduler,
       bwd_dq_contract_ds_axis0=args.bwd_dq_contract_ds_axis0,
+      bwd_keep_kv_seq_minor=args.bwd_keep_kv_seq_minor,
       interpret=args.interpret,
   )
   kernel = _make_kernel(ids, config)

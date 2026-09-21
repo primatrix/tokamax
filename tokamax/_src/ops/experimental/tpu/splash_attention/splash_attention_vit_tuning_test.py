@@ -55,8 +55,21 @@ def _relative_l2(actual, expected):
         {"compact_softmax_scratch": True},
         {"bwd_dv_last": True},
         {"bwd_dq_contract_ds_axis0": True},
+        {
+            "bwd_dq_contract_ds_axis0": True,
+            "bwd_keep_kv_seq_minor": True,
+            "q_layout": splash.QKVLayout.SEQ_MINOR,
+            "k_layout": splash.QKVLayout.SEQ_MINOR,
+            "v_layout": splash.QKVLayout.SEQ_MINOR,
+        },
     ],
-    ids=["combined", "compact_scratch", "dv_last", "dq_contract_axis0"],
+    ids=[
+        "combined",
+        "compact_scratch",
+        "dv_last",
+        "dq_contract_axis0",
+        "keep_kv_seq_minor",
+    ],
 )
 def test_tuning_preserves_segmented_outputs_and_all_gradients(
     fuse_reciprocal, extra
