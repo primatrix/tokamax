@@ -589,7 +589,9 @@ def flash_attention_kernel(
         values = jnp.concatenate(
             (values, jnp.ones((NUM_SUBLANES, bkv_compute), values.dtype)),
             axis=0,
-        )
+        ).astype(jnp.float32)
+        # HIGHEST's FP32 contraction requires both operands to be FP32.
+        # Widening stored BF16 values is exact, not an input-precision change.
       output_t = lax.dot_general(
           values, probabilities, NN_DIM_NUMBERS,
           preferred_element_type=jnp.float32,

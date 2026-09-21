@@ -276,6 +276,7 @@ def test_forward_fused_normalizer_against_fp64(unroll, q_block, monkeypatch):
 
   def record_dot(lhs, rhs, *args, **kwargs):
     if lhs.shape == (80, 128) and rhs.dtype == jnp.float32:
+      assert lhs.dtype == jnp.float32
       normalizer_precisions.append(kwargs.get("precision"))
     return original_dot(lhs, rhs, *args, **kwargs)
 

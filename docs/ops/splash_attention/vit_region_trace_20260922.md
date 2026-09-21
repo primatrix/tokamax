@@ -913,3 +913,68 @@ footprint separately. These captures do not measure fine-grained overlap.
 
 Evidence: details `an-olchn8c8oh`, regions/final-LLO `an-akbm0kgcz0`,
 operator `an-mup5nz5vi2`, LLO `an-wy9n9h3iux`.
+
+## Complete backward consumer-order results
+
+`exp-6533l1trog` (`f9dc55c`, artifact `art-7e2xye75w5`) does not improve
+on the existing 45.201 ms transposed-dQ/dK-first candidate (live PR13
+50.038 ms). Moving dV last/middle gives 46.603/46.849 ms; dQ-first with
+dV between gives 48.143 ms. Early dP with dV first/last/middle gives
+48.069/47.480/47.739 ms. Transposing all outputs with dV last/middle gives
+50.570/50.830 ms. All arrays are finite. The best candidate reproduces 303
+dQ differences, dK/dV bitwise; its worst four-head FP32-reference L2-error
+ratio is 1.000000319 and max-absolute errors are unchanged.
+
+The first seven reordered transposed-dQ bodies all have the same 8,832
+matmul, 3,968 transpose, 3,664 load, and 2,880 store instructions. Yet device
+KV-loop time is 42.497 ms with dV first, 43.786 with dV last, 44.035 with
+dV between, and 45.403 with early dP. Each capture loads only 79,872 IMEM
+bytes, with approximately 0.199 ms internal uncovered time. This confirms
+the ordering regression inside the loop, not instruction-load expansion;
+it does not establish that every possible overlap schedule is optimal.
+
+Evidence: details `an-jn386pfpkl`, regions/final-LLO `an-zfc38ffpjv`,
+operator `an-m9cx4wn4e0`, LLO `an-0sxzjrjhnr`.
+
+## Forward footprint controls with the separate FP32 reduction
+
+`exp-jtoxrrfgxe` (`f9dc55c`, artifact `art-k3c8v39kkc`) obtains the first
+small forward improvement without the rejected fused denominator:
+
+| Native KV-major variant | Forward ms | Live PR13 ms |
+| --- | ---: | ---: |
+| Q4096, unroll 8 | 20.352 | 21.108 |
+| Q4096, memory-KV4096 | 19.953 | 20.797 |
+| Q8192, memory-KV2048 | 42.298 | 20.989 |
+| Q2048, compute-KV512 | 19.881 | 21.049 |
+
+For Q4096/memory-KV4096, device module / KV loop / internal uncovered time
+are 18.714 / 16.971 / 0.219 ms, with 13,655,040 IMEM bytes. For
+Q2048/compute-KV512 these are 18.841 / 17.082 / 0.211 ms and 12,862,464 bytes.
+PR13 is 20.069 / 18.679 / 0.431 ms and 79,872 bytes. Reducing the fully
+expanded body removes the earlier approximately 12 ms gaps at Q4096.
+
+All arrays remain finite. The compute-KV512 candidate differs from PR13 in
+6,542 output elements (relative L2 `2.54598e-5`), with dQ/dK/dV relative-L2
+differences `1.39964e-4` / `1.43627e-4` / `1.27219e-4`. Against independent
+FP32 heads 0/15/16/31, worst L2-error ratios are 1.000002415 for output,
+0.990491405 for LSE, 0.999995360 for dQ, 1.000013208 for dK, and 1.000008779
+for dV. All per-head maximum absolute errors are unchanged. These are
+promising numerical diagnostics, not training acceptance or a no-scope
+reproduction. Forward and backward gains have not yet been jointly measured.
+
+The two fused variants in this run are still the old DEFAULT-precision
+implementation. Their 18.873/19.002 ms timings remain rejected on accuracy.
+
+Evidence: details `an-8iou8bne9a`, regions/final-LLO `an-wu7yvy4xut`,
+operator `an-xnkdcw6cx7`, LLO `an-12wxbqo8vs`.
+
+### FP32-contraction compilation constraint
+
+`exp-qkj0w25zju` (`d2033db`, artifact `art-uqbkz5exir`) rejects the mixed
+BF16-left/FP32-right HIGHEST contraction at TPU compilation with `Bad lhs
+type`. The experiment runner records these as per-candidate errors; a
+SUCCEEDED experiment is not success of these kernel configurations.
+The follow-up widens BF16 V values exactly to FP32 before this contraction.
+Four focused CPU tests pass and assert both FP32 lhs and HIGHEST precision;
+another TPU run is required. No model input dtype is changed.
