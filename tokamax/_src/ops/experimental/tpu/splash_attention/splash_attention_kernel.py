@@ -161,7 +161,8 @@ class SplashConfig:
   # Opt-in ViT tuning. Defaults preserve the existing execution paths.
   # Arithmetic reordering may change floating-point rounding.
   combine_log2_scale: bool = False
-  bwd_kv_unroll: bool = True
+  # Integers use lax.fori_loop's partial-unroll factor (1 is rolled).
+  bwd_kv_unroll: bool | int = True
   bwd_dq_first: bool = False
   bwd_dv_last: bool = False
   bwd_cast_before_transpose: bool = False

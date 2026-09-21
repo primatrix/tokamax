@@ -96,6 +96,8 @@ def test_invalid_trace_mode_rejected():
     "extra",
     [
         {},
+        {"bwd_kv_unroll": 2},
+        {"bwd_kv_unroll": 4},
         {"compact_softmax_scratch": True},
         {"bwd_dv_last": True},
         {"bwd_dq_contract_ds_axis0": True},
@@ -126,6 +128,8 @@ def test_invalid_trace_mode_rejected():
     ],
     ids=[
         "combined",
+        "kv_unroll_2",
+        "kv_unroll_4",
         "compact_scratch",
         "dv_last",
         "dq_contract_axis0",
@@ -191,6 +195,7 @@ def test_tuning_preserves_segmented_outputs_and_all_gradients(
       flag: False
       for flag in (
           "bwd_compact_segment_ids",
+          "bwd_kv_unroll",
           "bwd_do_seq_minor",
           "bwd_dq_scratch_seq_minor",
           "bwd_dkv_scratch_seq_minor",
