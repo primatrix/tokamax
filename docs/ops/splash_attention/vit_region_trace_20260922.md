@@ -2,22 +2,34 @@
 
 ## Current result
 
-Best screened backward setting: sequence-minor scratch/dO plus transposed dQ,
-with **dK before dQ**. Across repeated full-shape runs it measures about
-45.3 ms versus PR13 about 50 ms. With region scopes removed and seed changed
-to 28, it measures 45.313 versus 49.738 ms: 8.9% lower latency / 1.098x
-throughput. Native KV-major forward with Q2048/compute-KV512 measures
-19.881 ms versus live PR13 21.049 ms (5.5% lower latency) with coarse scopes;
-seed 28 with region tracing disabled reproduces 19.658 versus 20.907 ms
-(6.0% lower latency / 1.064x throughput). The combined attention
-target of 20–30% improvement has **not** been reached. Joint forward/backward
-and full-model speedups are not claimed from separate timings.
+The public custom-VJP joint benchmark now measures **62.555 ms versus live
+PR13 70.098 ms**, 10.8% lower latency / 1.121x throughput (seed 29, region
+tracing disabled, `exp-qi1gilizpq`). It combines native KV-major Q4096 /
+memory-KV4096 / compute-KV256 forward, native normalization/physical output
+layout, and sequence-minor backward scratch/dO with transposed dQ and
+**dK before dQ**. Q2048/compute-KV512 is a second retained setting at about
+62.7–63.1 ms. These are measurements of one
+compiled forward/backward invocation, not added independent measurements.
+It is not a full-model or rematerialization benchmark. The combined
+attention target of 20–30% improvement has **not** been reached.
 
-All new orientation/pipeline controls remain default-off, BF16 inputs/FP32 softmax are preserved,
-and model rematerialization is unchanged. dK/dV are bitwise equal for the best
-candidate; dQ differs in 302–303 of 75,497,472 elements across seeds 27/28.
-Independent-reference errors are essentially unchanged on four full-length
-heads per seed, but this is not training-convergence certification.
+Forward-only native physical output measures 18.906 ms (Q2048) or 18.754 ms
+(Q4096/memory-KV4096), versus matched live PR13 21.221/20.826 ms. Coarse trace
+attributes a concrete gain to output formatting: Q2048 drain time falls
+from 0.833 to 0.025 ms while KV-loop time stays near 17 ms. Independent
+backward-only no-scope timing remains 45.313 versus 49.738 ms.
+
+All new orientation/pipeline controls remain default-off. BF16 inputs,
+FP32 softmax, and model rematerialization are unchanged. The joint candidates
+are non-bitwise. Seed 29 now checks all **32 full-length FP32 oracle heads**:
+output and gradient maximum absolute errors are unchanged on every head;
+their aggregate L2 errors are essentially unchanged. LSE's maximum absolute
+error never increases, though per-head L2 error can differ. This is numerical
+screening, not training-convergence certification. Seed-27/no-scope
+reproduction measures 63.079 ms for Q2048
+and 62.570 ms for Q4096/memory-KV4096, versus live PR13 70.272/70.286 ms.
+The latter is 11.0% lower latency / 1.123x throughput. All submitted
+experiments and requested analyses in this iteration are terminal and read.
 The DEFAULT-precision fused-normalizer probe is rejected for TPU LSE/gradient
 accuracy regression. Its faster timings are excluded from retained results.
 
@@ -1025,7 +1037,7 @@ Evidence: details `an-u3hfr26giw`, operator `an-gxdqkovxwh`, LLO
 `an-adv2gcsp6h`. All experiments submitted in this iteration and their
 requested analyses are terminal and have been inspected through Falcon.
 
-## Next bounded work
+## Motivation for the native output-drain probe
 
 First jointly measure and validate the retained native forward candidate
 with the existing transposed-dQ/dK-first backward candidate. Do not infer
@@ -1040,5 +1052,204 @@ lost in normalization/output formatting. A bounded next kernel probe is
 direct sequence-minor normalization/writeback, with the public output
 layout and precision preserved and any outer conversion included in timing.
 Another independent option is removing duplicated full/partial loop bodies
-without changing segment semantics. Neither is implemented or claimed as a
-speedup here; inner-loop overlap is still not proven optimal.
+without changing segment semantics. The following sections implement and
+test these probes; inner-loop overlap is still not proven optimal.
+
+## Native normalization and physical output layout
+
+Source `c9b88ded464a808a7e192b3ae50c2e32e70a8969` adds two default-off flags:
+`fwd_native_output_normalization` keeps FP32 output/state scratch in its
+native sequence-minor layout for reciprocal/multiply, then casts to BF16;
+`fwd_output_seq_minor` also stores physical Pallas output in that layout.
+The wrapper restores the public logical output with `out.mT`. Any outer
+conversion is inside the compiled, timed function. No FP8, lower-precision
+probability conversion, fused denominator, or remat change is enabled.
+
+`exp-qfrgjymw1x`, artifact `art-6xnz4p09fy`, seed 28, 30 samples:
+
+| Forward variant | Host median ms | Live PR13 ms | Device module ms | Output drain ms |
+| --- | ---: | ---: | ---: | ---: |
+| PR13 | 20.934 | 20.915 | 20.075 | 0.176 |
+| Q2048/compute-KV512, old drain | 20.137 | 20.892 | 18.796 | 0.833 |
+| Same, native normalization | 19.443 | 21.379 | 18.034 | 0.103 |
+| Same, native physical output | 18.906 | 21.221 | 17.684 | 0.025 |
+| Q4096/memory-KV4096, old drain | 19.774 | 21.133 | 18.692 | 0.810 |
+| Same, native normalization | 19.326 | 20.950 | 17.941 | 0.088 |
+| Same, native physical output | 18.754 | 20.826 | 17.594 | 0.025 |
+
+Device entries use the first of three captured calls, not host timings.
+For Q2048, final-body MXU count stays 10,752, while `llo.vxpose` falls
+7,168 -> 6,272 -> 6,144. KV-loop time is 17.042 -> 16.993 -> 16.991 ms.
+Thus the measured drain benefit is not an inner-dot-count reduction.
+Capture-wide IMEM input bytes fall from 12,862,464 / 12 descriptors to
+79,872 / 3 descriptors for both native-drain variants. These counters
+include three calls and other capture activity; they are not utilization.
+For Q4096, IMEM remains about 12.7–13.7 MB and 12 descriptors.
+
+All arrays are finite. Within each tile family, old/native/physical-output
+variants have identical reported precision statistics against PR13 and
+identical independent-oracle statistics. That is not a direct pairwise
+bitwise comparison of the complete arrays. Q2048's worst four-head
+candidate/reference L2-error ratios are 1.000009753 (output), 0.993629862
+(LSE), 1.000052810 (dQ), 1.000008662 (dK), and 1.000003912 (dV), with all
+max-absolute errors unchanged. CPU direct drain comparisons are bitwise
+for both output layouts, both reciprocal modes, and both probability
+orientations; the initial suite passed 192 tests in 138.78 seconds.
+
+Evidence: details `an-cxxgbm3ymc`, regions/final-LLO `an-2knakdxw5r`,
+operator `an-muoegrncny`, LLO `an-gmplgxg5n4`.
+
+## Public custom-VJP joint measurement
+
+The new `--phase joint` compiles public `jax.vjp(kernel)` and returns output
+plus dQ/dK/dV. This avoids assuming that manually composing internal
+forward/backward functions is identical to the public API: CPU physical-
+output probes showed a few gradient differences for the internal
+composition. Residual LSE is checked through a separate, untimed standalone
+forward and is explicitly labelled `joint_lse_source`; it is not an extra
+forward inside joint timing. Actual joint outputs/gradients feed precision
+and independent-oracle checks. No model/remat performance is implied.
+
+`exp-p9myb5scfh`, artifact `art-ehvo30nf7n`, source `c9b88de`, seed 28:
+
+| Joint configuration | Median ms | Live PR13 ms |
+| --- | ---: | ---: |
+| PR13 | 70.028 | 70.058 |
+| Backward optimization only | 64.860 | 69.888 |
+| Native forward, old drain only | 68.795 | 70.044 |
+| Both, old forward drain | 64.095 | 70.046 |
+| Both, native forward normalization | 63.162 | 69.847 |
+| Both, native physical forward output | 62.742 | 70.023 |
+
+For the last three rows, the precision/oracle statistics are identical:
+output differs from PR13 in 6,516 elements (relative L2 2.48309e-5);
+dQ/dK/dV differ in 123,213 / 398,073 / 289,210 elements with relative L2
+1.38552e-4 / 1.40596e-4 / 1.28228e-4. All are finite. Worst per-head
+FP32-reference L2-error ratios are 1.000009753 / 0.993629862 / 1.000053451 /
+1.000008662 / 1.000003912 for output/LSE/dQ/dK/dV. All per-head maximum
+absolute errors match PR13. As before, this is not automatic acceptance.
+
+Joint device-module time falls from 68.739 to 61.428 ms. The best capture
+has approximately 17.174 ms forward KV loops and 42.499 ms backward KV
+loops. Forward drain is 0.025 ms and backward dQ/dKV drains total 0.200 ms.
+About 0.866 ms is uncovered inside the combined scope span; this includes
+the transition between forward and backward and must not be interpreted
+as stall time or a utilization metric. Further substantial gains must
+address loop work, not just the now-small forward output drain.
+
+Evidence: details `an-1ycmwindq2`, regions/final-LLO `an-p0m9ycy4o0`,
+operator `an-svzdx6ic5i`, LLO `an-yfkfyvtvhs`.
+
+## Shared-loop probe
+
+Source `91f4230810abf4bbda261174f3c1ec44e726f8a8` adds default-off
+`fwd_kvmajor_single_loop`: only segment masking retains the full/partial
+conditional; QK, exp, denominator reduction, and PV share one loop body.
+It preserves the original full-tile contract and ID 0 == 0 semantics.
+The purpose is to test instruction footprint, not to assume improved
+hardware overlap from fewer static instructions.
+
+The first CPU prototype always applied segment equality. Both that and
+the narrower conditional-mask implementation are non-bitwise at seed 28.
+For the latter, output has 3 differences / 36,864 elements; dQ/dK have
+20/64, and dV is bitwise. dK cross-candidate relative L2 is 1.08829e-4,
+slightly above an initial 1e-4 diagnostic gate, while its independent-FP64
+error ratio is 1.000104978. The final test explicitly gates independent
+oracle error with the existing 0.1% + 1e-7 bound, not cross-candidate
+distance, and retains strict bitwise tests for drain-only changes. No
+independent-oracle tolerance was widened. The complete suite passes
+**201 tests** in 143.95 seconds; TPU accuracy remains a separate gate.
+
+`exp-fma6erh63p` (artifact `art-n8jxvv7ipb`) completes the coarse-trace
+screen. Shared-loop Q2048 and Q4096/memory-KV4096 give 48.165 and 48.890 ms,
+versus matched native-output controls 18.858 and 18.693 ms. Q4096 with
+memory-KV8192 gives 46.398 ms (compute-KV256) or 42.982 ms (compute-KV512).
+All four shared-loop variants are rejected on performance; all arrays are
+finite and matched tile families have unchanged reported oracle statistics.
+
+| Layout | Device ms | KV loop ms | Internal uncovered ms | IMEM bytes / descriptors |
+| --- | ---: | ---: | ---: | ---: |
+| Q2048 native output | 17.690 | 16.997 | 0.228 | 79,872 / 3 |
+| Q2048 shared loop | 46.894 | 37.316 | 9.085 | 15,054,240,768 / 15,381 |
+| Q4096/KV4096 native output | 17.593 | 16.903 | 0.222 | 12,710,400 / 12 |
+| Q4096/KV4096 shared loop | 47.479 | 38.621 | 8.372 | 15,963,829,248 / 15,381 |
+
+The shared Q2048 body's static MXU count halves (10,752 -> 5,376) while
+transpose count falls only from 6,144 to 5,632. This is a failed code-
+footprint hypothesis: the new placement of runtime mask branches produces
+far more dynamic instruction loading despite fewer counted body operations,
+and the loop itself also slows. The capture does not separate instruction
+stalls inside the coarse loop from MXU/vector scheduling stalls, so neither
+is assigned an invented utilization percentage. All IMEM figures are
+capture-wide three-call counters, not per-call memory bandwidth.
+
+Evidence: details `an-8dc4z0pe1v`, regions/final-LLO `an-djuyb88mny`,
+operator `an-qcifutgsxm`, LLO `an-eoofhe2twb`.
+
+## Seed-27 joint reproduction without region tracing
+
+`exp-7anbtxoyij` (artifact `art-rl3v5hamql`, source `91f4230`) uses
+`region_trace_mode=none` and disables libtpu custom-region tracing. Thirty
+samples confirm Q2048 at 63.079 ms versus live PR13 70.272 ms; native
+Q4096/memory-KV4096 gives 62.570 versus 70.286 ms. All arrays are finite.
+
+The Q2048 joint candidate has worst four-head FP32-reference L2-error
+ratios 1.000002415 / 0.990491405 / 0.999995440 / 1.000013208 / 1.000008779
+for output/LSE/dQ/dK/dV. For Q4096 these are 0.999999780 / 1.001046173 /
+1.000001200 / 1.000005045 / 1.000010185. All per-head maximum absolute
+errors are unchanged. Q4096's full-array relative differences from PR13
+are 2.22873e-5 (output), 8.29178e-5 (dQ), 9.19117e-5 (dK), and 7.33053e-5
+(dV); base-2 LSE differs by at most 1.90735e-6. LSE remains an untimed
+standalone diagnostic; output and gradients come from the actual joint VJP.
+
+Evidence: details `an-7sv0zibbw0`, operator `an-j57hn85lhc`, LLO
+`an-p3p25zfxuq`. All three reports have been inspected through Falcon.
+
+## Third seed and all-32-head independent precision validation
+
+`exp-qi1gilizpq` (artifact `art-izvad6ndxl`, source `91f4230`) completes
+seed 29 with all 32 full-length FP32 oracle heads, not only 0/15/16/31.
+It preserves the same three variants and no-region-trace configuration.
+Every reference/candidate oracle array and every full-shape kernel array
+is finite. Q2048 measures 62.663 ms versus live PR13 69.893 ms; Q4096 is
+62.555 versus 70.098 ms. Thirty-sample p95, computed by linear interpolation,
+is 63.097 / 63.126 ms for Q2048/Q4096. Q4096 has one 68.254 ms maximum,
+so its small median advantage should not be treated as a universal latency
+win over Q2048; neither setting is promoted to default.
+
+The following are candidate/reference error ratios against the independent
+FP32 oracle. Aggregate L2 ratios use summed squared error norms over all
+heads (`sum(rms_abs**2 * elements)`), not the average of head ratios.
+
+| Array | Q2048 worst head L2 ratio | Q2048 aggregate L2 ratio | Q4096 worst head L2 ratio | Q4096 aggregate L2 ratio |
+| --- | ---: | ---: | ---: | ---: |
+| Output | 1.000008206 | 1.000000076 | 1.000008658 | 1.000000572 |
+| Natural LSE | 0.992838881 | 0.986998417 | 1.004493902 | 0.999930442 |
+| dQ | 1.000026383 | 0.999997901 | 1.000028169 | 1.000002145 |
+| dK | 1.000052582 | 0.999995215 | 1.000043750 | 0.999997547 |
+| dV | 1.000040526 | 0.999997362 | 1.000023891 | 1.000002588 |
+
+Output and all three gradients have exactly the same maximum absolute
+oracle error as PR13 on each of the 32 heads. LSE max-absolute error is
+unchanged or smaller on every head: Q2048 improves heads 6/12/13/14 and
+Q4096 improves head 1. Q4096's worst per-head LSE L2-error ratio rises by
+0.4494%, while its aggregate LSE error is slightly lower; do not describe
+every LSE error metric as identical. Against PR13, full-array base-2 LSE
+differences remain at most 1.90735e-6. The candidate is non-bitwise and
+these random-input checks do not certify training convergence or all inputs.
+
+Evidence: details `an-ofzxqfm1ld`, operator `an-j6jwd8cja3`, LLO
+`an-y2et4tz3zq`. All reports and declared precision output were inspected.
+
+## Next bounded work
+
+The measured joint improvement is about 11% lower latency / 12% higher
+throughput, not the 20–30% target. Forward output formatting is no longer a
+large exposed cost. Retain the external full/partial branch and native
+drain as the current control. A useful next ablation is a shared loop with
+unconditional equality masking (`segment_mask_on_partial_only=False`) to
+remove per-compute-tile scalar branches. This separates branch-induced
+instruction loading from the cost of extra mask arithmetic without changing
+segment semantics. It has not been measured on TPU and is not a claimed
+optimization. Backward KV-loop work remains the largest measured region;
+coarse traces still do not prove that its MXU/vector overlap is optimal.
