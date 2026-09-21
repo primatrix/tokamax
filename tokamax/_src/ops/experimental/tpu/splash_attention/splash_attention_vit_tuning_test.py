@@ -478,6 +478,25 @@ def test_shared_segment_loop_against_fp64(seed, q_block, mask_all_tiles):
   np.testing.assert_allclose(np.asarray(actual_residuals[6][0] / splash.LOG2E), oracle[1], rtol=2e-7, atol=1e-6)
 
 
+@pytest.mark.parametrize("variant,delta", [
+    ("joint_q4096_bwd_scheduler", {"bwd_scheduler": True}),
+    ("joint_q4096_bwd_scheduler_default", {"bwd_scheduler": None}),
+    ("joint_q4096_fwd_scheduler", {"use_experimental_scheduler": True}),
+    ("joint_q4096_both_scheduler", {"bwd_scheduler": True, "use_experimental_scheduler": True}),
+])
+def test_joint_scheduler_controls_only_change_scheduler_flags(variant, delta):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_schedule_sweep as sweep
+
+  configs = dict(sweep.variants("joint"))
+  retained = configs["joint_q4096_native_output"]
+  assert retained == sweep._FWD_KVMAJOR | sweep._DQ_DK_FIRST | dict(
+      block_q=4096, block_kv=4096,
+      fwd_native_output_normalization=True, fwd_output_seq_minor=True,
+  )
+  assert configs[variant] == retained | delta
+  assert configs[variant]["bwd_dq_first"] is False
+
+
 @pytest.mark.parametrize("drain", ["reference", "native", "native_output"])
 @pytest.mark.parametrize("fast_backward", [False, True])
 def test_joint_runner_matches_public_custom_vjp(drain, fast_backward):

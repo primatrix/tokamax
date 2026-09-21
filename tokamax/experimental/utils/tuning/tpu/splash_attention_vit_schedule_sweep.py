@@ -49,6 +49,11 @@ _FWD_KVMAJOR = dict(
 
 _FWD_FAST = _FWD_KVMAJOR | dict(block_q=2048, block_kv_compute=512)
 
+_JOINT_Q4096_NATIVE = _FWD_KVMAJOR | _DQ_DK_FIRST | dict(
+    block_q=4096, block_kv=4096,
+    fwd_native_output_normalization=True, fwd_output_seq_minor=True,
+)
+
 _FWD_BRANCHLESS = _FWD_KVMAJOR | dict(
     fwd_native_output_normalization=True, fwd_output_seq_minor=True,
     fwd_kvmajor_single_loop=True, fwd_kvmajor_mask_all_tiles=True,
@@ -64,7 +69,11 @@ def variants(phase="backward"):
         ("joint_fast", _FWD_FAST | _DQ_DK_FIRST),
         ("joint_native_drain", _FWD_FAST | _DQ_DK_FIRST | dict(fwd_native_output_normalization=True)),
         ("joint_native_output", _FWD_FAST | _DQ_DK_FIRST | dict(fwd_native_output_normalization=True, fwd_output_seq_minor=True)),
-        ("joint_q4096_native_output", _FWD_KVMAJOR | _DQ_DK_FIRST | dict(block_q=4096, block_kv=4096, fwd_native_output_normalization=True, fwd_output_seq_minor=True)),
+        ("joint_q4096_native_output", _JOINT_Q4096_NATIVE),
+        ("joint_q4096_bwd_scheduler", _JOINT_Q4096_NATIVE | dict(bwd_scheduler=True)),
+        ("joint_q4096_bwd_scheduler_default", _JOINT_Q4096_NATIVE | dict(bwd_scheduler=None)),
+        ("joint_q4096_fwd_scheduler", _JOINT_Q4096_NATIVE | dict(use_experimental_scheduler=True)),
+        ("joint_q4096_both_scheduler", _JOINT_Q4096_NATIVE | dict(bwd_scheduler=True, use_experimental_scheduler=True)),
     ]
   if phase == "forward":
     return [
