@@ -27,6 +27,7 @@ import numpy as np
 from tokamax._src.ops.experimental.tpu.splash_attention import base
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask_info as mask_info_lib
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 
 
 def _segment_mask_info(q_ids, kv_ids, block_q, block_kv, *, is_dkv=False):
@@ -187,6 +188,7 @@ def _parser():
   parser.add_argument("--variant", default="pr13_best_tiling")
   parser.add_argument("--output")
   parser.add_argument("--interpret", action="store_true")
+  parser.add_argument("--split-major-segments", action="store_true")
   parser.add_argument(
       "--bwd-parallel-heads", action=argparse.BooleanOptionalAction, default=False
   )
@@ -240,13 +242,65 @@ def main():
   do = jax.random.normal(keys[3], shape, jnp.bfloat16)
   _ready((q, k, v, do, ids))
 
-  forward = jax.jit(lambda q, k, v, ids: _forward(kernel, q, k, v, ids))
+  if args.split_major_segments:
+    if tuple(args.segment_lengths[:2]) != (
+        args.sequence // 2,
+        args.sequence // 2 - 16,
+    ):
+      raise ValueError("split-major-segments requires the production segment layout")
+    half = args.sequence // 2
+    first_kernel = splash.make_splash_mha_single_device(
+        mask_lib.FullMask((half, half)), config=config
+    )
+    second_ids_np = np.concatenate(
+        [
+            np.ones(args.segment_lengths[1], np.int32),
+            np.full(args.segment_lengths[2], 2, np.int32),
+            np.zeros(args.segment_lengths[3], np.int32),
+        ]
+    )
+    second_ids = base.SegmentIds(
+        jnp.asarray(second_ids_np), jnp.asarray(second_ids_np)
+    )
+    second_kernel = _make_kernel(second_ids, config)
+
+    def split_forward(q, k, v, unused_ids):
+      del unused_ids
+      first_out, first_res = _forward(
+          first_kernel, q[:, :half], k[:, :half], v[:, :half], None
+      )
+      second_out, second_res = _forward(
+          second_kernel,
+          q[:, half:],
+          k[:, half:],
+          v[:, half:],
+          second_ids,
+      )
+      return jnp.concatenate((first_out, second_out), axis=1), (
+          first_res,
+          second_res,
+      )
+
+    def split_backward(residuals, do):
+      first = _backward(first_kernel, residuals[0], do[:, :half])
+      second = _backward(second_kernel, residuals[1], do[:, half:])
+      return tuple(
+          jnp.concatenate((a, b), axis=1) for a, b in zip(first, second)
+      )
+
+    forward_fn = split_forward
+    backward_fn = split_backward
+  else:
+    forward_fn = lambda q, k, v, ids: _forward(kernel, q, k, v, ids)
+    backward_fn = lambda residuals, do: _backward(kernel, residuals, do)
+
+  forward = jax.jit(forward_fn)
   compile_start = time.perf_counter()
   forward = forward.lower(q, k, v, ids).compile()
   forward_compile_s = time.perf_counter() - compile_start
   output, residuals = _ready(forward(q, k, v, ids))
   del output
-  backward = jax.jit(lambda residuals, do: _backward(kernel, residuals, do))
+  backward = jax.jit(backward_fn)
   compile_start = time.perf_counter()
   backward = backward.lower(residuals, do).compile()
   backward_compile_s = time.perf_counter() - compile_start
