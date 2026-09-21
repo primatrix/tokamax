@@ -42,6 +42,17 @@ def _packed_kernel(a_ref, b_ref, o0_ref, o1_ref):
   o1_ref[...] = packed[128:, 128:]
 
 
+def _plusminus_kernel(a_ref, b_plus_ref, b_minus_ref, o0_ref, o1_ref):
+  plus = lax.dot(
+      a_ref[...], b_plus_ref[...], preferred_element_type=jnp.float32
+  )
+  minus = lax.dot(
+      a_ref[...], b_minus_ref[...], preferred_element_type=jnp.float32
+  )
+  o0_ref[...] = (plus + minus) * 0.5
+  o1_ref[...] = (plus - minus) * 0.5
+
+
 def _single_kernel(a_ref, b_ref, o_ref):
   o_ref[...] = lax.dot(
       a_ref[...], b_ref[...], preferred_element_type=jnp.float32
@@ -87,6 +98,9 @@ def main():
       ),
       axis=0,
   )
+  a_plusminus = jnp.concatenate((a0, a1), axis=1)
+  b_plus = jnp.concatenate((b0, b1), axis=0)
+  b_minus = jnp.concatenate((b0, -b1), axis=0)
 
   def same_block(*_):
     return 0, 0
@@ -140,12 +154,53 @@ def main():
           dimension_semantics=("parallel",), vmem_limit_bytes=63 * 1024**2
       ),
   )
+  plusminus = pl.pallas_call(
+      _plusminus_kernel,
+      grid_spec=pltpu.PrefetchScalarGridSpec(
+          num_scalar_prefetch=0,
+          grid=(args.grid,),
+          in_specs=[
+              pl.BlockSpec((128, 144), same_block),
+              pl.BlockSpec((144, 128), same_block),
+              pl.BlockSpec((144, 128), same_block),
+          ],
+          out_specs=[
+              pl.BlockSpec((None, 128, 128), output_block),
+              pl.BlockSpec((None, 128, 128), output_block),
+          ],
+      ),
+      out_shape=[
+          jax.ShapeDtypeStruct((args.grid, 128, 128), jnp.float32),
+          jax.ShapeDtypeStruct((args.grid, 128, 128), jnp.float32),
+      ],
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("parallel",), vmem_limit_bytes=63 * 1024**2
+      ),
+  )
   separate = jax.jit(separate).lower(a0, b0, a1, b1).compile()
   packed = jax.jit(packed).lower(a_packed, b_packed).compile()
+  plusminus = jax.jit(plusminus).lower(
+      a_plusminus, b_plus, b_minus
+  ).compile()
   separate_ms = _measure(
       separate, (a0, b0, a1, b1), args.warmup, args.repeats
   )
   packed_ms = _measure(packed, (a_packed, b_packed), args.warmup, args.repeats)
+  plusminus_ms = _measure(
+      plusminus,
+      (a_plusminus, b_plus, b_minus),
+      args.warmup,
+      args.repeats,
+  )
+  reference_out = separate(a0, b0, a1, b1)
+  plusminus_out = plusminus(a_plusminus, b_plus, b_minus)
+  plusminus_relative_l2 = max(
+      float(
+          jnp.linalg.norm(actual - expected)
+          / jnp.maximum(jnp.linalg.norm(expected), 1e-30)
+      )
+      for actual, expected in zip(plusminus_out, reference_out)
+  )
   k_sweep_ms = {}
   repeated_k_sweep_ms = {}
   for k_dim in (64, 72, 128, 144, 256):
@@ -212,6 +267,9 @@ def main():
       "separate_ms": separate_ms,
       "packed_ms": packed_ms,
       "packed_speedup": separate_ms / packed_ms,
+      "plusminus_ms": plusminus_ms,
+      "plusminus_speedup": separate_ms / plusminus_ms,
+      "plusminus_relative_l2": plusminus_relative_l2,
       "grid": args.grid,
       "k_sweep_ms": k_sweep_ms,
       "repeated_k_sweep_ms": repeated_k_sweep_ms,
@@ -221,6 +279,7 @@ def main():
       for phase, latency in (
           ("separate", separate_ms),
           ("packed", packed_ms),
+          ("plusminus", plusminus_ms),
           *((f"k_{k_dim}", latency) for k_dim, latency in k_sweep_ms.items()),
           *(
               (f"repeat16_k_{k_dim}", latency)
