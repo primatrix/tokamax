@@ -263,6 +263,23 @@ Instruction markers in one largest gap jump from address `0xffe4` to `0x29d`
 after about 15.55 us. This motivates a code-footprint/overlay hypothesis, but
 does not prove it: `an-lc8fk3dr5c` finds no actual events on the TC Overlay lane.
 
+The broader hardware-counter audit `an-cnfj0heksw/audit.json` provides stronger
+evidence for instruction-memory traffic. Each profile captures three backward
+calls, but counters are capture aggregates, not per-region windows. For DIE0:
+
+| Counter | PR13 | Unroll 2 | Compute-KV 512 + unroll 2 |
+| --- | ---: | ---: | ---: |
+| OCI TCS destination Any2IMEM descriptors | 3 | 4623 | 3 |
+| OCI TCS destination Any2IMEM bytes | 79872 | 8098139136 | 79872 |
+| TC IMEM writes | 624 | 63266712 | 624 |
+| TC IMEM DMA active | 624 | 63397694 | 624 |
+
+These are instruction-memory counters, not KV data-transfer estimates. The
+massive increase together with the repeating boundary gaps and trace-disabled
+regression strongly supports repeated instruction loading after unrolling.
+Do not use the all-capture MXU idle counts to infer kernel utilization: capture
+startup/idle durations differ substantially between profiles.
+
 ## Forward loop-carried state probe
 
 Commit `41877a1` adds default-off `fwd_loop_carry`: carry softmax m/l and output
@@ -315,3 +332,34 @@ The production-shape screen is `exp-pij8860e8i`, artifact `art-vlh8hwttfv`, with
 layouts-only control and single-body unroll factors 1/2/4/8, raw timing samples,
 full-shape precision checks and coarse traces. The source remains on our branch;
 no production defaults changed. The CPU suite passes 49 tests at `86a3fd4`.
+
+The screen completes with four measured configurations and one explicitly
+recorded compile failure. Layouts-only is 49.172 ms; the single-body version is
+50.516 ms, unroll-2 is 49.999 ms and unroll-4 is 53.145 ms. All measured dQ/dK/dV
+arrays are bitwise equal to PR13. Unroll-8 exceeds compiler VMEM capacity:
+69.11M requested versus 63.94M available, a 5.17M excess. This is a candidate
+compilation failure, not a failed Falcon reservation or a measured runtime.
+
+Single-body unroll-2 recovers the earlier approximately 65.5 ms regression to
+50.0 ms. That is recovery relative to a regressed candidate, **not** a 20–30%
+improvement over PR13. No production setting is promoted from this screen.
+
+The final audit closes the hypothesis loop. Single-body unroll-2 reduces DIE0
+Any2IMEM descriptors back to 3 and bytes back to 79872 per three-call capture;
+its uncovered internal scope time is 0.195 ms, versus 16.266 ms for the old
+two-body unroll-2. Its device module is 48.718 ms, with 47.280 ms in the masked
+loop. This strongly corroborates instruction-loading/code-footprint as the
+cause of the old unroll-2 regression. The extra masking still makes the loop
+slightly slower than layouts-only (46.706 ms), so eliminating this regression
+does not improve the baseline critical path.
+
+Single-body unroll-4 again creates instruction traffic: 18444 descriptors and
+16008055296 bytes per capture, with a 52.201 ms module, 48.999 ms loop total and
+1.952 ms uncovered scope time. More instruction bytes do not translate directly
+into proportionally more exposed latency; location and overlap matter. The
+next pipeline design must control both code footprint and VMEM live ranges.
+
+Evidence: numerical details `an-092z7rzwx4`, region/counters/final LLO
+`an-to8chbbdf2`, operator `an-nxiwba0v4z`, LLO inventory `an-dds4p1n550`.
+This run records wall-clock compilation windows, allowing final dumps to be
+mapped to variants directly rather than by compile order alone.
