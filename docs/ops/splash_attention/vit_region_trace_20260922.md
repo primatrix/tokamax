@@ -248,6 +248,21 @@ outside the named loop regions, not measured as slower dots inside the loop.
 This does not identify DMA, instruction loading, or another scheduling mechanism;
 the new configuration also needs a trace-disabled control before attribution.
 
+The control `exp-t5dvkzvg39` (`3468420`, artifact `art-8k6i9uo5v6`) disables both
+the region flag and named scopes, uses 20 candidate samples, and confirms the
+regression: PR13 49.879 ms, layouts 49.550 ms, unroll-2 65.475 ms and unroll-4
+57.915 ms. All gradients remain bitwise. Thus the unroll regression is not
+caused by region tracing. Evidence: `an-5dd2b6y0te/report.md`, operator
+`an-h7lpc62i1b`, LLO inventory `an-mktew80r4n`.
+
+The detailed boundary audit `an-ukdq2frpfy/audit.json` locates unroll-2's gaps:
+5.426 ms from full-loop end to dQ output; 6.307 ms from dQ output to the next
+dQ initialization; 2.060 ms across dK/dV output-to-initialization; 2.472 ms from
+dQ initialization to the partial loop. Individual gaps are about 15–17 us.
+Instruction markers in one largest gap jump from address `0xffe4` to `0x29d`
+after about 15.55 us. This motivates a code-footprint/overlay hypothesis, but
+does not prove it: `an-lc8fk3dr5c` finds no actual events on the TC Overlay lane.
+
 ## Forward loop-carried state probe
 
 Commit `41877a1` adds default-off `fwd_loop_carry`: carry softmax m/l and output
@@ -263,3 +278,40 @@ The forward screen is `exp-406vxkirrx`, artifact `art-7vslcgvgd9`, pinned to
 output, logsumexp and dQ/dK/dV, and screens carry, compact scratch, Q/compute-KV
 sizes and scheduler combinations. CPU-interpreted checks pass, but the flag
 remains experimental and off by default until compiled TPU evidence is reviewed.
+
+**Not promoted:** all nine variants completed. Plain carry is 21.719 ms versus
+its live reference 20.826 ms; compact carry is 22.479 versus 21.053 ms; Q=2048
+carry variants regress to approximately 42 ms. The fastest carry variant,
+scheduler+carry, is 20.709 versus 20.889 ms, not a significant target-sized gain.
+Scheduler without carry is bitwise and 20.806 versus 21.079 ms, still only a
+small screening difference. The carry and compact-carry outputs have relative
+L2 difference `2.07090e-5`, dQ `3.22644e-5`, and dK `4.89105e-5`; logsumexp/dV
+remain bitwise. All values are finite. No accuracy/performance threshold is
+relaxed to accept these results.
+
+The first coarse forward module changes from 20.073 ms to 20.842 ms with carry;
+its KV-loop total changes from 18.687 to 19.460 ms. Unlike backward unrolling,
+this regression is inside the loop. Candidate final bodies have substantially
+fewer explicit loads/stores (e.g. 2504 vector loads and 776 unmasked/512 masked
+stores, versus baseline 24320 and 8456/8448), with unchanged MXU multiply count.
+Reducing explicit scratch traffic did not improve the critical path. These
+compiler-body counts still do not include outer pipelines or prove why the
+machine-level schedule is slower.
+
+Forward evidence: `an-q3iucqlhsu/details.json`, region/final-LLO
+`an-mq1zkr3lqg/audit.json`, operator `an-f1siy0wbb4`, LLO inventory
+`an-btynsn829z`.
+
+## Single segment-mask body hypothesis
+
+Commit `86a3fd4` adds default-off `bwd_single_segment_mask_body`, restricted to
+segment-only masks (no arbitrary mask Ref/function). Full and partial tiles use
+one masked body; full tiles do redundant segment comparisons but do not change
+the allowed attention entries. This removes the full/partial body duplication
+before unrolling, testing the code-footprint hypothesis above. It is not a claim
+that the MXU/vector pipeline is already optimal.
+
+The production-shape screen is `exp-pij8860e8i`, artifact `art-vlh8hwttfv`, with
+layouts-only control and single-body unroll factors 1/2/4/8, raw timing samples,
+full-shape precision checks and coarse traces. The source remains on our branch;
+no production defaults changed. The CPU suite passes 49 tests at `86a3fd4`.
