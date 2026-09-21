@@ -363,3 +363,120 @@ Evidence: numerical details `an-092z7rzwx4`, region/counters/final LLO
 `an-to8chbbdf2`, operator `an-nxiwba0v4z`, LLO inventory `an-dds4p1n550`.
 This run records wall-clock compilation windows, allowing final dumps to be
 mapped to variants directly rather than by compile order alone.
+
+## Two-stage backward KV pipeline probe
+
+Commit `6713969` adds default-off `bwd_staged_kv_pipeline`, restricted to the
+BF16 ViT exact-layout configuration and a single segment-mask body. The
+prologue computes P/dS for tile 0; each iteration prepares tile i before
+consuming tile i-1 in dV/dQ/dK; the epilogue consumes the last tile. P remains
+FP32 in the softmax derivative. The loop carries BF16 P/dS only at the cast
+boundaries already used by the reference gradient dots, retaining tile order
+for the accumulations. The hypothesis is extra cross-tile scheduling freedom,
+not that this source ordering guarantees hardware overlap.
+
+`exp-tgu93neqym`, artifact `art-8awxxa6vz9`, measures production shape with
+20 samples per candidate and live PR13 checks. All values below are host
+medians, with unchanged JAX/libtpu, BF16 inputs and one benchmark device.
+
+| Variant | Backward ms | Live PR13 ms | Numerical result |
+| --- | ---: | ---: | --- |
+| Exact layouts, no pipeline | 49.584 | 50.012 | Bitwise |
+| Pipeline compute-KV 512 | 59.350 | 50.180 | Non-bitwise, finite |
+| Pipeline compute-KV 256 | 61.190 | 50.094 | Non-bitwise, finite |
+| Pipeline Q=2048 / compute-KV 512 | 61.818 | 49.996 | Non-bitwise, finite |
+| Pipeline compute-KV 512 + scheduler | 64.305 | 50.007 | Non-bitwise, finite |
+| Pipeline compute-KV 1024 | Compile failure | 50.021 | Not executed |
+
+The 1024 case needs 70.57M VMEM versus 63.94M available; register-allocation
+spill slots account for 40.95M. This diagnoses the failed configuration, not
+the precise spill cost of the configurations that compile. For compute-KV 512,
+dK is bitwise; dQ relative L2 is `2.14896e-5` and dV `3.22779e-6`. Changing the
+compute tile also changes reduction grouping; the comparison against PR13 does
+not isolate numerical changes caused solely by pipelining. No candidate is
+promoted, and the precision requirement is not relaxed.
+
+The first device module grows from 48.152 ms (layouts only) to 58.031 ms
+(compute-KV 512 pipeline); KV-loop time grows from 46.708 to 56.583 ms.
+Uncovered internal scope time stays about 0.199 ms. All three profiled variants
+have DIE0 TCS Any2IMEM descriptors=3, bytes=79872, and IMEM writes=624 for the
+three-call capture. Thus this regression is inside the loop, without the large
+instruction-loading traffic from the earlier unrolling regression. Simply
+carrying an additional tile did not improve the critical path.
+
+The CPU suite passed 61 tests before this submission. Evidence: details
+`an-uqnqhim26g`, device regions/counters/final LLO `an-otlg1kfq4m`, operator
+`an-a916zaobsu`, LLO inventory `an-dq0udj0fpa`. The generic operator report
+recognizes five successful metric rows; the failed compilation is preserved
+separately in `details.json`, rather than reported as a measured latency.
+
+## Forward unrolling and staged pipeline controls
+
+Commit `9f032bb` adds `fwd_kv_unroll` with its original default `True` and a
+default-off fixed-logit-shift `fwd_staged_kv_pipeline`. The latter prepares
+QK/exp for tile i before consuming tile i-1 in PV and the accumulators.
+Probabilities stay FP32 in PV; this is not a BF16-probability or FP8 shortcut.
+Forward outputs, logsumexp and all three gradients are checked, not just the
+backward function in isolation. The CPU suite passes 67 tests.
+
+Production-shape experiment `exp-77nlvju2ci`, artifact `art-jhiex75o69`, has
+20 timing samples per candidate. All eight compute-KV=256 configurations
+(including PR13) are bitwise equal for output, logsumexp, dQ, dK and dV.
+
+| Variant | Forward ms | Live PR13 ms |
+| --- | ---: | ---: |
+| PR13, fully unrolled | 21.070 | 20.863 |
+| Rolled control | 43.925 | 21.447 |
+| Unroll 2 | 32.570 | 20.782 |
+| Unroll 4 | 26.459 | 20.828 |
+| Unroll 8 | 23.707 | 21.015 |
+| Staged pipeline, rolled | 44.393 | 20.866 |
+| Staged pipeline, unroll 2 | 33.003 | 20.954 |
+| Staged pipeline, unroll 4 | 28.234 | 20.934 |
+| Staged pipeline, compute-KV 512 / unroll 2 | 30.632 | 21.144 |
+
+The final row is finite but non-bitwise: output relative L2 `2.72818e-5`,
+logsumexp `3.38810e-8`, dQ `1.40507e-4`, dK `1.44960e-4`, dV `1.27368e-4`.
+There is no performance gain to justify further promotion work on this
+configuration. None of this screen changes the default implementation.
+
+The device trace locates the forward regression inside the KV loop:
+
+| Profile | First device module ms | KV loops ms | Uncovered internal ms |
+| --- | ---: | ---: | ---: |
+| PR13 | 20.072 | 18.687 | 0.428 |
+| Rolled | 42.454 | 41.026 | 0.447 |
+| Pipeline + unroll 2 | 31.604 | 30.210 | 0.425 |
+
+All three captures have DIE0 TCS Any2IMEM descriptors=3 and bytes=79872.
+Reducing code expansion does not help this forward body. The controlled
+unroll sequence demonstrates an important cross-iteration scheduling effect,
+but these coarse scopes do not directly measure which operations overlap.
+At matched unroll factors the explicit two-stage version is no faster than
+the ordinary loop. Do not label the improvement over the rolled control a
+gain over PR13.
+
+Evidence: details `an-tysswrc1uk`, region/counters/final LLO `an-o8d6osf38w`,
+operator `an-6dzppjbuq4`, LLO inventory `an-y1sy0xg6k2`. The generic plugin's
+trace count is zero because it does not discover this nested XProf layout;
+the region analyzer reads all three captures and nine device calls directly.
+
+## Raw device metadata and remaining interpretation limits
+
+The trace-JSON clock search `an-d4neowuln6` found no validated clock or
+counter sampling window. A separate read-only decoder of the original
+XPlane files, `an-x4q19ck8ry/metadata.json`, uses the
+[OpenXLA XPlane schema](https://github.com/openxla/xla/blob/main/third_party/tsl/tsl/profiler/protobuf/xplane.proto).
+For `/device:TPU:0` it exposes `peak_teraflops_per_second=1028.75`,
+`peak_hbm_bw_gigabytes_per_second=3686.1556817920005`,
+`has_megacore=0`, and `has_merged_vmem=1`. It does not expose a TensorCore clock
+statistic or a validated hardware-counter duration. Peak-capability metadata
+must not be treated as a measurement of operating frequency or kernel
+utilization. The large idle/startup component of all-capture counters remains
+a reason not to divide them by one kernel duration.
+
+This pair of pipeline probes has not achieved the 20–30% target. The next
+useful experiment must reduce live ranges or layout work while retaining the
+effective unrolling schedule, rather than assuming that a larger carried
+tile will create useful overlap. Arithmetic changes remain subject to
+separate numerical review; CPU equality alone cannot certify TPU behavior.
