@@ -202,11 +202,6 @@ def _parser():
   parser.add_argument("--interpret", action="store_true")
   parser.add_argument("--split-major-segments", action="store_true")
   parser.add_argument("--bwd-dq-contract-ds-axis0", action="store_true")
-  parser.add_argument("--bwd-dq-transposed-output", action="store_true")
-  parser.add_argument(
-      "--check-bwd-dq-transposed-output", action="store_true",
-      help="Require bitwise-equal, finite TPU gradients versus untransposed dQ dots.",
-  )
   parser.add_argument("--bwd-keep-kv-seq-minor", action="store_true")
   parser.add_argument("--bwd-do-seq-minor", action="store_true")
   parser.add_argument(
@@ -239,10 +234,6 @@ def main():
       not args.bwd_do_seq_minor or args.split_major_segments
   ):
     raise ValueError("dO layout check requires --bwd-do-seq-minor without segment splitting")
-  if args.check_bwd_dq_transposed_output and (
-      not args.bwd_dq_transposed_output or args.split_major_segments
-  ):
-    raise ValueError("dQ check requires --bwd-dq-transposed-output without segment splitting")
   ids_np = np.concatenate(
       [
           *(np.full(n, i, np.int32) for i, n in enumerate(args.segment_lengths[:-1], 1)),
@@ -276,7 +267,6 @@ def main():
       bwd_parallel_heads=args.bwd_parallel_heads,
       bwd_scheduler=args.bwd_scheduler,
       bwd_dq_contract_ds_axis0=args.bwd_dq_contract_ds_axis0,
-      bwd_dq_transposed_output=args.bwd_dq_transposed_output,
       bwd_keep_kv_seq_minor=args.bwd_keep_kv_seq_minor,
       bwd_do_seq_minor=args.bwd_do_seq_minor,
       bwd_dp_before_qk=args.bwd_dp_before_qk,
@@ -363,14 +353,9 @@ def main():
 
   precision_check = None
   reference_bwd = None
-  if args.check_bwd_do_seq_minor or args.check_bwd_dq_transposed_output:
-    reference_flags = {}
-    if args.check_bwd_do_seq_minor:
-      reference_flags["bwd_do_seq_minor"] = False
-    if args.check_bwd_dq_transposed_output:
-      reference_flags["bwd_dq_transposed_output"] = False
+  if args.check_bwd_do_seq_minor:
     reference_kernel = _make_kernel(
-        ids, dataclasses.replace(config, **reference_flags)
+        ids, dataclasses.replace(config, bwd_do_seq_minor=False)
     )
     reference_backward = jax.jit(
         lambda residuals, do: _backward(reference_kernel, residuals, do)

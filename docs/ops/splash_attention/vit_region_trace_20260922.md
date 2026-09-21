@@ -164,9 +164,33 @@ scratch, rather than forming the large dS transpose for `dQ = dS.T @ K`.
 The reference check disables only this orientation change, retaining the same
 other tuning/layout flags.
 
+The full-shape dQ trial is `exp-0cw1kyzxf0`, source `4b803ec`, artifact
+`art-q8qyvvh9t1`. It retains sequence-minor dO in both candidate and reference;
+the orientation flag is the only difference in the same-process backward
+comparison. Precision is checked before timing, and any bit-pattern or finite
+check failure aborts the benchmark rather than relaxing the threshold.
+
+**Rejected:** the full-shape TPU check reported dQ and dV not bitwise equal;
+dK remained bitwise equal and all three remained finite. The experiment failed
+at the explicit accuracy gate, before timing/profiling, not during compilation
+or provisioning. The magnitude and cause of the discrepancies have not been
+quantified, so this is not a claim of a particular model-level error rate.
+There is no latency result for this candidate. Its 43 CPU tests had passed;
+CPU interpretation was insufficient to certify compiled TPU numerics.
+The orientation flag and implementation were subsequently removed from the
+active branch. Commit `4b803ec` preserves the rejected trial for investigation.
+
+The counter inventory `an-5leius2bxu` also exposes actual MXU busy-state and XLU
+transpose counters in the dO capture. They are encoded as zero-duration events
+with `counter_value`, not Chrome `ph=C` events. Their measurement window is not
+per named region, and chip/die attribution must be resolved before deriving
+kernel utilization. In particular, do not divide the entire-capture MXU busy
+counter by a single forward/backward duration or count another die's activity
+as attention parallelism.
+
 ## Validation and next decision
 
-The ViT tuning regression suite passes 37 tests. New tests compare outputs and
+The retained ViT tuning regression suite passes 37 tests. New tests compare outputs and
 all dQ/dK/dV arrays bitwise at head dimension 72 for none/coarse/fine tracing
 plus the exact-layout flags and dO layout variants. These are CPU-interpreted arithmetic checks, not
 TPU compiled numerical certification or training convergence validation.
