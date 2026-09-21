@@ -59,10 +59,17 @@ def variants(phase="backward"):
         ("joint_fast", _FWD_FAST | _DQ_DK_FIRST),
         ("joint_native_drain", _FWD_FAST | _DQ_DK_FIRST | dict(fwd_native_output_normalization=True)),
         ("joint_native_output", _FWD_FAST | _DQ_DK_FIRST | dict(fwd_native_output_normalization=True, fwd_output_seq_minor=True)),
+        ("joint_q4096_native_output", _FWD_KVMAJOR | _DQ_DK_FIRST | dict(block_q=4096, block_kv=4096, fwd_native_output_normalization=True, fwd_output_seq_minor=True)),
     ]
   if phase == "forward":
     return [
         ("pr13", {}),
+        ("single_loop", _FWD_FAST | dict(fwd_kvmajor_single_loop=True)),
+        ("single_loop_native_drain", _FWD_FAST | dict(fwd_kvmajor_single_loop=True, fwd_native_output_normalization=True)),
+        ("single_loop_native_output", _FWD_FAST | dict(fwd_kvmajor_single_loop=True, fwd_native_output_normalization=True, fwd_output_seq_minor=True)),
+        ("single_loop_q4096", _FWD_KVMAJOR | dict(block_q=4096, fwd_kvmajor_single_loop=True, fwd_native_output_normalization=True, fwd_output_seq_minor=True)),
+        ("single_loop_q4096_c512", _FWD_KVMAJOR | dict(block_q=4096, block_kv_compute=512, fwd_kvmajor_single_loop=True, fwd_native_output_normalization=True, fwd_output_seq_minor=True)),
+        ("single_loop_q4096_k4096", _FWD_KVMAJOR | dict(block_q=4096, block_kv=4096, fwd_kvmajor_single_loop=True, fwd_native_output_normalization=True, fwd_output_seq_minor=True)),
         ("native_drain", _FWD_FAST | dict(fwd_native_output_normalization=True)),
         ("native_output", _FWD_FAST | dict(fwd_native_output_normalization=True, fwd_output_seq_minor=True)),
         ("q4096_k4096_native_drain", _FWD_KVMAJOR | dict(block_q=4096, block_kv=4096, fwd_native_output_normalization=True)),

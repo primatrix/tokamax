@@ -229,6 +229,9 @@ class SplashConfig:
   # Fixed-shift ViT diagnostic: produce P as [KV, Q] from QK onward,
   # feed V @ P directly, and keep output/state scratch sequence-minor.
   fwd_kvmajor_probabilities: bool = False
+  # Share dot/exp/PV between full/partial tiles; branch only around masking.
+  # This controls instruction footprint without changing mask semantics.
+  fwd_kvmajor_single_loop: bool = False
   # Accuracy/scheduling control: express sum on the reference's logical axis.
   # This does not guarantee identical lowering or floating-point association.
   fwd_kvmajor_sum_in_qmajor: bool = False
@@ -268,6 +271,8 @@ class SplashConfig:
       raise ValueError("native output normalization requires sequence-minor output and compact statistics scratch")
     if self.fwd_output_seq_minor and not self.fwd_native_output_normalization:
       raise ValueError("sequence-minor forward output requires native normalization")
+    if self.fwd_kvmajor_single_loop and not self.fwd_kvmajor_probabilities:
+      raise ValueError("shared segment loop requires native KV-major probabilities")
     if self.block_kv_compute is None:
       object.__setattr__(self, "block_kv_compute", self.block_kv)
     if self.block_kv_dkv_compute is None:
@@ -580,10 +585,15 @@ def flash_attention_kernel(
       )
       logits *= jnp.float32(config.softmax_scale * LOG2E)
     with _attention_scope(config, "splash_fwd_mask"):
-      if not config.segment_mask_on_partial_only or has_partial_mask:
+      def mask_logits(value):
         q_ids = q_segment_ids_ref[:, :1].T
         kv_ids = kv_segment_ids_ref[:1, window].T
-        logits = jnp.where(kv_ids == q_ids, logits, mask_value)
+        return jnp.where(kv_ids == q_ids, value, mask_value)
+
+      if config.fwd_kvmajor_single_loop and config.segment_mask_on_partial_only:
+        logits = lax.cond(should_not_mask, lambda value: value, mask_logits, logits)
+      elif not config.segment_mask_on_partial_only or has_partial_mask:
+        logits = mask_logits(logits)
     with _attention_scope(config, "splash_fwd_softmax"):
       probabilities = jnp.exp2(logits - max_logit_estimate)
       if not config.fwd_kvmajor_fuse_normalizer:
@@ -817,15 +827,22 @@ def flash_attention_kernel(
     else:
       lax.fori_loop(0, num_iters, loop_body, None, unroll=config.fwd_kv_unroll)
 
-  @pl.when(should_not_mask)
-  def _():
+  if config.fwd_kvmajor_single_loop:
+    # The native KV-major path only supports segment masks. Keep the full/
+    # partial decision around masking, preserving ID 0 == 0, without emitting
+    # two fully unrolled copies of the expensive dot/exp/PV.
     with _attention_scope(config, "splash_fwd_kv_loop", coarse=True):
-      run_inner_loop(False)
-
-  @pl.when(jnp.logical_not(should_not_mask))
-  def _():
-    with _attention_scope(config, "splash_fwd_kv_loop_partial", coarse=True):
       run_inner_loop(True)
+  else:
+    @pl.when(should_not_mask)
+    def _():
+      with _attention_scope(config, "splash_fwd_kv_loop", coarse=True):
+        run_inner_loop(False)
+
+    @pl.when(jnp.logical_not(should_not_mask))
+    def _():
+      with _attention_scope(config, "splash_fwd_kv_loop_partial", coarse=True):
+        run_inner_loop(True)
 
   @pl.when(should_write)
   def end():
