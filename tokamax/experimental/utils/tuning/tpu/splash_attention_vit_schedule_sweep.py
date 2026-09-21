@@ -190,6 +190,9 @@ def main():
       candidate = None
       try:
         kernel = bench._make_kernel(ids, candidate_cfg)
+        # The benchmark helper sets dq_reduction_steps; record what executes.
+        row["config"] = dataclasses.asdict(kernel.kwargs["config"])
+        row["compile_started_ns"] = time.time_ns()
         started = time.perf_counter()
         if args.phase == "backward":
           candidate_residuals = (*residuals[:-1], kernel.dkv_mask_info)
@@ -203,6 +206,7 @@ def main():
               lambda q, k, v, ids: bench._forward(kernel, q, k, v, ids)
           ).lower(*candidate_args).compile()
         row["compile_seconds"] = time.perf_counter() - started
+        row["compile_finished_ns"] = time.time_ns()
         if args.phase == "backward":
           candidate_grads = bench._ready(candidate(*candidate_args))
           output_precision = {}

@@ -190,7 +190,7 @@ as attention parallelism.
 
 ## Validation and next decision
 
-The retained ViT tuning regression suite passes 37 tests. New tests compare outputs and
+The retained ViT tuning regression suite passes 45 tests at `41877a1`. New tests compare outputs and
 all dQ/dK/dV arrays bitwise at head dimension 72 for none/coarse/fine tracing
 plus the exact-layout flags and dO layout variants. These are CPU-interpreted arithmetic checks, not
 TPU compiled numerical certification or training convergence validation.
@@ -200,3 +200,66 @@ coarse loop body time against initialization/output/grid-transition time, then
 map exposed intervals to compiler or hardware evidence. A dot-only microbench
 cannot prove attention overlap is saturated. No 40–50% kernel gain is claimed
 by the tracing/layout work above.
+
+## Scheduling screen after the region audit
+
+`exp-v9le0h9j6n` (`1c1a2f7`, artifact `art-afybaczla0`) screens 12 backward
+configurations on the production shape and seed 27. Each candidate has 12 timing
+samples and is followed by a six-sample live PR13 reference check. Forward
+residuals are shared unchanged. Backward tiling changes replace the residual
+MaskInfo as well as the configuration; otherwise they would not test the
+requested tiling correctly. No BF16 probability reuse is enabled.
+
+| Configuration | Backward ms | Live PR13 ms | Full-shape precision |
+| --- | ---: | ---: | --- |
+| PR13 | 50.187 | 50.175 | bitwise |
+| Sequence-minor layouts, including dO | 49.510 | 49.981 | bitwise |
+| Layouts + unroll 2 | 65.588 | 50.140 | bitwise |
+| Layouts + unroll 4 | 58.623 | 50.249 | bitwise |
+| Layouts + compute-KV 512 | 51.533 | 50.035 | review required |
+| Layouts + compute-KV 512 + unroll 2 | 50.208 | 49.978 | review required |
+| Layouts + Q 2048 | 51.134 | 49.980 | review required |
+| Layouts + Q 2048 + unroll 2 | 50.181 | 50.261 | review required |
+| Layouts + Q 2048 + compute-KV 512 + unroll 2 | 51.472 | 50.046 | review required |
+| Layouts + scheduler | 49.834 | 49.726 | bitwise |
+| Layouts + compute-KV 512 + scheduler | 51.352 | 50.200 | review required |
+| Layouts + early dP / late dV | 55.475 | 49.969 | review required |
+
+All gradients are finite. Non-bitwise candidates are diagnostic measurements,
+not automatically accepted. For example compute-KV 512 changes 2394 of
+75497472 dQ elements, relative L2 `2.14896e-5`, max absolute `0.000244140625`;
+dK/dV remain bitwise. Q 2048 produces relative L2 errors between `7.39487e-6`
+and `1.60743e-5`. These are differences from PR13, not errors against an FP32
+oracle or a training-convergence certification. None of these candidates has a
+material speed benefit, so there is no reason to trade precision for them.
+
+Evidence: operator `an-2a2iwpmbj5`; numerical details and raw timing samples
+`an-nm9p3xz5rf/details.json`; LLO inventory `an-y5u381yz1i`; final-LLO and device
+scope audit `an-94t2rxgo7e/audit.json`. The built-in operator inventory reports
+zero traces for this nested variant-directory layout; the custom audit confirms
+three `.trace.json.gz` plus three `.xplane.pb` files. Zero in that inventory does
+not mean no profiles were captured.
+
+The unroll-2 trace is especially informative: its first device module takes
+64.106 ms, but the coarse KV-loop regions total 46.569 ms, close to PR13's
+46.528 ms (48.681 ms device module). Uncovered time within the first-to-last
+scope span grows from 0.202 ms to 16.266 ms. The regression is therefore exposed
+outside the named loop regions, not measured as slower dots inside the loop.
+This does not identify DMA, instruction loading, or another scheduling mechanism;
+the new configuration also needs a trace-disabled control before attribution.
+
+## Forward loop-carried state probe
+
+Commit `41877a1` adds default-off `fwd_loop_carry`: carry softmax m/l and output
+accumulators through the inner loop, committing them to scratch only at the
+memory-tile boundary. Operation order and intermediate precision are retained.
+The hypothesis is reduced explicit VMEM traffic and more compiler scheduling
+freedom, not an assumed speedup. The final coarse baseline body still contains
+24320 vector loads, 8456 unmasked stores and 12288 MXU multiply instructions
+across both mask branches; these are static counts, not dynamic costs.
+
+The forward screen is `exp-406vxkirrx`, artifact `art-7vslcgvgd9`, pinned to
+`41877a1`, with the same JAX/libtpu versions, production shape and seed. It checks
+output, logsumexp and dQ/dK/dV, and screens carry, compact scratch, Q/compute-KV
+sizes and scheduler combinations. CPU-interpreted checks pass, but the flag
+remains experimental and off by default until compiled TPU evidence is reviewed.
