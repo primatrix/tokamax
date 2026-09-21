@@ -204,6 +204,7 @@ def _parser():
   parser.add_argument("--use-base2-exp", action="store_true")
   parser.add_argument("--bwd-reuse-bf16-probabilities", action="store_true")
   parser.add_argument("--bwd-compact-segment-ids", action="store_true")
+  parser.add_argument("--bwd-dq-scratch-seq-minor", action="store_true")
   parser.add_argument("--bwd-dkv-scratch-seq-minor", action="store_true")
   parser.add_argument("--bwd-dkv-output-seq-minor", action="store_true")
   parser.add_argument("--bwd-fuse-segment-id-inputs", action="store_true")
@@ -258,6 +259,7 @@ def main():
       bwd_head_group_size=args.bwd_head_group_size,
       bwd_reuse_bf16_probabilities=args.bwd_reuse_bf16_probabilities,
       bwd_compact_segment_ids=args.bwd_compact_segment_ids,
+      bwd_dq_scratch_seq_minor=args.bwd_dq_scratch_seq_minor,
       bwd_dkv_scratch_seq_minor=args.bwd_dkv_scratch_seq_minor,
       bwd_dkv_output_seq_minor=args.bwd_dkv_output_seq_minor,
       bwd_fuse_segment_id_inputs=args.bwd_fuse_segment_id_inputs,

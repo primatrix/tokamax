@@ -66,6 +66,7 @@ def _relative_l2(actual, expected):
         {"bwd_head_group_size": 2},
         {"bwd_reuse_bf16_probabilities": True},
         {"bwd_compact_segment_ids": True},
+        {"bwd_dq_scratch_seq_minor": True},
         {"bwd_dkv_scratch_seq_minor": True},
         {
             "bwd_dkv_scratch_seq_minor": True,
@@ -83,6 +84,7 @@ def _relative_l2(actual, expected):
         "head_group_2",
         "reuse_bf16_probabilities",
         "compact_segment_ids",
+        "dq_scratch_seq_minor",
         "dkv_scratch_seq_minor",
         "dkv_scratch_and_output_seq_minor",
         "fuse_segment_id_inputs",
@@ -137,6 +139,7 @@ def test_tuning_preserves_segmented_outputs_and_all_gradients(
       flag: False
       for flag in (
           "bwd_compact_segment_ids",
+          "bwd_dq_scratch_seq_minor",
           "bwd_dkv_scratch_seq_minor",
           "bwd_dkv_output_seq_minor",
           "bwd_fuse_segment_id_inputs",

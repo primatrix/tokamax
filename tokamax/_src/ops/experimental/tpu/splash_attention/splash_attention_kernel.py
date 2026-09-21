@@ -174,6 +174,9 @@ class SplashConfig:
   # Store FP32 dK/dV accumulators with sequence as the minor dimension. This
   # avoids padding a non-MXU-facing head dimension in VMEM.
   bwd_dkv_scratch_seq_minor: bool = False
+  # Store the FP32 dQ accumulator with sequence as the minor dimension. This
+  # avoids the same head-dimension padding without changing the public layout.
+  bwd_dq_scratch_seq_minor: bool = False
   # Return dK/dV from the Pallas call in sequence-minor physical layout, then
   # restore the public logical layout outside the custom call.
   bwd_dkv_output_seq_minor: bool = False
@@ -1616,10 +1619,13 @@ def _flash_attention_dkv_kernel(
             dq *= jnp.float32(config.softmax_scale)
           if dq_scratch_ref is not None:
             # Compute block size != memory block size
+            scratch_update = (
+                dq.T if config.bwd_dq_scratch_seq_minor else dq
+            )
             if head_group_size == 1:
-              dq_scratch_ref[...] += dq
+              dq_scratch_ref[...] += scratch_update
             else:
-              head_ref(dq_scratch_ref)[...] += dq
+              head_ref(dq_scratch_ref)[...] += scratch_update
           else:
             # Compute block size == memory block size
             if head_group_size == 1:
@@ -1675,10 +1681,13 @@ def _flash_attention_dkv_kernel(
 
   if dq_scratch_ref is not None:
     with jax.named_scope("splash_bwd_dq_output_drain"):
+      dq_scratch = dq_scratch_ref[...]
+      if config.bwd_dq_scratch_seq_minor:
+        dq_scratch = jnp.swapaxes(dq_scratch, -1, -2)
       if dq_alias is not None:
-        dq_ref[...] = dq_alias[...] + dq_scratch_ref[...].astype(dq_ref.dtype)
+        dq_ref[...] = dq_alias[...] + dq_scratch.astype(dq_ref.dtype)
       else:
-        dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
+        dq_ref[...] = dq_scratch.astype(dq_ref.dtype)
 
   if dk_alias is None:
     assert dv_alias is None
@@ -1997,9 +2006,17 @@ def _splash_attention_bwd_dkv(
     dq_scratch = None
   else:
     dq_scratch = pltpu.VMEM(
-        (bq, head_dim_qk)
+        (
+            (head_dim_qk, bq)
+            if config.bwd_dq_scratch_seq_minor
+            else (bq, head_dim_qk)
+        )
         if head_group_size == 1
-        else (head_group_size, bq, head_dim_qk),
+        else (
+            (head_group_size, head_dim_qk, bq)
+            if config.bwd_dq_scratch_seq_minor
+            else (head_group_size, bq, head_dim_qk)
+        ),
         jnp.float32,
     )
 
