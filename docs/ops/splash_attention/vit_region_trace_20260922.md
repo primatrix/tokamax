@@ -23,7 +23,7 @@ The subsequent branchless-forward, internal-Q backward pipeline and
 small-body backward-unroll screens add **no retained speedup**. The best
 new backward case is Q1024/unroll-4 at 46.070 ms versus the retained
 45.201 ms in the same experiment. All remain default-off. The expanded
-CPU kernel/oracle suite passes 234 tests; these TPU screens preserve finite
+CPU kernel/oracle suite passes 284 tests; these TPU screens preserve finite
 outputs and essentially unchanged sampled independent-oracle errors.
 
 All new orientation/pipeline controls remain default-off. BF16 inputs,
@@ -1450,8 +1450,8 @@ retain dK/dV accumulators across inner Q subtiles and drain once per compute
 KV block, instead of repeatedly loading/storing them for every subtile.
 Keep the FP32 addition order and BF16 dot boundaries, compare against the
 same Q-tile control, and recheck both oracle errors and VMEM/code footprint.
-This is a proposed experiment, not an implemented or measured gain. The
-current evidence does not establish that MXU/vector overlap is optimal.
+The implementation and negative results of this experiment are recorded
+below. The current evidence does not establish optimal MXU/vector overlap.
 
 ## Nested Q sweep and dK/dV accumulator reuse
 
@@ -1472,3 +1472,63 @@ TPU screen focuses on sequential schedules to isolate accumulator reuse.
 This does not guarantee that the compiler keeps accumulators in registers
 or that the larger live range is profitable. Independent precision checks,
 timings and trace/compiler evidence remain required before promotion.
+
+Source `01f5f5d094ce9155015cb7676529f80128f2e407` passes 78 focused CPU
+tests and all **284 kernel/oracle tests** (219.86 seconds). Nested/carry,
+sequential/staged and unroll 1/2/4 paths are directly bitwise equal to their
+matched flat rolled Q-tile controls at the tested CPU shapes/seeds.
+
+`exp-m2iiz18ivs` (artifact `art-ikyymnjlwr`) completes nine full-size BF16
+backward cases. No new configuration is faster than the retained control:
+
+| Variant | Latency ms | Live PR13 ms | KV-loop ms |
+| --- | ---: | ---: | ---: |
+| Retained | 45.543 | 50.107 | 42.475 |
+| Q1024 flat / unroll 4 | 45.976 | 50.107 | 43.054 |
+| Q1024 nested / unroll 4 | 45.676 | 49.778 | 43.022 |
+| Q1024 accumulator carry / rolled | 50.042 | 50.046 | 47.254 |
+| Q1024 accumulator carry / unroll 2 | 47.799 | 49.997 | 44.972 |
+| Q1024 accumulator carry / unroll 4 | 45.683 | 50.051 | 43.058 |
+| Q512 nested / unroll 4 | 46.862 | 50.133 | 43.956 |
+| Q512 accumulator carry / unroll 4 | 47.225 | 50.173 | 44.510 |
+
+All captures have 79,872 DIE0 TCS IMEM bytes / 3 descriptors and only
+0.198–0.202 ms of internal uncovered intervals. There is no instruction-load
+regression masking a gain here. In the non-partial Q1024/unroll-4 loop,
+accumulator carry really reduces explicit vector loads **1,728 -> 1,008**
+and stores **864 -> 432**, with unchanged 4,416 MXU / 1,536 transpose
+instructions. The partial loop's loads fall **2,240 -> 1,520**. These
+changes do not improve measured loop time. Thus reducing these explicit
+loads/stores alone is insufficient; it is not valid to assert that the
+control compiler had already performed the same reuse or that every saved
+instruction was on the critical path. These dumps are still SCF/SSA LLO,
+not a direct post-allocation spill or hardware-utilization measurement.
+
+The rolled nested carry has 144 vector SSA values in its inner Q-loop
+state. Its non-partial inner loop has 216 loads / 72 stores per Q subtile,
+plus the one-time outer accumulator load/drain. Counts for nested parent
+and child loop bodies overlap and must not be summed as independent work.
+
+All candidate arrays and independent FP32 oracle arrays are finite.
+Within each Q-compute family, reported precision statistics match prior
+controls; per-head maximum absolute gradient errors are unchanged versus
+PR13 on heads 0/15/16/31. Worst L2-error ratios across new variants remain
+1.000000561 (dQ), 1.000005405 (dK), 1.000005690 (dV). This is sampled
+numerical evidence, not direct full-size pairwise bitwise equality or a
+training-convergence certification. No carry configuration is promoted.
+
+Evidence: details `an-8bxjbpaumz`, regions/final LLO `an-ba4kvehezg`,
+loop structure `an-4px0bd91gf`, operator `an-s2ugujzhff`, LLO
+`an-4oi2sc0ihh`. All five analyses succeeded and their reports were read.
+
+## Larger backward Q aspect-ratio screen
+
+The next bounded screen goes back to the retained, non-Q-subtiled path:
+increase memory/compute Q together to 8192 or 16384, while shrinking
+compute-KV to keep QK/P/dS tile area bounded. Memory-KV stays 8192, so
+the dQ reduction-slot schedule and BF16 output-partial boundaries do not
+change merely from adding more memory-KV blocks. Compare against both the
+retained Q4096/compute-KV1024 and Q4096/compute-KV512 controls. Larger Q
+can amortize accumulations and outer-block setup, but grows Q/dO/dQ buffer
+requirements; VMEM capacity, precision and loop/drain timing must be checked.
+This is a hypothesis, not a measured speedup.

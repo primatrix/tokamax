@@ -256,6 +256,40 @@ def test_invalid_backward_q_compute_tile_rejected(kwargs):
     splash.SplashConfig(block_q=128, block_kv=128, **kwargs)
 
 
+@pytest.mark.parametrize("seed", [27, 28])
+@pytest.mark.parametrize("block_q,compute_kv", [(1024, 256), (1024, 128), (2048, 256), (2048, 128)])
+def test_backward_large_q_aspect_ratio_against_fp64(seed, block_q, compute_kv):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_accuracy as accuracy
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_schedule_sweep as sweep
+
+  q, k, v, do = [jax.random.normal(key, (1, 4096, 72), jnp.bfloat16)
+                 for key in jax.random.split(jax.random.key(seed), 4)]
+  ids = jnp.asarray(np.repeat(np.array([1, 2, 3, 0], np.int32), [2048, 2032, 8, 8]))
+  segments = base.SegmentIds(ids, ids)
+  cfg = splash.SplashConfig(
+      block_q=256, block_kv=1024, block_kv_compute=128,
+      block_q_dkv=512, block_kv_dkv=1024, block_kv_dkv_compute=256,
+      q_layout=splash.QKVLayout.SEQ_MINOR, k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR, softmax_scale=72**-0.5,
+      use_base2_exp=True, max_logit_const=0.0, interpret=True,
+      **(_TUNING | sweep._DQ_DK_FIRST),
+  )
+  reference = bench._make_kernel(segments, cfg)
+  _, residuals = bench._forward(reference, q, k, v, segments)
+  expected = bench._backward(reference, residuals, do)
+  candidate = bench._make_kernel(segments, dataclasses.replace(
+      cfg, block_q_dkv=block_q, block_kv_dkv_compute=compute_kv,
+  ))
+  candidate_residuals = (*residuals[:-1], candidate.dkv_mask_info)
+  actual = bench._backward(candidate, candidate_residuals, do)
+  oracle = accuracy.numpy_attention_and_gradients(q[0], k[0], v[0], do[0], ids, ids)
+  for value, control, fp64 in zip(actual, expected, oracle[2:]):
+    assert value.shape == control.shape and value.dtype == control.dtype
+    assert np.isfinite(np.asarray(value)).all()
+    assert _relative_l2(value[0], fp64) <= _relative_l2(control[0], fp64) * 1.001 + 1e-7
+
+
 def test_conflicting_dv_order_rejected():
   with pytest.raises(ValueError, match="dV cannot be both"):
     splash.SplashConfig(
