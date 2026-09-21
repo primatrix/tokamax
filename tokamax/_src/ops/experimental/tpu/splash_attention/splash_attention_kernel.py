@@ -180,6 +180,9 @@ class SplashConfig:
   # Keep BF16 dot inputs and FP32 accumulation exactly as in the normal path.
   bwd_dk_transposed_output: bool = False
   bwd_dv_transposed_output: bool = False
+  # ViT-only diagnostic: form P/dS as [Q, KV] throughout the inner loop.
+  # dK/dV then write sequence-minor accumulators without transposing P/dS.
+  bwd_qmajor_probabilities: bool = False
   bwd_keep_kv_seq_minor: bool = False
   # Feed dO directly in sequence-minor physical layout to dP/dV dots.
   # This changes operand preparation, not the logical contraction or dtype.
@@ -1603,6 +1606,7 @@ def _flash_attention_dkv_kernel(
         and not config.bwd_dq_transposed_output
         and not config.bwd_dk_transposed_output
         and not config.bwd_dv_transposed_output
+        and not config.bwd_qmajor_probabilities
         and not config.bwd_dv_last
         and not config.bwd_reuse_bf16_probabilities
         and config.use_base2_exp
@@ -1669,7 +1673,82 @@ def _flash_attention_dkv_kernel(
     state = lax.fori_loop(1, num_iters, step, state, unroll=False)
     consume(num_iters - 1, state)
 
+  def qmajor_body(i, has_partial_mask):
+    if not (
+        head_group_size == 1
+        and config.q_layout == config.k_layout == config.v_layout == QKVLayout.SEQ_MINOR
+        and config.bwd_do_seq_minor
+        and config.bwd_dq_scratch_seq_minor
+        and config.bwd_dkv_scratch_seq_minor
+        and config.bwd_scale_after_dot
+        and not config.bwd_dk_transposed_output
+        and not config.bwd_dv_transposed_output
+        and not config.bwd_dq_contract_ds_axis0
+        and not config.bwd_reuse_bf16_probabilities
+        and config.use_base2_exp and config.combine_log2_scale
+        and config.softmax_scale is not None
+        and attn_logits_soft_cap is None
+        and dq_scratch_ref is not None
+        and mask_ref is None and mask_function is None
+        and q_segment_ids_ref is not None and kv_segment_ids_ref is not None
+        and q_ref.dtype == k_ref.dtype == v_ref.dtype == do_ref.dtype == jnp.bfloat16
+    ):
+      raise ValueError("bwd_qmajor_probabilities requires ViT sequence-minor BF16 inputs and scratch")
+    window = pl.ds(i * bkv_compute, bkv_compute)
+    q, k, v, do = q_ref[...], k_ref[:, window], v_ref[:, window], do_ref[...]
+
+    def compute_dp():
+      with _attention_scope(config, "splash_bwd_dp_mxu"):
+        return lax.dot_general(do, v, TN_DIM_NUMBERS, preferred_element_type=jnp.float32)
+
+    dp = compute_dp() if config.bwd_dp_before_qk else None
+    with _attention_scope(config, "splash_bwd_qk_recompute_mxu"):
+      logits = lax.dot_general(q, k, TN_DIM_NUMBERS, preferred_element_type=jnp.float32)
+      logits *= jnp.float32(config.softmax_scale * LOG2E)
+    with _attention_scope(config, "splash_bwd_mask_softmax"):
+      if not config.segment_mask_on_partial_only or has_partial_mask:
+        q_ids = q_segment_ids_ref[:1, :].T
+        kv_ids = kv_segment_ids_ref[window, :1].T
+        logits = jnp.where(q_ids == kv_ids, logits, mask_value)
+      p = jnp.exp2(logits - logsumexp_ref[:1, :].T)
+      p_bf16 = p.astype(do.dtype)
+
+    def compute_dv():
+      with _attention_scope(config, "splash_bwd_dv_mxu_accum"):
+        dv_t = lax.dot_general(do, p_bf16, NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        dv_scratch_ref[:, window] += dv_t.astype(dv_scratch_ref.dtype)
+
+    if not config.bwd_dv_last:
+      compute_dv()
+    with _attention_scope(config, "splash_bwd_softmax_grad"):
+      if dp is None:
+        dp = compute_dp()
+      ds = ((dp - di_ref[:1, :].T) * p).astype(do.dtype)
+
+    def compute_dk():
+      with _attention_scope(config, "splash_bwd_dk_mxu_accum"):
+        dk_t = lax.dot_general(q, ds, NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        dk_t *= jnp.float32(config.softmax_scale)
+        dk_scratch_ref[:, window] += dk_t.astype(dk_scratch_ref.dtype)
+
+    if not config.bwd_dq_first:
+      compute_dk()
+    with _attention_scope(config, "splash_bwd_dq_mxu_accum"):
+      if config.bwd_dq_transposed_output:
+        dq_t = lax.dot_general(k, ds, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+      else:
+        dq_t = lax.dot_general(ds, k, NT_DIM_NUMBERS, preferred_element_type=jnp.float32).T
+      dq_t *= jnp.float32(config.softmax_scale)
+      dq_scratch_ref[...] += dq_t
+    if config.bwd_dq_first:
+      compute_dk()
+    if config.bwd_dv_last:
+      compute_dv()
+
   def body(i, _, has_partial_mask=False):
+    if config.bwd_qmajor_probabilities:
+      qmajor_body(i, has_partial_mask)
+      return
 
     slice_k = pl.ds(i * bkv_compute, bkv_compute)
 

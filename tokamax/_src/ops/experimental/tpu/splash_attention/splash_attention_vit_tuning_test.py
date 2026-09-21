@@ -123,6 +123,41 @@ def test_dkv_orientation_preserves_head_dim_72(dk_transposed, dv_transposed, seq
     np.testing.assert_array_equal(value, wanted)
 
 
+@pytest.mark.parametrize("dq_transposed", [False, True])
+@pytest.mark.parametrize("order", ["dq_first", "dk_first", "dp_early", "dv_last"])
+def test_qmajor_probabilities_preserve_asymmetric_tiles(dq_transposed, order):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
+
+  q, k, v, do = [
+      jax.random.normal(key, (1, 512, 72), jnp.bfloat16)
+      for key in jax.random.split(jax.random.key(27), 4)
+  ]
+  ids = jnp.asarray(np.repeat(np.array([1, 2, 3, 0], np.int32), [256, 240, 8, 8]))
+  segments = base.SegmentIds(ids, ids)
+  cfg = splash.SplashConfig(
+      block_q=128, block_kv=256, block_kv_compute=128,
+      block_q_dkv=256, block_kv_dkv=256, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR, k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR,
+      softmax_scale=72**-0.5, use_base2_exp=True, max_logit_const=0.0,
+      bwd_dq_scratch_seq_minor=True, bwd_dkv_scratch_seq_minor=True,
+      bwd_dkv_output_seq_minor=True, bwd_do_seq_minor=True,
+      bwd_fuse_segment_id_inputs=True, interpret=True, **_TUNING,
+  )
+  reference = bench._make_kernel(segments, cfg)
+  _, residuals = bench._forward(reference, q, k, v, segments)
+  expected = bench._backward(reference, residuals, do)
+  candidate = bench._make_kernel(segments, dataclasses.replace(
+      cfg, bwd_qmajor_probabilities=True, bwd_dq_transposed_output=dq_transposed,
+      bwd_dq_first=order != "dk_first", bwd_dp_before_qk=order == "dp_early",
+      bwd_dv_last=order == "dv_last",
+  ))
+  actual = bench._backward(candidate, residuals, do)
+  for value, wanted in zip(actual, expected):
+    assert np.isfinite(np.asarray(value)).all()
+    np.testing.assert_array_equal(value, wanted)
+
+
 def test_invalid_trace_mode_rejected():
   with pytest.raises(ValueError, match="Invalid region_trace_mode"):
     splash.SplashConfig(block_q=128, block_kv=128, region_trace_mode="invalid")
