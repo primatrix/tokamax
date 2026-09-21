@@ -177,6 +177,8 @@ class SplashConfig:
   # Return dK/dV from the Pallas call in sequence-minor physical layout, then
   # restore the public logical layout outside the custom call.
   bwd_dkv_output_seq_minor: bool = False
+  # Let XLA fuse the segment-ID broadcast producers into the custom call.
+  bwd_fuse_segment_id_inputs: bool = False
   # Process multiple independent MHA heads in one Pallas program. Dots remain
   # 2D (Mosaic TPU does not support a rank-3 batched dot); the larger program
   # gives the scheduler independent BF16 dot/vector work to interleave.
@@ -2038,6 +2040,24 @@ def _splash_attention_bwd_dkv(
       mask_info.partial_mask_blocks,
       q_sequence,
   ]
+  input_fusion_candidates = [
+      False,  # active_rows
+      False,  # active_cols
+      False,  # mask_next
+      False,  # bounds_start
+      False,  # bounds_end
+      False,  # block_mask
+      False,  # q
+      False,  # k
+      False,  # v
+      True,  # q_segment_ids
+      True,  # kv_segment_ids
+      False,  # logsumexp
+      False,  # do
+      False,  # di
+      False,  # partial_mask_blocks
+      False,  # q_sequence
+  ]
   num_args = sum(1 for x in args if x is not None)
   input_output_aliases = {}
   if dq_reduction_steps == 3:
@@ -2156,6 +2176,21 @@ def _splash_attention_bwd_dkv(
       dkv_mask_sparsity,
   )
 
+  allow_input_fusion = None
+  if config.bwd_fuse_segment_id_inputs:
+    # The dynamic grid bound is the first custom-call operand. Pallas then
+    # removes None arguments while preserving the order of the remaining
+    # scalar-prefetch and regular inputs, followed by aliased outputs.
+    allow_input_fusion = (
+        *((False,) if dynamic_grid else ()),
+        *(
+            can_fuse
+            for arg, can_fuse in zip(args, input_fusion_candidates)
+            if arg is not None
+        ),
+        *(False for value in (dq, dk, dv) if value is not None),
+    )
+
   with jax.named_scope(kernel_name):
     dq_unreduced, dk, dv = pl.pallas_call(
         kernel,
@@ -2185,6 +2220,7 @@ def _splash_attention_bwd_dkv(
             if config.bwd_scheduler is None
             else {"XLA_TPU_FORCE_LP_LLO_SCHEDULER": config.bwd_scheduler},
             vmem_limit_bytes=config.bwd_vmem_limit_bytes,
+            allow_input_fusion=allow_input_fusion,
         ),
         name=kernel_name,
         cost_estimate=cost_estimate,

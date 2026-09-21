@@ -198,6 +198,7 @@ def _parser():
   parser.add_argument("--bwd-compact-segment-ids", action="store_true")
   parser.add_argument("--bwd-dkv-scratch-seq-minor", action="store_true")
   parser.add_argument("--bwd-dkv-output-seq-minor", action="store_true")
+  parser.add_argument("--bwd-fuse-segment-id-inputs", action="store_true")
   parser.add_argument(
       "--bwd-parallel-heads", action=argparse.BooleanOptionalAction, default=False
   )
@@ -251,6 +252,7 @@ def main():
       bwd_compact_segment_ids=args.bwd_compact_segment_ids,
       bwd_dkv_scratch_seq_minor=args.bwd_dkv_scratch_seq_minor,
       bwd_dkv_output_seq_minor=args.bwd_dkv_output_seq_minor,
+      bwd_fuse_segment_id_inputs=args.bwd_fuse_segment_id_inputs,
       interpret=args.interpret,
   )
   kernel = _make_kernel(ids, config)

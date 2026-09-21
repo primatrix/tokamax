@@ -71,6 +71,7 @@ def _relative_l2(actual, expected):
             "bwd_dkv_scratch_seq_minor": True,
             "bwd_dkv_output_seq_minor": True,
         },
+        {"bwd_fuse_segment_id_inputs": True},
     ],
     ids=[
         "combined",
@@ -84,6 +85,7 @@ def _relative_l2(actual, expected):
         "compact_segment_ids",
         "dkv_scratch_seq_minor",
         "dkv_scratch_and_output_seq_minor",
+        "fuse_segment_id_inputs",
     ],
 )
 def test_tuning_preserves_segmented_outputs_and_all_gradients(
@@ -137,6 +139,7 @@ def test_tuning_preserves_segmented_outputs_and_all_gradients(
           "bwd_compact_segment_ids",
           "bwd_dkv_scratch_seq_minor",
           "bwd_dkv_output_seq_minor",
+          "bwd_fuse_segment_id_inputs",
       )
       if extra.get(flag, False)
   }
