@@ -173,6 +173,9 @@ class SplashConfig:
   bwd_dv_last: bool = False
   bwd_cast_before_transpose: bool = False
   bwd_dq_contract_ds_axis0: bool = False
+  # Diagnostic: produce dQ.T directly, avoiding the large dS transpose.
+  # Reassociation can change TPU rounding; never infer accuracy from CPU alone.
+  bwd_dq_transposed_output: bool = False
   bwd_keep_kv_seq_minor: bool = False
   # Feed dO directly in sequence-minor physical layout to dP/dV dots.
   # This changes operand preparation, not the logical contraction or dtype.
@@ -1573,6 +1576,7 @@ def _flash_attention_dkv_kernel(
         and not config.bwd_dp_before_qk
         and not config.bwd_keep_kv_seq_minor
         and not config.bwd_dq_contract_ds_axis0
+        and not config.bwd_dq_transposed_output
         and not config.bwd_dv_last
         and not config.bwd_reuse_bf16_probabilities
         and config.use_base2_exp
@@ -1799,7 +1803,20 @@ def _flash_attention_dkv_kernel(
         compute_dk()
       if dq_scratch_ref is not None or dq_ref is not None:
         with _attention_scope(config, "splash_bwd_dq_mxu_accum"):
-          if config.bwd_dq_contract_ds_axis0:
+          if config.bwd_dq_transposed_output:
+            dq_dims = (
+                NN_DIM_NUMBERS
+                if config.bwd_keep_kv_seq_minor
+                and config.k_layout == QKVLayout.SEQ_MINOR
+                else TN_DIM_NUMBERS
+            )
+            dq_transposed = lax.dot_general(
+                k, ds.astype(k.dtype), dq_dims,
+                preferred_element_type=jnp.float32,
+            )
+            # Sequence-minor scratch cancels this logical-output transpose.
+            dq = dq_transposed.T
+          elif config.bwd_dq_contract_ds_axis0:
             dq_dims = (
                 TT_DIM_NUMBERS
                 if config.bwd_keep_kv_seq_minor

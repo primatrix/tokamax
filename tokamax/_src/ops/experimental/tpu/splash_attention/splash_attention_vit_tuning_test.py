@@ -49,7 +49,8 @@ def _relative_l2(actual, expected):
 
 @pytest.mark.parametrize("mode", ["none", "coarse", "fine"])
 @pytest.mark.parametrize("do_seq_minor", [False, True])
-def test_trace_scopes_and_seqminor_scratch_preserve_head_dim_72(mode, do_seq_minor):
+@pytest.mark.parametrize("dq_transposed", [False, True])
+def test_trace_scopes_and_seqminor_scratch_preserve_head_dim_72(mode, do_seq_minor, dq_transposed):
   """Layout/diagnostic changes must be bitwise exact at the production width."""
   arrays = [
       jax.random.normal(key, (1, 256, 72), jnp.bfloat16)
@@ -77,6 +78,7 @@ def test_trace_scopes_and_seqminor_scratch_preserve_head_dim_72(mode, do_seq_min
   expected = run(config)
   actual = run(dataclasses.replace(
       config, region_trace_mode=mode,
+      bwd_dq_transposed_output=dq_transposed,
       bwd_do_seq_minor=do_seq_minor,
       bwd_dq_scratch_seq_minor=True, bwd_dkv_scratch_seq_minor=True,
       bwd_dkv_output_seq_minor=True, bwd_fuse_segment_id_inputs=True,
@@ -172,6 +174,13 @@ def test_single_segment_mask_body_preserves_gradients(unroll, staged, kv_block):
         {"compact_softmax_scratch": True},
         {"bwd_dv_last": True},
         {"bwd_dq_contract_ds_axis0": True},
+        {"bwd_dq_transposed_output": True},
+        {
+            "bwd_dq_transposed_output": True,
+            "bwd_dq_scratch_seq_minor": True,
+            "bwd_dkv_scratch_seq_minor": True,
+            "bwd_do_seq_minor": True,
+        },
         {"bwd_do_seq_minor": True},
         {
             "bwd_do_seq_minor": True,
@@ -206,6 +215,8 @@ def test_single_segment_mask_body_preserves_gradients(unroll, staged, kv_block):
         "compact_scratch",
         "dv_last",
         "dq_contract_axis0",
+        "dq_transposed_output",
+        "dq_transposed_output_seqminor",
         "do_seq_minor",
         "do_and_v_seq_minor",
         "keep_kv_seq_minor",
