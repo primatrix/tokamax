@@ -1241,15 +1241,125 @@ these random-input checks do not certify training convergence or all inputs.
 Evidence: details `an-ofzxqfm1ld`, operator `an-j6jwd8cja3`, LLO
 `an-y2et4tz3zq`. All reports and declared precision output were inspected.
 
-## Next bounded work
+## Follow-up hypotheses after the joint reproduction
 
 The measured joint improvement is about 11% lower latency / 12% higher
 throughput, not the 20–30% target. Forward output formatting is no longer a
 large exposed cost. Retain the external full/partial branch and native
-drain as the current control. A useful next ablation is a shared loop with
-unconditional equality masking (`segment_mask_on_partial_only=False`) to
-remove per-compute-tile scalar branches. This separates branch-induced
-instruction loading from the cost of extra mask arithmetic without changing
-segment semantics. It has not been measured on TPU and is not a claimed
-optimization. Backward KV-loop work remains the largest measured region;
+drain as the current control. A shared loop with unconditional equality
+masking was the next ablation; its forward-only implementation and negative
+results are recorded below. Backward KV-loop work remains the largest measured region;
 coarse traces still do not prove that its MXU/vector overlap is optimal.
+
+## Branchless shared-loop forward control
+
+Source `c7943ab286d7787f4df48fc18e1e59ea66dd4eed` introduces default-off
+`fwd_kvmajor_mask_all_tiles`, restricted to the shared native forward loop.
+It applies segment equality unconditionally and removes the per-compute-tile
+scalar branch without modifying the backward mask policy. The CPU suite
+passes 206 tests, including both mask policies against FP64 at two seeds
+and two Q-compute shapes.
+
+`exp-gyakmt7le1` (artifact `art-3t27aopsk3`) completes seven forward cases:
+
+| Variant | Forward ms | Live PR13 ms | Device KV-loop ms | IMEM bytes / descriptors |
+| --- | ---: | ---: | ---: | ---: |
+| Q2048/compute-KV512 native output | 18.861 | 20.955 | 16.991 | 79,872 / 3 |
+| Same, branchless shared loop | 22.353 | 21.006 | 20.414 | 79,872 / 3 |
+| Q4096/memory-KV4096 native output | 18.759 | 21.467 | 16.903 | 12,710,400 / 12 |
+| Same, branchless shared loop | 23.817 | 21.008 | 22.063 | 79,872 / 3 |
+| Branchless Q4096/memory-KV8192 | 28.739 | 21.061 | 22.316 | 6,478,321,152 / 6,162 |
+| Previous row, compute-KV512 | 22.049 | 21.261 | 20.501 | 13,879,296 / 12 |
+
+These are all slower than the retained native-output configuration. At
+Q2048, removing the runtime mask branch reduces the prior shared-loop
+capture's IMEM traffic from about 15 GB to 79,872 bytes and internal
+uncovered time from 9.085 to 0.222 ms. Yet the branchless loop still takes
+20.414 ms versus the retained outer-branch loop's 16.991 ms. Thus fixing
+instruction loading alone is insufficient; extra mask work and/or changed
+inner scheduling still leave a regression. No utilization percentage is
+inferred. Conditional and branchless shared Q2048 bodies have identical
+counted MXU/transpose/load/store instructions (5,376 / 5,632 / 8,560 / 2,824),
+despite very different runtime instruction-loading behavior.
+
+All arrays are finite, and matched tile families have the same reported
+precision/oracle statistics as their controls. No automatic acceptance or
+direct pairwise bitwise equality is claimed from equal summary statistics.
+Evidence: details `an-yiq2sv8k95`, regions/final-LLO `an-h3t62ozw40`, operator
+`an-tptwoj1jdx`, LLO `an-vlhnnzlap4`; all declared reports were inspected.
+
+## Internal backward Q-compute tiles and bounded pipeline state
+
+Source `09e0b3cad0ae3149859a6719ce69278c098d63d5` adds default-off
+`bwd_block_q_compute` and `bwd_qtile_pipeline`. The production outer Q4096 /
+KV8192 DMA blocks and gradient output/reduction handling remain unchanged.
+Only internal Q compute is subdivided. The paired sequential/staged probes
+compute QK, FP32 P, dP and dS before consuming BF16 P/dS in dV, dK, dQ order.
+FP32 P is retained through dS; casts occur at the reference gradient-dot
+boundaries, not as a lower-precision softmax shortcut. Q subdivision can
+reassociate dK/dV reductions and therefore requires independent accuracy
+review. The staged version prepares tile i before consuming tile i-1;
+this source order alone does not prove hardware overlap.
+
+The hypothesis follows the earlier staged-KV VMEM failure: shrinking the
+compute-Q dimension should reduce the simultaneously live probability and
+gradient arrays without shrinking the outer transfer blocks. Cases pair
+sequential and staged Q1024/KV1024, Q512/KV1024, and Q2048/KV512 compute.
+The full CPU suite passes **218 tests** (157.42 seconds); another 12 focused
+tests pass after preserving the configured unroll policy. At sequence 1024,
+the staged/sequential gradients are directly bitwise equal for both tested
+Q-compute sizes and seeds, and all gradients satisfy the existing FP64
+oracle criterion. A sequence-2048 CLI smoke with `qtile512_pipeline` also
+completes with finite gradients; it is non-bitwise versus PR13.
+
+TPU validation completed as `exp-9j205abzub`, artifact `art-a16riith7j`,
+with all eight cases compiling and producing finite gradients. The full-size
+backward timings and first device-call coarse regions are:
+
+| Variant | Backward ms | Live PR13 ms | KV-loop ms | Internal uncovered ms |
+| --- | ---: | ---: | ---: | ---: |
+| PR13 | 49.961 | 50.123 | 46.526 | 0.202 |
+| Retained transposed-dQ/dK-first | 45.383 | 50.020 | 42.473 | 0.198 |
+| Q1024/KV1024 sequential | 49.080 | 50.067 | 46.255 | 0.198 |
+| Q1024/KV1024 staged | 59.048 | 49.990 | 56.285 | 0.203 |
+| Q512/KV1024 sequential | 53.001 | 50.125 | 50.170 | 0.198 |
+| Q512/KV1024 staged | 62.500 | 50.179 | 59.539 | 0.204 |
+| Q2048/KV512 sequential | 49.769 | 50.249 | 46.855 | 0.198 |
+| Q2048/KV512 staged | 59.348 | 50.186 | 56.418 | 0.202 |
+
+Every capture reports only 79,872 DIE0 TCS IMEM bytes / 3 descriptors.
+Unlike the earlier large-body unroll failures, there is no repeated
+instruction-loading surge. Initialization and gradient drain costs remain
+near the retained layout's costs. The staged Q1024 loop adds 10.030 ms
+versus its matched sequential loop, while internal uncovered time rises by
+only about 0.005 ms: the regression is inside the loop, not an exposed
+inter-block gap. This does not identify its stall type or prove optimal
+MXU/vector overlap.
+
+For final LLO bodies, Q1024 sequential has 2,208 MXU, 1,280 transpose,
+2,944 vector-load and 2,448 vector-store instructions. Its staged counterpart
+has 4,416 / 2,048 / 4,080 / 2,880. These totals include different prologue,
+epilogue and branch structures, so they are **not** dynamic instruction
+counts and do not establish a twofold matmul cost. The smaller static bodies
+make limited unrolling a separate, still unmeasured scheduling hypothesis.
+
+Independent full-length FP32 checks on heads 0/15/16/31 find unchanged
+maximum absolute gradient errors for all variants. Worst per-head L2-error
+ratios across the new candidates are 1.000000561 (dQ), 1.000007347 (dK),
+and 1.000005690 (dV). Paired sequential/staged variants have equal reported
+precision statistics; summary equality alone is not a direct bitwise test.
+The retained layout still changes only 302 dQ elements versus PR13, with
+dK/dV bitwise. These are diagnostics, not training-convergence certification.
+No Q-tiled variant is promoted: all are slower than the retained control.
+
+Evidence: details `an-2wvzbyu88w`, regions/final LLO `an-7fzehbn9df`,
+operator `an-newu7r3zxn`, LLO `an-ortghmetnl`; all declared reports and
+filtered timing/precision/compiler outputs were inspected.
+
+## Next bounded work: small-body backward unrolling
+
+Test unroll 2/4 on internal Q1024 and unroll 4 on Q512, paired sequential
+and staged. The outer DMA blocks and numerical expressions are unchanged.
+The purpose is to test cross-iteration scheduling with a smaller compiled
+body than the previously rejected whole-Q unroll probes. It is not a claim
+that fewer source loops or more live tiles improve hardware overlap.
