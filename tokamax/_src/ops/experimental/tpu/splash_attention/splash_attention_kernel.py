@@ -1548,43 +1548,69 @@ def _flash_attention_dkv_kernel(
           preferred_element_type=jnp.float32,
       )
 
-    qk_dims = (
-        NT_DIM_NUMBERS
-        if config.q_layout == HEAD_DIM_MINOR
-        else NN_DIM_NUMBERS
-    )
-    qk_uncapped = lax.dot_general(
-        k, scaled_q, qk_dims, preferred_element_type=jnp.float32
-    )
-    if config.softmax_scale is not None:
-      if config.use_base2_exp and config.combine_log2_scale:
-        qk_uncapped *= jnp.float32(config.softmax_scale * LOG2E)
-      else:
-        qk_uncapped *= jnp.float32(config.softmax_scale)
-        if config.use_base2_exp:
-          qk_uncapped *= jnp.float32(LOG2E)
-    qk = _apply_mask_and_soft_cap(
-        qk_uncapped,
-        mask_value,
-        mask_ref,
-        q_sequence_ref,
-        q_segment_ids_ref
-        if (not config.segment_mask_on_partial_only or has_partial_mask)
-        else None,
-        kv_segment_ids_ref
-        if (not config.segment_mask_on_partial_only or has_partial_mask)
-        else None,
-        attn_logits_soft_cap=attn_logits_soft_cap,
-        k_slice=slice_k,
-        k_offset=kv_index * bkv + i * bkv_compute,
-        bq=bq,
-        k_in_lanes=False,
-        mask_function=mask_function,
-        has_partial_mask=has_partial_mask,
-        kv_segment_ids_seq_minor=native_layout,
-    )
-    exp = jnp.exp2 if config.use_base2_exp else jnp.exp
-    p = exp(qk - logsumexp)
+    if native_layout and bq >= 2048 and bq % 1024 == 0:
+      # Materialize FP32 P a query chunk at a time. The gradient contractions
+      # below still use the original complete Q tile and reduction order.
+      def produce_probabilities(p_ref):
+        def query_body(query_index, _):
+          query_slice = pl.ds(query_index * 1024, 1024)
+          logits = lax.dot_general(
+              k, q_ref[:, query_slice], NN_DIM_NUMBERS,
+              preferred_element_type=jnp.float32,
+          )
+          logits *= jnp.float32(config.softmax_scale * LOG2E)
+          if not config.segment_mask_on_partial_only or has_partial_mask:
+            q_ids = q_segment_ids_ref[:1, query_slice]
+            kv_ids = kv_segment_ids_ref[:1, slice_k].T
+            logits = jnp.where(kv_ids == q_ids, logits, mask_value)
+          p_ref[:, query_slice] = jnp.exp2(
+              logits - logsumexp_ref[:1, query_slice]
+          )
+
+        lax.fori_loop(0, bq // 1024, query_body, None, unroll=False)
+        return p_ref[...]
+
+      p = pl.run_scoped(
+          produce_probabilities, pltpu.VMEM((bkv_compute, bq), jnp.float32)
+      )
+    else:
+      qk_dims = (
+          NT_DIM_NUMBERS
+          if config.q_layout == HEAD_DIM_MINOR
+          else NN_DIM_NUMBERS
+      )
+      qk_uncapped = lax.dot_general(
+          k, scaled_q, qk_dims, preferred_element_type=jnp.float32
+      )
+      if config.softmax_scale is not None:
+        if config.use_base2_exp and config.combine_log2_scale:
+          qk_uncapped *= jnp.float32(config.softmax_scale * LOG2E)
+        else:
+          qk_uncapped *= jnp.float32(config.softmax_scale)
+          if config.use_base2_exp:
+            qk_uncapped *= jnp.float32(LOG2E)
+      qk = _apply_mask_and_soft_cap(
+          qk_uncapped,
+          mask_value,
+          mask_ref,
+          q_sequence_ref,
+          q_segment_ids_ref
+          if (not config.segment_mask_on_partial_only or has_partial_mask)
+          else None,
+          kv_segment_ids_ref
+          if (not config.segment_mask_on_partial_only or has_partial_mask)
+          else None,
+          attn_logits_soft_cap=attn_logits_soft_cap,
+          k_slice=slice_k,
+          k_offset=kv_index * bkv + i * bkv_compute,
+          bq=bq,
+          k_in_lanes=False,
+          mask_function=mask_function,
+          has_partial_mask=has_partial_mask,
+          kv_segment_ids_seq_minor=native_layout,
+      )
+      exp = jnp.exp2 if config.use_base2_exp else jnp.exp
+      p = exp(qk - logsumexp)
     p_bf16 = p.astype(do.dtype)
 
     def compute_dv():
