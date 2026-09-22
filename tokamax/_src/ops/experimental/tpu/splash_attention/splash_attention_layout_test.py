@@ -141,7 +141,7 @@ def test_native_layout_preserves_block_sparse_mask():
 @pytest.mark.parametrize("block_q", [2048, 4096])
 def test_native_layout_large_query_window(block_q):
   arrays, ids = _inputs(block_q, 512, 72, 72)
-  _check(_config(72, block_q=block_q), arrays, ids,
+  _check(_config(72, block_q=block_q, block_kv=512, block_kv_compute=256), arrays, ids,
          np.ones((block_q, 512), bool))
 
 
