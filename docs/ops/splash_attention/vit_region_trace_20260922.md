@@ -1945,3 +1945,67 @@ the newly compact/native ID layouts at Q4096 and Q8192. It must measure
 both instruction-loading gaps and redundant full-tile masking cost;
 eliminating the Q8192 regression alone is not progress over the retained
 Q4096 baseline.
+
+### Shared-body test closes the large-Q instruction-loading hypothesis
+
+Source `ce803ab8fdc64b21336ac08091fb9978d116b443` adds runner-only shared-body
+controls with native dQ and compact/native IDs. Eight new CPU cases pass
+(7.68 seconds), covering the ordinary shared body across two seeds,
+compact Q IDs on/off and partial-only masking on/off, with direct bitwise
+comparison to the matched old KV-ID layout.
+
+`exp-w81twk7riw` / `art-edrk3ir4m9` keeps seed 28, 30 samples, coarse
+scopes, four independent full-length oracle heads, and the same scoped
+VMEM process flag for all five cases. All compile and execute:
+
+| Backward configuration | Wall ms | Live PR13 ms | Device ms | KV loops ms | Internal gaps ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Compact/native Q4096, two bodies | 44.1693 | 49.9020 | 42.9046 | 42.0978 | 0.2034 |
+| Q4096, shared masked body | 44.4530 | 49.7544 | 43.3458 | 42.5413 | 0.2001 |
+| Compact/native Q8192, two bodies | 51.8833 | 49.9875 | 50.6434 | 42.4866 | 7.5292 |
+| Q8192, shared masked body | 44.9976 | 49.8042 | 43.7800 | 43.0749 | 0.0990 |
+
+At Q8192, sharing the body removes the repeated 14–16 microsecond gaps.
+The largest falls 15.6494 -> 0.4142 microseconds. The two-body gap totals
+include 2.2827 ms after the full KV loop, 1.9614 ms from dQ drain to the
+next dQ init, 1.9125 ms between dK/dV drain and init, and 1.3717 ms on
+entering the partial loop. These gaps collapse in the shared-body case.
+Three-call DIE0 Any2IMEM traffic falls **3,710,180,352 -> 79,872 bytes**,
+and descriptors **2,319 -> 3**. Together with the matched intervention,
+this strongly corroborates the instruction-loading/code-footprint
+explanation; the trace still does not quantify inner-loop MXU/vector
+overlap or overall hardware utilization. Zero-duration Tensor Core
+markers and absent TC Overlay events are not stall-duration measurements.
+
+Static final-body counts (MXU/transpose/load/store) at Q8192 are
+17,664/5,632/4,761/4,032 -> 8,832/2,880/3,393/3,312. At Q4096 they are
+8,832/3,584/3,173/3,024 -> 4,416/1,856/2,381/2,592. Dynamic gradient
+contractions are unchanged; full tiles now also execute exact masking.
+That cost is visible in loop time: +0.5883 ms at Q8192 and +0.4435 ms at
+Q4096. Thus code-size recovery does **not** beat the retained Q4096
+two-body configuration. Neither shared-body candidate is promoted, and
+the retained joint result remains 61.5991 ms / live PR13 70.1631 ms.
+
+For each tile size, shared and two-body variants report identical full
+PR13-distance and complete four-head oracle statistics. All sampled
+candidate/oracle gradients are finite with unchanged maximum absolute
+oracle errors. Q4096 retains bitwise PR13 dK/dV and 302 dQ mismatches;
+Q8192 retains 302/8,922/5,640 dQ/dK/dV mismatches. Worst oracle ratios
+remain those recorded in the budget probe above. This is equality of
+reported statistics, not a direct all-array candidate-pair bitwise test.
+
+The next bounded implementation target is the staged KV pipeline's
+consumer: its current guard only permits old dQ-first/untransposed-dQ
+arithmetic. Add an explicitly tested native-dQ/dK-first route and compare
+it to the ordinary consumer with the same compact IDs. Keep FP32 P for
+dS, cast only at existing BF16 dot boundaries, preserve reduction slots,
+and test live-range/VMEM effects before claiming overlap improvements.
+The older pipeline regressions above remain evidence against assuming
+that carrying another tile is intrinsically beneficial.
+
+Evidence, all declared reports read: details `an-uwax95g5d6`, regions/final
+LLO `an-v9owdib5fl`, operator `an-hre8ihgkck`, LLO `an-5ulklclms3`.
+The complete CPU kernel/oracle suite passes **366 tests in 295.14 seconds**
+at `ce803ab8fdc64b21336ac08091fb9978d116b443`. No experiment or analysis
+from this iteration remains pending. The performance goal remains active;
+neither this diagnostic success nor CPU coverage establishes its completion.
