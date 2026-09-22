@@ -483,12 +483,14 @@ def flash_attention_kernel(
       kv_ids = kv_segment_ids_ref[:1, window].T
       logits = jnp.where(kv_ids == q_ids, logits, mask_value)
     probabilities = jnp.exp2(logits - max_logit_estimate)
+    # Keep normalization in FP32, but expose the packed PV operand before
+    # reduction so its live range need not retain the full FP32 tile.
+    probabilities_for_pv = probabilities.astype(v_ref.dtype)
     current_l = jnp.sum(probabilities, axis=0, keepdims=True)
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
-    # Keep the original FP32 PV operand and its contraction precision.
     values = v_ref[:, window]
     output_t = lax.dot_general(
-        values, probabilities, NN_DIM_NUMBERS,
+        values, probabilities_for_pv, NN_DIM_NUMBERS,
         preferred_element_type=jnp.float32,
     )
     o_scratch_ref[...] += output_t
