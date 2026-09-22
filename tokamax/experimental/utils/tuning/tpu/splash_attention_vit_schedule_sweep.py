@@ -359,8 +359,34 @@ def _config(args):
   )
 
 
+PROFILE_MODES = ("default", "kernel", "kernel_compute", "periodic", "periodic_compute")
+
+
+def profile_configuration(mode):
+  """Documented JAX/XProf options, without assuming counter-index semantics."""
+  if mode not in PROFILE_MODES:
+    raise ValueError(f"Unknown profile mode: {mode}")
+  config = {}
+  if mode.startswith("kernel"):
+    config["tpu_enable_kernel_profiling"] = True
+  if mode.startswith("periodic"):
+    config.update(
+        tpu_enable_periodic_counter_sampling=True,
+        # Official example indices; 32-bit payload avoids a 16-bit overflow
+        # assumption. These are not assigned hardware-unit meanings here.
+        tpu_tc_perf_counter_sampling_options=(
+            "interval_us:1 scaling:0 counter_size_bits:2 "
+            "indices:10 indices:11 indices:56 indices:57 indices:58"
+        ),
+    )
+  if mode.endswith("_compute"):
+    config["tpu_trace_mode"] = "TRACE_COMPUTE"
+  return config
+
+
 def capture_profiles(candidate, candidate_args, *, out, name, phase,
-                     repeats=3, repeat_counts=None, kernel_profiling=False):
+                     repeats=3, repeat_counts=None, kernel_profiling=False,
+                     profile_modes=None):
   """Capture independently warmed replays without changing timed measurements.
 
   Host boundaries describe calls into the profiler, not hardware-counter
@@ -369,7 +395,27 @@ def capture_profiles(candidate, candidate_args, *, out, name, phase,
   counts = [repeats] if repeat_counts is None else list(repeat_counts)
   if not counts or any(count < 0 for count in counts):
     raise ValueError("profile replay counts must be nonempty and nonnegative")
-  advanced_configuration = {"tpu_enable_kernel_profiling": True} if kernel_profiling else {}
+  if profile_modes is not None:
+    if kernel_profiling or not profile_modes:
+      raise ValueError("profile modes must be nonempty and cannot accompany kernel-profiling")
+    # Validate the whole plan before running even the first warmup.
+    for mode in profile_modes:
+      profile_configuration(mode)
+    modes = list(profile_modes)
+  else:
+    modes = ["kernel" if kernel_profiling else "default"]
+  for mode_index, mode in enumerate(modes):
+    _capture_profile_mode(
+        candidate, candidate_args, out=out, name=name, phase=phase,
+        counts=counts, indexed_counts=repeat_counts is not None,
+        mode=mode, mode_index=mode_index,
+        indexed_modes=profile_modes is not None,
+    )
+
+
+def _capture_profile_mode(candidate, candidate_args, *, out, name, phase,
+                          counts, indexed_counts, mode, mode_index, indexed_modes):
+  advanced_configuration = profile_configuration(mode)
   trace_kwargs = {}
   if advanced_configuration:
     options = jax.profiler.ProfileOptions()
@@ -378,13 +424,16 @@ def capture_profiles(candidate, candidate_args, *, out, name, phase,
   metadata_path = out / "profiling/capture-metadata.jsonl"
   for index, count in enumerate(counts):
     profile_dir = out / "profiling/xprof" / name
-    if repeat_counts is not None:
+    if indexed_modes:
+      profile_dir /= f"mode_{mode_index:02d}_{mode}"
+    if indexed_counts:
       # The index distinguishes repeated counts and avoids trace overwrites.
       profile_dir /= f"capture_{index:02d}_replays_{count}"
     profile_dir.mkdir(parents=True, exist_ok=True)
     bench._ready(candidate(*candidate_args))  # Complete warmup outside trace.
     capture = dict(
         variant=name, phase=phase, capture_index=index, requested_replays=count,
+        profile_mode=mode, profile_mode_index=mode_index,
         completed_replays=0, status="failed",
         advanced_configuration=advanced_configuration,
         profile_dir=str(profile_dir.relative_to(out)),
@@ -424,12 +473,16 @@ def main():
                       help="Independent replay-count captures; zero measures an idle window")
   parser.add_argument("--kernel-profiling", action="store_true",
                       help="Enable TPU7x runtime counter sampling in profiler options")
+  parser.add_argument("--profile-modes", nargs="+", choices=PROFILE_MODES,
+                      help="Compare profiler configurations on the same compiled candidate")
   parser.add_argument("--oracle-heads", type=int, nargs="*", default=[],
                       help="Untimed independent FP32 oracle on these full-length merged heads")
   parser.add_argument("--oracle-block-q", type=int, default=512)
   parser.add_argument("--region-trace-mode", choices=("none", "coarse", "fine"), default="none")
   parser.add_argument("--interpret", action="store_true")
   args = parser.parse_args()
+  if args.profile_modes is not None and args.kernel_profiling:
+    raise ValueError("profile-modes cannot accompany kernel-profiling")
   if args.sequence < 256 or args.sequence & (args.sequence - 1):
     raise ValueError("sequence must be a power of two >= 256")
   if any(head < 0 or head >= args.heads for head in args.oracle_heads):
@@ -582,6 +635,7 @@ def main():
               candidate, candidate_args, out=out, name=name, phase=args.phase,
               repeats=args.profile_repeats, repeat_counts=args.profile_repeat_counts,
               kernel_profiling=args.kernel_profiling,
+              profile_modes=args.profile_modes,
           )
         metric = dict(variant=name, phase=args.phase, latency_ms=row[args.phase]["median_ms"],
                       seq_len=args.sequence, merged_heads=args.heads, head_dim=args.head_dim,

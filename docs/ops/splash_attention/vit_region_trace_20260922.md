@@ -2332,3 +2332,92 @@ calls for PR13 and the retained joint native/compact configuration, using
 two independent single-replay windows plus idle controls. This permits
 temporal attribution to both forward and backward coarse regions without
 changing the timed benchmark's four public outputs.
+
+## Completed counter calibration and raw sampling audit
+
+All 28 captures from `exp-40u42fsy4a` have the requested and observed
+module counts 0/1/3/9/3/1/0. The bounded summary `an-lmmah5ppki` has been
+read (189,744 output bytes). Device-duration slopes per invocation are
+42.92997 ms retained, 48.67554 ms PR13, 68.40949 ms SSA staged 512, and
+57.99557 ms VMEM staged 512. No staged candidate is promoted. All four
+cases retain their earlier four-head seed-30 precision results.
+
+The DIE0 BF16 matrix-instruction counters scale exactly with replay count:
+retained MXU0/MXU1 9,437,184/8,650,752 per call, PR13
+10,485,760/10,485,760, and both staged variants 9,306,112/9,306,112.
+In contrast, the fitted MXU/XLU busy-bucket sums contain an intercept
+of about 230–232 million raw units; bucket 0 accounts for essentially
+all of this intercept. The two bucket sums agree capture by capture.
+This establishes substantial capture-wide fixed contribution, not its
+physical meaning or clock rate. Empty captures have no device counters,
+not measured zero counter values. Fits therefore use the five nonempty
+captures for counters, and all seven captures for module duration.
+Counter units, bucket semantics, and time-resolved overlap remain unproven.
+
+The original expanded audit and first attempted summary produced 295 MB
+and 127 MB JSON files, exceeding Falcon's 64 MiB read limit. The final
+analyzer selects relevant DIE0 TC/IMEM families before serialization and
+asserts a 4 MiB output bound. No direct backing-bucket access was used.
+Other completed analyses: operator `an-1as6na1d8c`, LLO `an-zhllgbl6u9`,
+details `an-9trad6oaml`, expanded regions `an-4hwxsqmqjs`, and first
+summary `an-dwoci89rr7`. Large JSON outputs were not successfully read;
+the bounded replacement is the counter evidence used here.
+
+`exp-mezskfblgk` / `art-z61quul4i2`, source
+`703cbb35085e2894406727f683e0a0b11f1c6925`, profiles the public joint
+forward/backward call with `tpu_enable_kernel_profiling=True`. The normal
+benchmark (outside sampling) is 61.63347 ms retained versus its live
+PR13 control 70.25746 ms. This reproduces the existing gain, not a new
+kernel improvement. All four independent seed-30 oracle heads are finite;
+maximum absolute errors for O/dQ/dK/dV/LSE are unchanged. Worst per-head
+L2-error ratios versus PR13 are O 0.99999935, dQ 1.00000640,
+dK 1.00000026, dV 1.00000668, LSE 1.00195811. These are not bitwise
+PR13 outputs or a new all-32-head/convergence gate.
+
+Two independently warmed single calls per variant and two idle windows
+produce the exact requested module counts. Sampled-call device durations
+are retained 60.14141/60.13863 ms and PR13 68.70406/68.70300 ms. First-call
+coarse KV-loop times are forward 16.90644 versus 18.68713 ms and backward
+42.09751 versus 46.52608 ms. These region durations do not sum to the wall
+benchmark: they exclude other device regions and dispatch overhead.
+
+The Chrome trace audit `an-7mnye0shht` finds no time-varying hardware
+counter series inside these modules. The raw XSpace protobuf audit
+`an-tii5yk5krq` independently rules out loss solely during Chrome
+conversion: each nonempty TPU0 plane has 12 lines, including 94,039
+capture-total counter events at offset zero; the additional `_counters_`
+lines contain only single P-state/throttle points and an empty line.
+There are no periodic counter samples in these TPU0 planes. No XSpace
+errors/warnings are recorded, which does not prove loss-free sampling.
+Raw metadata identifies TPU v7x. All eight raw profiles were inspected
+through the declared bounded `xplane.json` (623,744 bytes), using field
+numbers from the official OpenXLA XSpace protobuf schema and a wire
+decoder with malformed-input checks. No vendor counter meanings are
+inferred from names alone.
+
+The joint details, operator, and LLO reports are also terminal and read:
+`an-lgu7s2y1ex`, `an-gwwf0nfeyd`, `an-q8w8skgwr7`. The generic operator
+plugin counts zero traces because the captures use nested per-variant
+directories; the custom audit explicitly reads all eight captures.
+
+### Sampling configuration isolation
+
+The runner now has optional `--profile-modes`, applying named profiler
+presets to the **same compiled candidate and argument objects** after
+normal timing/precision checks. It supports default options, the kernel
+sampling shortcut, explicit periodic sampling, and the latter two with
+`TRACE_COMPUTE`. Repeated mode names and replay counts get unique indexed
+directories. Exact options and mode indices are recorded; old flags and
+paths remain unchanged when mode comparison is absent. Invalid plans
+are rejected before warmup or filesystem side effects.
+
+The periodic preset uses the official example indices 10/11/56/57/58
+without assigning them hardware-unit meanings, a 1 us interval, and a
+documented 32-bit payload. The
+[JAX profiler documentation](https://docs.jax.dev/en/latest/profiling.html#advanced-configuration-options)
+states that the default trace mode is `TRACE_ONLY_XLA`; explicit
+`TRACE_COMPUTE` is a bounded diagnostic variable, not an established fix.
+Fourteen host capture tests pass in 0.07 seconds, covering all presets,
+legacy behavior, repeated modes, replay boundaries, and invalid plans.
+No kernel arithmetic, BF16 boundary, rematerialization setting, or
+device count is changed by this diagnostic.
