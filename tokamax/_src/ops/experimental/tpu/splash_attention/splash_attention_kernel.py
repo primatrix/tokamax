@@ -1567,7 +1567,7 @@ def _flash_attention_dkv_kernel(
               logits - logsumexp_ref[:1, query_slice]
           )
 
-        lax.fori_loop(0, bq // 1024, query_body, None, unroll=False)
+        lax.fori_loop(0, bq // 1024, query_body, None, unroll=True)
         return p_ref[...]
 
       p = pl.run_scoped(
