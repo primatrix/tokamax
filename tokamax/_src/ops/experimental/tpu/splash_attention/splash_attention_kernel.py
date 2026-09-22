@@ -1084,6 +1084,7 @@ def _splash_attention_forward(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary"),
             vmem_limit_bytes=config.fwd_vmem_limit_bytes,
+            fuse_transposed_lhs_in_matmul=native_layout,
             flags={
                 "XLA_TPU_FORCE_LP_LLO_SCHEDULER": (
                     config.use_experimental_scheduler
@@ -1517,11 +1518,7 @@ def _flash_attention_dkv_kernel(
     dk_scratch_ref[...] = jnp.zeros_like(dk_scratch_ref)
     dv_scratch_ref[...] = jnp.zeros_like(dv_scratch_ref)
 
-  # Keep the native dQ sum in loop state, draining to VMEM only once. The
-  # additions still visit compute-KV tiles in their original order.
-  carry_dq = native_layout and dq_scratch_ref is not None
-
-  def body(i, dq_acc, has_partial_mask=False):
+  def body(i, _, has_partial_mask=False):
     slice_k = pl.ds(i * bkv_compute, bkv_compute)
     q = q_ref[...]
     if config.use_base2_exp and config.softmax_scale is None:
@@ -1663,10 +1660,7 @@ def _flash_attention_dkv_kernel(
       if dq_scratch_ref is not None:
         # Compute block size != memory block size
         scratch_update = dq.T if native_layout else dq
-        if carry_dq:
-          dq_acc = dq_acc + scratch_update
-        else:
-          dq_scratch_ref[...] += scratch_update
+        dq_scratch_ref[...] += scratch_update
       else:
         if dq_alias is not None:
           dq_ref[...] = dq_alias[...] + dq.astype(dq_ref.dtype)
@@ -1677,7 +1671,6 @@ def _flash_attention_dkv_kernel(
       compute_dk()
     if config.bwd_dv_last:
       compute_dv()
-    return dq_acc
 
   if dq_scratch_ref is not None:
     dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
@@ -1690,13 +1683,10 @@ def _flash_attention_dkv_kernel(
   num_iters = k_ref.shape[k_seq_axis] // bkv_compute
 
   def run_inner_loop(has_partial_mask):
-    dq_acc = lax.fori_loop(
-        0, num_iters, partial(body, has_partial_mask=has_partial_mask),
-        dq_scratch_ref[...] if carry_dq else None,
+    lax.fori_loop(
+        0, num_iters, partial(body, has_partial_mask=has_partial_mask), None,
         unroll=config.bwd_kv_unroll,
     )
-    if carry_dq:
-      dq_scratch_ref[...] = dq_acc
 
   @pl.when(jnp.logical_and(should_not_mask, should_run))
   def _():
@@ -2263,6 +2253,7 @@ def _splash_attention_bwd_dkv(
             else {"XLA_TPU_FORCE_LP_LLO_SCHEDULER": config.bwd_scheduler},
             vmem_limit_bytes=config.bwd_vmem_limit_bytes,
             allow_input_fusion=allow_input_fusion,
+            fuse_transposed_lhs_in_matmul=native_layout,
         ),
         name=kernel_name,
         cost_estimate=cost_estimate,
