@@ -138,6 +138,21 @@ def test_native_layout_preserves_block_sparse_mask():
   _check(_config(72), arrays, ids, mask)
 
 
+@pytest.mark.parametrize("partial_only", [False, True])
+def test_native_segment_ids_across_full_and_partial_tiles(partial_only):
+  arrays, _ = _inputs(512, 512, 72, 72)
+  # Boundaries straddle both query and KV compute tiles, with distinct IDs
+  # (including negative and zero) rather than assuming positive segment labels.
+  ids = base.SegmentIds(
+      jnp.asarray(np.select([np.arange(512) < 160, np.arange(512) < 352],
+                            [-3, 0], default=7), jnp.int32),
+      jnp.asarray(np.select([np.arange(512) < 144, np.arange(512) < 384],
+                            [-3, 0], default=7), jnp.int32),
+  )
+  _check(_config(72, segment_mask_on_partial_only=partial_only),
+         arrays, ids, np.ones((512, 512), bool))
+
+
 @pytest.mark.parametrize("mode", [
     "online", "nonzero_shift", "soft_cap", "causal", "no_segments",
     "mqa", "gqa", "head_minor", "sinks", "single_compute_tile",

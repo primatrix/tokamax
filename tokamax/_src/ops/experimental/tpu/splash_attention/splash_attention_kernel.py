@@ -479,7 +479,7 @@ def flash_attention_kernel(
     )
     logits *= jnp.float32(config.softmax_scale * LOG2E)
     if not config.segment_mask_on_partial_only or has_partial_mask:
-      q_ids = q_segment_ids_ref[:, :1].T
+      q_ids = q_segment_ids_ref[:1, :]
       kv_ids = kv_segment_ids_ref[:1, window].T
       logits = jnp.where(kv_ids == q_ids, logits, mask_value)
     probabilities = jnp.exp2(logits - max_logit_estimate)
@@ -819,7 +819,9 @@ def _splash_attention_forward(
     next_m = to_i32(mask_next_ref[grid_idx])
     return next_m, 0, 0
 
-  q_segment_ids_index_map = unravel(lambda h, i, j: (i, 0))
+  q_segment_ids_index_map = unravel(
+      (lambda h, i, j: (0, i)) if native_layout else (lambda h, i, j: (i, 0))
+  )
   kv_segment_ids_index_map = unravel(lambda h, i, j: (0, j))
 
   # Convert the logical shape from head-minor to sequence-minor.
@@ -843,11 +845,18 @@ def _splash_attention_forward(
   ]
   if segment_ids is not None:
     in_specs += [
-        pl.BlockSpec((bq, NUM_LANES), q_segment_ids_index_map),
+        pl.BlockSpec(
+            (1, bq) if native_layout else (bq, NUM_LANES),
+            q_segment_ids_index_map,
+        ),
         pl.BlockSpec((NUM_SUBLANES, bkv), kv_segment_ids_index_map),
     ]
-    q_segment_ids = jax.lax.broadcast_in_dim(
-        segment_ids.q, (q_seq_len, NUM_LANES), (0,)
+    # The native [KV, Q] logits consume query IDs along the minor axis.
+    # Keep that orientation at the input instead of transposing each KV tile.
+    q_segment_ids = (
+        segment_ids.q[None, :] if native_layout else jax.lax.broadcast_in_dim(
+            segment_ids.q, (q_seq_len, NUM_LANES), (0,)
+        )
     )
     kv_segment_ids = jax.lax.broadcast_in_dim(
         segment_ids.kv, (NUM_SUBLANES, kv_seq_len), (1,)
