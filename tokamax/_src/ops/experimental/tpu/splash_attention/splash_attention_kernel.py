@@ -469,23 +469,23 @@ def flash_attention_kernel(
         else value
     ).astype(ref.dtype)
 
-  def kvmajor_probabilities(kv_compute_index, has_partial_mask):
+  def kvmajor_scores(kv_compute_index):
     # Keep P as [KV, Q] so V @ P accumulates directly into [D, Q].
     # This avoids padding D in the minor axis of the output scratch buffer.
     window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-    logits = lax.dot_general(
+    return lax.dot_general(
         k_ref[:, window], q_ref[...], TN_DIM_NUMBERS,
         preferred_element_type=jnp.float32,
     )
+
+  def kvmajor_consume(kv_compute_index, logits, has_partial_mask):
+    window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
     logits *= jnp.float32(config.softmax_scale * LOG2E)
     if not config.segment_mask_on_partial_only or has_partial_mask:
       q_ids = q_segment_ids_ref[:1, :]
       kv_ids = kv_segment_ids_ref[:1, window].T
       logits = jnp.where(kv_ids == q_ids, logits, mask_value)
-    return jnp.exp2(logits - max_logit_estimate)
-
-  def kvmajor_consume(kv_compute_index, probabilities):
-    window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
+    probabilities = jnp.exp2(logits - max_logit_estimate)
     current_l = jnp.sum(probabilities, axis=0, keepdims=True)
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
     # Keep the original FP32 PV operand and its contraction precision.
@@ -498,8 +498,8 @@ def flash_attention_kernel(
 
   def body(kv_compute_index, _, has_partial_mask=False):
     if native_layout:
-      probabilities = kvmajor_probabilities(kv_compute_index, has_partial_mask)
-      kvmajor_consume(kv_compute_index, probabilities)
+      scores = kvmajor_scores(kv_compute_index)
+      kvmajor_consume(kv_compute_index, scores, has_partial_mask)
       return
     slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
     m_prev, l_prev = load_state(m_scratch_ref), load_state(l_scratch_ref)
@@ -611,19 +611,19 @@ def flash_attention_kernel(
       )
       return
 
-    # Prepare the next tile before consuming the previous one. Keep every
-    # probability FP32, and preserve the original order of l/o additions.
-    probabilities = kvmajor_probabilities(0, has_partial_mask)
+    # Issue next QK before current softmax/PV. Keep every probability FP32
+    # and preserve the original order of l/o additions.
+    scores = kvmajor_scores(0)
 
     def staged(i, previous):
-      following = kvmajor_probabilities(i, has_partial_mask)
-      kvmajor_consume(i - 1, previous)
+      following = kvmajor_scores(i)
+      kvmajor_consume(i - 1, previous, has_partial_mask)
       return following
 
-    probabilities = lax.fori_loop(
-        1, num_iters, staged, probabilities, unroll=True
+    scores = lax.fori_loop(
+        1, num_iters, staged, scores, unroll=True
     )
-    kvmajor_consume(num_iters - 1, probabilities)
+    kvmajor_consume(num_iters - 1, scores, has_partial_mask)
 
   @pl.when(should_not_mask)
   def _():
