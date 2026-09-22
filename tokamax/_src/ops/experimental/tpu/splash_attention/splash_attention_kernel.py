@@ -480,8 +480,16 @@ def flash_attention_kernel(
     logits *= jnp.float32(config.softmax_scale * LOG2E)
     if not config.segment_mask_on_partial_only or has_partial_mask:
       q_ids = q_segment_ids_ref[:1, :]
-      kv_ids = kv_segment_ids_ref[:1, window].T
-      logits = jnp.where(kv_ids == q_ids, logits, mask_value)
+      kv_ids = kv_segment_ids_ref[:1, window]
+      first_kv_id = kv_ids[:1, :1]
+      # A partial outer block may contain uniform inner KV blocks. Check
+      # every ID: arbitrary/non-monotone segments must retain the full mask.
+      logits = lax.cond(
+          jnp.all(kv_ids == first_kv_id),
+          lambda x: jnp.where(first_kv_id == q_ids, x, mask_value),
+          lambda x: jnp.where(kv_ids.T == q_ids, x, mask_value),
+          logits,
+      )
     probabilities = jnp.exp2(logits - max_logit_estimate)
     current_l = jnp.sum(probabilities, axis=0, keepdims=True)
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)

@@ -172,6 +172,21 @@ def test_native_segment_ids_across_full_and_partial_tiles(partial_only):
          arrays, ids, np.ones((512, 512), bool))
 
 
+@pytest.mark.parametrize("mixed_interior", [False, True])
+def test_native_uniform_inner_kv_ids(mixed_interior):
+  arrays, _ = _inputs(512, 512, 72, 72)
+  kv_ids = np.repeat(np.array([-3, 0, 7, -3], np.int32), 128)
+  if mixed_interior:
+    # The first/last ID agree, but the complete block is not uniform.
+    kv_ids[63] = 7
+    kv_ids[319] = -3
+  ids = base.SegmentIds(
+      jnp.asarray(np.resize(np.array([-3, 0, 7, 0], np.int32), 512)),
+      jnp.asarray(kv_ids),
+  )
+  _check(_config(72), arrays, ids, np.ones((512, 512), bool))
+
+
 @pytest.mark.parametrize("mode", [
     "online", "nonzero_shift", "soft_cap", "causal", "no_segments",
     "mqa", "gqa", "head_minor", "sinks", "single_compute_tile",
