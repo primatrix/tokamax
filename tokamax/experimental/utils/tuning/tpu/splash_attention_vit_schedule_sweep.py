@@ -201,6 +201,7 @@ def variants(phase="backward"):
       ("dq_and_kv_ids_native", _NATIVE_DQ_AND_KV_IDS),
       ("dq_and_ids_compact", _NATIVE_DQ_AND_KV_IDS | dict(bwd_compact_segment_ids=True)),
       ("dq_and_ids_compact_q8192", _NATIVE_DQ_AND_KV_IDS | dict(bwd_compact_segment_ids=True, block_q_dkv=8192)),
+      ("dq_and_ids_compact_q8192_vmem64", _NATIVE_DQ_AND_KV_IDS | dict(bwd_compact_segment_ids=True, block_q_dkv=8192, bwd_vmem_limit_bytes=64 * 1024**2)),
       ("dq_and_kv_ids_native_q8192", _NATIVE_DQ_AND_KV_IDS | dict(block_q_dkv=8192)),
       ("dq_and_kv_ids_native_q8192_c512", _NATIVE_DQ_AND_KV_IDS | dict(block_q_dkv=8192, block_kv_dkv_compute=512)),
       ("dq_and_kv_ids_native_q16384_c256", _NATIVE_DQ_AND_KV_IDS | dict(block_q_dkv=16384, block_kv_dkv_compute=256)),
