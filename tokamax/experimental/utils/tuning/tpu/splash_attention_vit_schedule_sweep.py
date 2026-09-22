@@ -360,7 +360,7 @@ def _config(args):
 
 
 def capture_profiles(candidate, candidate_args, *, out, name, phase,
-                     repeats=3, repeat_counts=None):
+                     repeats=3, repeat_counts=None, kernel_profiling=False):
   """Capture independently warmed replays without changing timed measurements.
 
   Host boundaries describe calls into the profiler, not hardware-counter
@@ -369,6 +369,12 @@ def capture_profiles(candidate, candidate_args, *, out, name, phase,
   counts = [repeats] if repeat_counts is None else list(repeat_counts)
   if not counts or any(count < 0 for count in counts):
     raise ValueError("profile replay counts must be nonempty and nonnegative")
+  advanced_configuration = {"tpu_enable_kernel_profiling": True} if kernel_profiling else {}
+  trace_kwargs = {}
+  if advanced_configuration:
+    options = jax.profiler.ProfileOptions()
+    options.advanced_configuration = advanced_configuration
+    trace_kwargs["profiler_options"] = options
   metadata_path = out / "profiling/capture-metadata.jsonl"
   for index, count in enumerate(counts):
     profile_dir = out / "profiling/xprof" / name
@@ -380,12 +386,13 @@ def capture_profiles(candidate, candidate_args, *, out, name, phase,
     capture = dict(
         variant=name, phase=phase, capture_index=index, requested_replays=count,
         completed_replays=0, status="failed",
+        advanced_configuration=advanced_configuration,
         profile_dir=str(profile_dir.relative_to(out)),
         host_requested_unix_ns=time.time_ns(),
         host_requested_monotonic_ns=time.perf_counter_ns(),
     )
     try:
-      with jax.profiler.trace(str(profile_dir)):
+      with jax.profiler.trace(str(profile_dir), **trace_kwargs):
         capture["host_entered_monotonic_ns"] = time.perf_counter_ns()
         for step in range(count):
           with jax.profiler.StepTraceAnnotation("vit_splash_" + phase, step_num=step):
@@ -415,6 +422,8 @@ def main():
   parser.add_argument("--profile-repeats", type=int, default=3)
   parser.add_argument("--profile-repeat-counts", type=int, nargs="+",
                       help="Independent replay-count captures; zero measures an idle window")
+  parser.add_argument("--kernel-profiling", action="store_true",
+                      help="Enable TPU7x runtime counter sampling in profiler options")
   parser.add_argument("--oracle-heads", type=int, nargs="*", default=[],
                       help="Untimed independent FP32 oracle on these full-length merged heads")
   parser.add_argument("--oracle-block-q", type=int, default=512)
@@ -572,6 +581,7 @@ def main():
           capture_profiles(
               candidate, candidate_args, out=out, name=name, phase=args.phase,
               repeats=args.profile_repeats, repeat_counts=args.profile_repeat_counts,
+              kernel_profiling=args.kernel_profiling,
           )
         metric = dict(variant=name, phase=args.phase, latency_ms=row[args.phase]["median_ms"],
                       seq_len=args.sequence, merged_heads=args.heads, head_dim=args.head_dim,

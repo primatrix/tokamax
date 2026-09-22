@@ -15,12 +15,13 @@ from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_schedule_
 
 
 def install_profiler(monkeypatch):
-  state = dict(active=False, paths=[], invocations=[], steps=[])
+  state = dict(active=False, paths=[], invocations=[], steps=[], options=[])
 
   @contextlib.contextmanager
-  def trace(path):
+  def trace(path, **kwargs):
     assert not state["active"]
     state["paths"].append(Path(path))
+    state["options"].append(kwargs)
     state["active"] = True
     try:
       yield
@@ -40,7 +41,8 @@ def install_profiler(monkeypatch):
 
 
 @pytest.mark.parametrize("counts", [None, [0, 1, 3, 9, 3]])
-def test_replay_capture_boundaries(monkeypatch, tmp_path, counts):
+@pytest.mark.parametrize("kernel_profiling", [False, True])
+def test_replay_capture_boundaries(monkeypatch, tmp_path, counts, kernel_profiling):
   state = install_profiler(monkeypatch)
   argument = object()
 
@@ -50,7 +52,8 @@ def test_replay_capture_boundaries(monkeypatch, tmp_path, counts):
     return value
 
   sweep.capture_profiles(candidate, (argument,), out=tmp_path, name="control",
-                         phase="backward", repeats=3, repeat_counts=counts)
+                         phase="backward", repeats=3, repeat_counts=counts,
+                         kernel_profiling=kernel_profiling)
   expected_counts = [3] if counts is None else counts
   assert state["invocations"] == [
       active for count in expected_counts for active in [False] + [True] * count
@@ -64,6 +67,12 @@ def test_replay_capture_boundaries(monkeypatch, tmp_path, counts):
   for index, (row, count) in enumerate(zip(rows, expected_counts)):
     assert row["status"] == "captured"
     assert row["capture_index"] == index
+    expected_options = {"tpu_enable_kernel_profiling": True} if kernel_profiling else {}
+    assert row["advanced_configuration"] == expected_options
+    if kernel_profiling:
+      assert state["options"][index]["profiler_options"].advanced_configuration == expected_options
+    else:
+      assert state["options"][index] == {}
     assert row["requested_replays"] == row["completed_replays"] == count
     assert tmp_path / row["profile_dir"] == state["paths"][index]
     assert (row["host_requested_monotonic_ns"] <= row["host_entered_monotonic_ns"]

@@ -2298,3 +2298,37 @@ All six capture records are complete; both candidates report bitwise
 PR13 gradients. The calibration analyzer's linear-fit helper also passes
 synthetic slope/intercept, repeated-count, constant-value, and insufficient-
 distinct-count checks. These checks validate orchestration, not TPU counters.
+
+Source `17cb20c43da3c2e745ba287bfa104662063b2906` is pinned in
+`exp-40u42fsy4a` / `art-33x1hbnei5`. The four kernels are PR13, retained
+native/compact Q4096, wrapped SSA staged compute-KV512, and VMEM-buffered
+staged 512. Each gets independently warmed 0/1/3/9/3/1/0-call captures.
+The original 63 MiB backward budget, BF16/FP32 boundaries, one benchmark
+device, seed 30, four oracle heads, and 30 timed samples are retained.
+The analyzer will require observed module counts to match capture metadata
+before fitting a counter; missing or duplicate counter samples are not
+silently replaced with zero. Raw DIE0 values and native units are retained.
+
+The complete kernel/oracle/capture CPU suite passes **414 tests in 322.89
+seconds** at this source. The TPU experiment reaches `SUCCEEDED`; individual
+capture completeness and counter behavior still require analyzer review.
+
+The [official XProf Kernel guide](https://openxla.org/xprof/kernel-profiling)
+provides a more direct follow-up for TPU7x: default 1 microsecond TC runtime
+sampling via `ProfileOptions.advanced_configuration` with
+`tpu_enable_kernel_profiling=True`. This is a profiler request option, not
+a speculative `LIBTPU_INIT_ARGS` flag. Local JAX 0.11 accepts this options
+object through `jax.profiler.trace(..., profiler_options=options)`.
+The runner adds default-off `--kernel-profiling` and records the exact
+advanced configuration in capture metadata; timed measurements and kernel
+compilation remain unchanged. Actual sample presence, loss, and temporal
+coverage must be verified before reporting runtime utilization.
+
+The updated host capture tests pass **8 tests in 0.04 seconds**, covering
+both default and runtime-sampling profiler options with legacy and indexed
+replay paths. No kernel implementation is changed by this addition.
+The runtime-sampling follow-up will profile public joint forward/backward
+calls for PR13 and the retained joint native/compact configuration, using
+two independent single-replay windows plus idle controls. This permits
+temporal attribution to both forward and backward coarse regions without
+changing the timed benchmark's four public outputs.
