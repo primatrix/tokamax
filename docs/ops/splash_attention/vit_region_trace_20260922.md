@@ -2191,3 +2191,86 @@ was removed from this equivalence matrix because the existing native-dQ
 control correctly rejects that unsupported no-scratch configuration before
 execution; no kernel guard or numerical assertion was relaxed. Full CPU
 regression and TPU timing/precision remain separate checks.
+
+Source `64d6e32fe6c7690518042e6ed3f7c997048fcdf5` passes the complete CPU
+kernel/oracle suite: **408 tests in 324.26 seconds**. The source is pushed
+only to `codex/vit-pr13-50pct` and remains descended from tag `v0.2.1`.
+`exp-lklk5z9il5` / `art-v7lahcgeji` tests four reference-buffer candidates
+(two schedules by compute-KV256/512), ordinary shared 256/512 controls,
+wrapped SSA staged/interleaved 512, retained Q4096, and PR13. It uses the
+original 63 MiB backward budget with no enclosing VMEM override, single
+benchmark device, seed 30, 30 samples, four oracle heads, and coarse scopes.
+
+All ten TPU cases execute successfully. None is promoted:
+
+| Backward case | Wall ms | First device ms | KV-loop ms |
+| --- | ---: | ---: | ---: |
+| Retained two-body compute-KV1024 | 44.3895 | 42.9309 | 42.0960 |
+| Ordinary shared 256 | 58.9511 | 57.5952 | 56.7646 |
+| Ordinary shared 512 | 47.2382 | 45.9127 | 45.0813 |
+| Wrapped SSA staged 512 | 69.5247 | 68.4325 | 67.5952 |
+| Wrapped SSA interleaved 512 | 68.6822 | 67.3915 | 66.5552 |
+| VMEM staged 256 | 71.5327 | 70.1686 | 69.3311 |
+| VMEM staged 512 | 59.1438 | 58.0328 | 57.2009 |
+| VMEM interleaved 256 | 91.0570 | 89.6638 | 88.8251 |
+| VMEM interleaved 512 | 79.4426 | 78.1732 | 77.3369 |
+
+Live PR13 controls range from 49.71 to 50.30 ms. Explicit VMEM storage
+improves staged 512 by 10.3809 ms relative to the matched SSA pipeline,
+but worsens interleaved 512 by 10.7604 ms. Both remain slower than the
+ordinary shared 512 control, let alone retained 1024. The differences
+are inside KV loops; every capture retains 79,872 Any2IMEM bytes / three
+descriptors and 0.200–0.206 ms internal gaps.
+
+The final LLO directly verifies the storage intervention: both SSA512
+pipelines contain a `scf.for` header with **2,048 iter-argument bindings**
+(141,403 characters); neither VMEM pipeline has that carried-value loop.
+At 512, both VMEM schedules have identical static MXU/transpose/load/store
+counts **3,232/1,600/5,980/6,616**, compared with SSA staged
+3,232/1,600/2,764/2,520 and SSA interleaved 3,232/1,600/2,908/2,520.
+At 256, both VMEM schedules are 1,616/1,312/4,363/4,532. Thus explicit
+storage removes the large SSA carry but introduces substantial reference
+traffic, and identical aggregate counts still permit markedly different
+execution times. These are SSA-form compiler-body counts, not allocated
+machine code, physical spill bytes, executed memory traffic, or an overlap
+percentage. The bounded allocation-line search yields no literal buffer
+declarations at this dump stage; it is not a physical VMEM allocation report.
+
+All four new candidates exactly match their ordinary same-compute-tile
+control's complete four-head oracle and full-array PR13-distance statistics.
+All are finite; maximum absolute oracle errors are unchanged; dK/dV are
+bitwise PR13. Compute-KV512 keeps 2,420 dQ differences, relative L2
+2.2250571e-5, maximum difference 4.8828125e-4, and worst oracle L2 ratio
+1.0000010003. Compute-KV256 has 2,917 dQ differences, relative L2
+2.4965822e-5, the same maximum difference, and worst ratio 1.0000013122.
+Reported-statistics equality is not a direct pairwise TPU bitwise test.
+
+All declared reports and filtered structured evidence have been read:
+details `an-znk1lxk8bg`, regions/final LLO `an-uqyqzqhv2i`, operator
+`an-1po36kkhzh`, and LLO `an-z5khn2xa70`. All experiments and analyses
+from this iteration are terminal. No default, rematerialization policy,
+model configuration, precision boundary, or device count is changed.
+The best certified joint result remains **61.5991 ms / live PR13
+70.1631 ms**; the 20–30% performance objective is not achieved.
+
+The next bounded diagnostic should calibrate hardware counter capture
+against known replay counts before another broad scheduling sweep. The
+existing runner already exposes `--profile-repeats` (default three). Use
+independently warmed 1/3/9-call captures with recorded host capture
+boundaries and actual device-module
+durations, retaining PR13 and the fastest ordinary kernel. Extract DIE0
+counter names/values plus available cycle/frequency metadata through a
+declared analyzer output. This can separate fixed profiler/idle cost from
+work proportional to invocation count; it must not perturb the timed
+benchmark or change kernel arithmetic.
+
+There is a concrete reason to investigate this: the retained control in
+`an-j0lt16iwvs` has capture-wide `COUNT_MXU_BUSY_0/1/2` values
+258,857,311 / 23,239,080 / 205,435,692. Their sum equals the sum of
+`COUNT_XLU_BUSY_0/1/2`, 445,701,525 / 15,511,820 / 26,318,738:
+487,532,083 in both cases. All timestamps are zero. This suggests a shared
+capture-wide counting interval, but does **not** establish bucket semantics,
+counter units, a core frequency, or per-kernel utilization. An exact-name
+public documentation search did not establish those semantics. Do not call
+the `_0/_1/_2` suffixes three separate engines or convert these totals to
+an overlap percentage without calibration and authoritative meaning.
