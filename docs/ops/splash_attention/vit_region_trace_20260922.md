@@ -2421,3 +2421,55 @@ Fourteen host capture tests pass in 0.07 seconds, covering all presets,
 legacy behavior, repeated modes, replay boundaries, and invalid plans.
 No kernel arithmetic, BF16 boundary, rematerialization setting, or
 device count is changed by this diagnostic.
+
+### Runtime-provided counter semantics and scheduling evidence
+
+`an-lf4qs7smgz` directly extracts the runtime's XEventMetadata descriptions
+and raw values from all 28 calibration XPlanes (236 selected DIE0 counters,
+2,330,844 output bytes). This resolves the earlier semantic uncertainty:
+MXU busy buckets count cycles with zero, exactly one, or exactly two MXUs
+executing matmul. XLU buckets likewise count zero/one/two busy XLUs.
+`COUNT_CYCLES` counts every cycle while this counter group is enabled.
+BF16 matrix counters count issued, predicate-true Vreg-input instructions
+targeting the named MXU. These meanings come from the captured runtime's
+descriptions, not an interpretation of suffixes or a guessed ISA.
+
+Ordinary least-squares fits over the five nonempty 1/3/9/3/1 replay windows
+give the following increments per replay (millions of counter units):
+
+| Backward case | Total cycles | No MXU executing | Matmul-path hold | MRB-result wait | MSR-path hold | VIF-full hold |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| PR13 | 94.171 | 9.261 | 3.584 | 3.407 | 0.040 | 9.225 |
+| Retained native/compact | 84.420 | 8.195 | 0.341 | 0.985 | 1.453 | 4.376 |
+| SSA staged 512 | 128.436 | 45.286 | 17.877 | 0.340 | 0.083 | 24.903 |
+| VMEM staged 512 | 109.491 | 26.496 | 12.409 | 0.240 | 0.099 | 20.083 |
+
+The runtime describes the matmul/MSR/MRB counters as vector-issue hold
+cycles and VIF-full as scalar-issue hold cycles. These conditions may
+overlap; they must not be summed as a disjoint timing breakdown. The
+failure of both staged candidates is accompanied by many additional
+no-MXU cycles and matmul-path reservation holds, not just a difference
+in static instruction counts. This supports targeting scheduling/resource
+dependencies instead of adding another broad two-tile pipeline.
+
+The 230–232 million-cycle fixed capture contribution remains present in
+total cycles, zero-MXU cycles, sync wait, and scalar-fence wait. Busy-1/2
+and matmul-path counts have near-zero intercepts and much tighter replay
+fits. The slope-derived weighted-MXU busy fractions are approximately
+PR13 89.1%, retained 85.7%, SSA 58.0%, VMEM 68.0%, computed as
+`(slope_busy1 + 2*slope_busy2) / (2*slope_cycles)`. These are incremental
+capture-window estimates, including replay/dispatch overhead and fit
+noise, not exact kernel-only utilization or MXU/vector/VMEM overlap.
+The retained kernel's lower ratio despite better time is also a reminder
+that less executed work and higher occupancy are different objectives.
+
+The mode-isolation run `exp-orklubmtq3` / `art-x5pevd2ouo`, source
+`5dfc9f7b7029d8fe0acd0c33e07d1f85a05b74ed`, ends `FAILED` with exit 139.
+Falcon reports no collected profiling artifact. Logs show a segmentation
+fault in `xprof::tpu::TraceCollector::AddJfTrace()` while closing/tearing
+down the TPU profiler. Benchmark rows were emitted before this failure,
+but no complete mode audit is available; do not infer which individual
+mode caused it or promote the uncollected measurements. Core dumps were
+disabled. The experiment is terminal and its failure log has been read.
+No further sampling run is started: the user's next priority is a
+kernel-only end-to-end replay of `exp-dmcaqltvwj` with remat unchanged.
