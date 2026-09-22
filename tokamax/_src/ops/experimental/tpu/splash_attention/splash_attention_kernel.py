@@ -1585,8 +1585,12 @@ def _flash_attention_dkv_kernel(
           preferred_element_type=jnp.float32,
       )
       scratch_ref = dv_scratch_ref
-      dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[slice_k, :]
-      scratch_ref[slice_k, :] = dv
+      if native_layout:
+        dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[:, slice_k].T
+        scratch_ref[:, slice_k] = dv.T
+      else:
+        dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[slice_k, :]
+        scratch_ref[slice_k, :] = dv
 
     if not config.bwd_dv_last:
       compute_dv()
@@ -1614,8 +1618,12 @@ def _flash_attention_dkv_kernel(
       if config.softmax_scale is not None and config.bwd_scale_after_dot:
         dk *= jnp.float32(config.softmax_scale)
       scratch_ref = dk_scratch_ref
-      dk = dk.astype(dk_scratch_ref.dtype) + scratch_ref[slice_k, :]
-      scratch_ref[slice_k, :] = dk
+      if native_layout:
+        dk = dk.astype(dk_scratch_ref.dtype) + scratch_ref[:, slice_k].T
+        scratch_ref[:, slice_k] = dk.T
+      else:
+        dk = dk.astype(dk_scratch_ref.dtype) + scratch_ref[slice_k, :]
+        scratch_ref[slice_k, :] = dk
 
     if not config.bwd_dq_first:
       compute_dk()
@@ -1686,19 +1694,13 @@ def _flash_attention_dkv_kernel(
     else:
       dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
 
-  def format_dkv(scratch_ref, dtype):
-    # Accumulate in the dot's [KV, D] layout, then transpose only once at
-    # output drain. dQ retains its sequence-minor scratch and alias layout.
-    value = scratch_ref[...].astype(dtype)
-    return value.T if native_layout else value
-
   if dk_alias is None:
     assert dv_alias is None
 
     @pl.when(should_write)
     def _():
-      dk_ref[...] = format_dkv(dk_scratch_ref, dk_ref.dtype)
-      dv_ref[...] = format_dkv(dv_scratch_ref, dv_ref.dtype)
+      dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
+      dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
 
   else:
     q_head = pl.program_id(0)
@@ -1706,13 +1708,13 @@ def _flash_attention_dkv_kernel(
 
     @pl.when(jnp.logical_and(should_write, first_q_head_in_kv_group))
     def _():
-      dk_ref[...] = format_dkv(dk_scratch_ref, dk_ref.dtype)
-      dv_ref[...] = format_dkv(dv_scratch_ref, dv_ref.dtype)
+      dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
+      dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
 
     @pl.when(jnp.logical_and(should_write, _not(first_q_head_in_kv_group)))
     def _():
-      dk_ref[...] = dk_alias[...] + format_dkv(dk_scratch_ref, dk_ref.dtype)
-      dv_ref[...] = dv_alias[...] + format_dkv(dv_scratch_ref, dv_ref.dtype)
+      dk_ref[...] = dk_alias[...] + dk_scratch_ref[...].astype(dk_ref.dtype)
+      dv_ref[...] = dv_alias[...] + dv_scratch_ref[...].astype(dv_ref.dtype)
 
 
 def _splash_attention_bwd_dkv(
@@ -2102,8 +2104,22 @@ def _splash_attention_bwd_dkv(
 
   scratch_shapes = [
       dq_scratch,
-      pltpu.VMEM((bkv, head_dim_qk), jnp.float32),
-      pltpu.VMEM((bkv, head_dim_v), jnp.float32),
+      pltpu.VMEM(
+          (
+              (head_dim_qk, bkv)
+              if native_layout
+              else (bkv, head_dim_qk)
+          ),
+          jnp.float32,
+      ),
+      pltpu.VMEM(
+          (
+              (head_dim_v, bkv)
+              if native_layout
+              else (bkv, head_dim_v)
+          ),
+          jnp.float32,
+      ),
   ]
 
   def _bwd_cost_estimate(
