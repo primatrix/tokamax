@@ -1517,6 +1517,61 @@ def _flash_attention_dkv_kernel(
     dk_scratch_ref[...] = jnp.zeros_like(dk_scratch_ref)
     dv_scratch_ref[...] = jnp.zeros_like(dv_scratch_ref)
 
+  split_query_compute = (
+      native_layout and bq == 4096 and bkv_compute == 1024
+      and bkv % 2048 == 0 and dq_scratch_ref is not None
+      and config.bwd_scale_after_dot and not config.bwd_dq_first
+      and not config.bwd_dv_last
+  )
+
+  def split_query_body(i, _, has_partial_mask=False):
+    # Keep Q4096/KV8192 transfer windows and output-rounding boundaries.
+    # Only reshape inner computation to Q2048/KV2048. Accumulate both Q
+    # halves before applying dK's scale or updating its outer accumulator.
+    q_compute, kv_compute = 2048, 2048
+    k_slice = pl.ds(i * kv_compute, kv_compute)
+    keys, values = k_ref[:, k_slice], v_ref[:, k_slice]
+    dk_init = jnp.zeros((keys.shape[0], kv_compute), jnp.float32)
+    dv_init = jnp.zeros((values.shape[0], kv_compute), jnp.float32)
+
+    def query_half(qi, carry):
+      dk_acc, dv_acc = carry
+      q_slice = pl.ds(qi * q_compute, q_compute)
+      query, dout = q_ref[:, q_slice], do_ref[:, q_slice]
+      logits = lax.dot_general(
+          keys, query, TN_DIM_NUMBERS, preferred_element_type=jnp.float32
+      )
+      logits *= jnp.float32(config.softmax_scale * LOG2E)
+      if not config.segment_mask_on_partial_only or has_partial_mask:
+        logits = jnp.where(
+            kv_segment_ids_ref[:1, k_slice].T
+            == q_segment_ids_ref[:1, q_slice], logits, mask_value
+        )
+      p = jnp.exp2(logits - logsumexp_ref[:1, q_slice])
+      dv = lax.dot_general(
+          p.astype(dout.dtype), dout, NT_DIM_NUMBERS,
+          preferred_element_type=jnp.float32,
+      ).T
+      dp = lax.dot_general(
+          values, dout, TN_DIM_NUMBERS,
+          preferred_element_type=jnp.float32,
+      )
+      ds = ((dp - di_ref[:1, q_slice]) * p).astype(query.dtype)
+      dk = lax.dot_general(
+          ds, query, NT_DIM_NUMBERS, preferred_element_type=jnp.float32
+      ).T
+      dq = lax.dot_general(
+          keys, ds, NN_DIM_NUMBERS, preferred_element_type=jnp.float32
+      )
+      dq_scratch_ref[:, q_slice] += dq * jnp.float32(config.softmax_scale)
+      return dk_acc + dk, dv_acc + dv
+
+    dk, dv = lax.fori_loop(
+        0, bq // q_compute, query_half, (dk_init, dv_init), unroll=True
+    )
+    dk_scratch_ref[:, k_slice] += dk * jnp.float32(config.softmax_scale)
+    dv_scratch_ref[:, k_slice] += dv
+
   def body(i, _, has_partial_mask=False):
     slice_k = pl.ds(i * bkv_compute, bkv_compute)
     q = q_ref[...]
@@ -1682,6 +1737,12 @@ def _flash_attention_dkv_kernel(
   num_iters = k_ref.shape[k_seq_axis] // bkv_compute
 
   def run_inner_loop(has_partial_mask):
+    if split_query_compute:
+      lax.fori_loop(
+          0, bkv // 2048, partial(split_query_body, has_partial_mask=has_partial_mask),
+          None, unroll=config.bwd_kv_unroll,
+      )
+      return
     lax.fori_loop(
         0, num_iters, partial(body, has_partial_mask=has_partial_mask), None,
         unroll=config.bwd_kv_unroll,
