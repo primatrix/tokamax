@@ -175,6 +175,9 @@ class SplashConfig:
   # Remove producer conditionals by preparing an unused, valid tile 0 at the
   # tail. This adds one producer tile; only measured schedules may justify it.
   bwd_staged_kv_wrap_tail: bool = False
+  # Store cross-iteration BF16 P/dS in explicit ping-pong VMEM references,
+  # instead of carrying full arrays through the loop's SSA state.
+  bwd_staged_kv_ref_buffers: bool = False
   # Split Q compute independently of the outer Q DMA tile to bound P/dS live
   # ranges. Optional producer/consumer carry holds only BF16 P and dS.
   bwd_block_q_compute: int | None = None
@@ -294,6 +297,10 @@ class SplashConfig:
       raise ValueError("interleaved KV pipeline requires staged native-dQ/dK-first consumers")
     if self.bwd_staged_kv_wrap_tail and not self.bwd_staged_kv_pipeline:
       raise ValueError("wrapped KV tail requires the staged KV pipeline")
+    if self.bwd_staged_kv_ref_buffers and not (
+        self.bwd_staged_kv_pipeline and self.bwd_staged_kv_wrap_tail
+    ):
+      raise ValueError("KV reference buffers require the wrapped staged KV pipeline")
     if self.bwd_dq_output_seq_minor and not (
         self.bwd_dq_scratch_seq_minor and self.use_fused_bwd_kernel
     ):
@@ -1901,6 +1908,47 @@ def _flash_attention_dkv_kernel(
       else:
         consume_dk(i, ds)
         consume_dq(i, ds)
+
+    if config.bwd_staged_kv_ref_buffers:
+      # Allocation is explicit; whether this improves register allocation or
+      # overlap is a compiler/TPU measurement, not a consequence of source order.
+      @partial(
+          pl.run_scoped,
+          p_ref=pltpu.VMEM((2, bkv_compute, bq), do_ref.dtype),
+          ds_ref=pltpu.VMEM((2, bkv_compute, bq), do_ref.dtype),
+      )
+      def buffered_pipeline(p_ref, ds_ref):
+        p, ds = prepare(0)
+        p_ref[0, ...], ds_ref[0, ...] = p, ds
+
+        def buffered_step(i, _):
+          previous_bank = lax.rem(i, 2)
+          next_bank = 1 - previous_bank
+          next_i = jnp.where(i + 1 < num_iters, i + 1, 0)
+          if config.bwd_staged_kv_interleave:
+            logits = prepare_logits(next_i)
+            consume_dv(i, p_ref[previous_bank, ...])
+            p = prepare_probabilities(next_i, logits)
+            consume_dk(i, ds_ref[previous_bank, ...])
+            dp = prepare_dp(next_i)
+            consume_dq(i, ds_ref[previous_bank, ...])
+            p, ds = finish_prepare(p, dp)
+            p_ref[next_bank, ...], ds_ref[next_bank, ...] = p, ds
+          else:
+            p, ds = prepare(next_i)
+            p_ref[next_bank, ...], ds_ref[next_bank, ...] = p, ds
+            consume_dv(i, p_ref[previous_bank, ...])
+            if config.bwd_dq_first:
+              consume_dq(i, ds_ref[previous_bank, ...])
+              consume_dk(i, ds_ref[previous_bank, ...])
+            else:
+              consume_dk(i, ds_ref[previous_bank, ...])
+              consume_dq(i, ds_ref[previous_bank, ...])
+
+        # No P/dS arrays cross the loop boundary as SSA values. All gradient
+        # consumers, including the final one, still share exactly one body.
+        lax.fori_loop(0, num_iters, buffered_step, None, unroll=False)
+      return
 
     state = prepare(0)
 

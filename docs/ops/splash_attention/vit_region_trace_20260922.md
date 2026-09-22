@@ -2009,3 +2009,185 @@ The complete CPU kernel/oracle suite passes **366 tests in 295.14 seconds**
 at `ce803ab8fdc64b21336ac08091fb9978d116b443`. No experiment or analysis
 from this iteration remains pending. The performance goal remains active;
 neither this diagnostic success nor CPU coverage establishes its completion.
+
+## Native-dQ staged KV consumers
+
+Source `06f37dba07f31199f4002031d7f27c9e576a0fe8` extends the existing
+default-off staged KV pipeline to native dQ contraction and dK-before-dQ
+consumption. The consumer retains dV/dK/dQ accumulation order across KV
+tiles; the wrapper's three BF16 dQ alias slots and public output layouts
+are unchanged. New default-off `bwd_staged_kv_interleave` inserts next-tile
+QK, softmax and dP between prior-tile dV, dK and dQ, respectively. P stays
+FP32 through dS; only the existing gradient-dot inputs are cast to BF16.
+This source order is a scheduling hypothesis, not hardware-overlap proof.
+
+The first CPU version used an independent final consumer outside the
+steady-state loop. Public-VJP tests with repeated noncontiguous segment
+IDs and KV-memory tile 256 found 1–2 differing dQ BF16 values at seeds
+29/30, while memory tile 512 passed. Disabling JIT passed the sampled
+failure; disabling CPU fast math did not. A one-iteration drain loop also
+did not fix it. These observations implicate compiled expression/control
+boundaries, but do not identify a specific fused machine instruction.
+
+The implemented version instead uses **one consumer loop including the
+last tile**. Conditional producer work skips the nonexistent next tile,
+without out-of-bounds reads or a separate drain copy. All 12 new public-VJP
+cases are now directly bitwise equal to their ordinary matched controls,
+with unchanged assertions. They cover two seeds, three memory/compute KV
+pairs, both pipeline schedules, alias-slot reuse, negative and repeated
+segment IDs, and allowed zero-ID tails. Three invalid-interleave guard
+tests and eight previous staged layout tests also pass: **23 targeted
+tests in 18.70 seconds**. CPU equality does not certify TPU numerics.
+
+`exp-s7zer0syna` / `art-cwx2nvp47w` screens PR13, the retained two-body
+native/compact Q4096, ordinary shared-body compute-KV512/1024, staged
+512/1024 and interleaved 512/1024. It keeps one benchmark device, BF16,
+seed 30, 30 timing samples, four independent full-length FP32 oracle
+heads, coarse scopes, and the original 63 MiB backward kernel budget.
+There is no Q8192 budget override in this run. Precision and region
+results must be reviewed before any promotion.
+
+The full CPU kernel/oracle suite at this source passes **381 tests in
+302.81 seconds**. The TPU screen completes six measured cases and two
+caught compile failures; neither staged schedule is promoted:
+
+| Q4096 backward schedule | Wall ms | Live PR13 ms | Device ms | KV-loop ms |
+| --- | ---: | ---: | ---: | ---: |
+| Retained two-body / compute-KV1024 | 44.0145 | 50.1018 | 42.9297 | 42.0966 |
+| Shared body / 1024 | 44.5998 | 50.0333 | 43.3715 | 42.5420 |
+| Shared body / 512 | 47.1278 | 49.9089 | 45.9126 | 45.0803 |
+| Staged / 512 | 95.0128 | 49.9709 | 93.7983 | 92.9573 |
+| Interleaved / 512 | 166.6536 | 50.0363 | 165.4222 | 164.5755 |
+
+All measured captures retain 79,872 Any2IMEM bytes / 3 descriptors, and
+internal gaps remain 0.200–0.210 ms. The regression is inside the KV loop,
+not the outer instruction-loading effect seen at Q8192. The ordinary
+shared 512 body has static MXU/transpose/load/store counts
+2,208/1,440/2,273/2,520. Both staged and interleaved 512 bodies have
+**identical** counts 3,232/1,600/2,908/2,520 despite their large timing
+difference. Extra static dots include the prologue, not extra consumed
+gradient tiles. These facts isolate a compiled schedule/control-flow
+problem but do not by themselves establish a specific spill or stall
+mechanism in the executed 512 case.
+
+The **1024 compile failures**, in contrast, expose allocator evidence:
+staged requires **83.66M** VMEM versus 63.94M (19.73M excess), including
+**63.95M register-allocator spill slots**. Interleaved requires **75.82M**
+(11.89M excess), including **56.11M spill slots**. No runtime or precision
+measurement exists for these failures. Native compact IDs are still
+present in their input constraints; input-padding savings do not prevent
+the increased live-range pressure of this schedule.
+
+Both measured 512 pipelines have identical complete four-head oracle and
+full-array PR13-distance statistics to the ordinary shared 512 control.
+All arrays are finite, all per-head maximum absolute oracle errors are
+unchanged, and dK/dV are bitwise PR13. dQ has 2,420 differing elements,
+relative L2 distance 2.2250571e-5, maximum difference 4.8828125e-4, and
+worst oracle L2 ratio 1.0000010003. The retained 1024 case at seed 30 has
+277 dQ differences / worst ratio 1.0000005386; its shared-body control
+reports the same statistics. This is not direct pairwise equality of
+the candidate arrays and does not justify a performance promotion.
+
+Evidence, all reports read: details `an-0uif6bubup`, regions/final LLO
+`an-9772yop4ds`, operator `an-pijvb9y540`, LLO `an-ifsps0xbci`.
+
+Source `8f9341acb65f89d62717ab4e963979d4ddf0172e` adds default-off
+`bwd_staged_kv_wrap_tail` to isolate tail producer conditionals. The
+source expresses one extra unused producer for legal tile 0 at the end,
+so all consumers stay in the common loop with no out-of-bounds read.
+It does not change the number/order of gradient updates. This trades
+extra producer work for an unconditional steady-state body; no benefit
+is assumed. All 36 targeted tests pass in 26.81 seconds, including 12 new
+wrapped public-VJP cases that remain directly bitwise with the ordinary
+controls and an invalid-config guard. `exp-oasf8nazxz` / `art-61otttzsgc`
+remeasures controls plus staged/interleaved wrap variants at compute-KV
+512/1024 under the same seed 30 and original VMEM budget.
+
+### Wrapped producers remove a regression, not the retained baseline cost
+
+The wrapped screen completes seven measured cases and two caught compile
+failures. Full CPU regression at `8f9341a` passes **394 tests in 313.31
+seconds**. The matched conditional staged 512 control is 95.5019 ms;
+unconditional wrapped staged 512 is 70.1710 ms, and wrapped interleaved
+512 is 69.1102 ms. Ordinary shared 512 is still **47.1940 ms**, and the
+retained 1024 two-body case is **44.4308 ms**, so none of the pipelines is
+promoted. Their live PR13 controls are 50.03–50.22 ms.
+
+The device traces put the improvement inside the loop: staged conditional
+93.2712 ms -> wrapped staged 67.8352 ms / wrapped interleaved 66.7895 ms.
+Ordinary shared 512 takes 45.1121 ms. Every capture still has 79,872 IMEM
+bytes / 3 descriptors and roughly 0.20 ms internal gaps. Wrapped staged
+changes final-body loads 2,908 -> 2,764, retaining MXU/transpose/store
+3,232/1,600/2,520. Wrapped interleaved retains all four original counts.
+The control-flow intervention changes the compiled schedule substantially
+without solving its residual loop cost; it does not prove that a specific
+machine branch alone consumed all saved time.
+
+Wrapped staged 1024 still fails capacity: **70.66M** required versus
+63.94M, including **50.94M spill slots**, down from the conditional
+83.66M / 63.95M. Wrapped interleaved 1024 advances to a distinct scoped
+budget failure: **63.53M** needed against the configured **63.00M**,
+an excess of 540 KiB. These are unexecuted configurations, not measured
+slow paths, and they have no precision results.
+
+The measured wrapped 512 candidates exactly match the ordinary shared
+512 control's reported full-array PR13-distance and complete four-head
+oracle statistics. All are finite; maximum absolute oracle errors do not
+increase; dK/dV stay bitwise PR13; dQ retains 2,420 mismatches and worst
+oracle L2 ratio 1.0000010003. As elsewhere, matching statistics do not
+establish direct pairwise array equality. No tolerance changes.
+
+Evidence, all reports read: details `an-aqe67dvs0j`, regions/final LLO
+`an-27dz72a5j2`, operator `an-qel259fkqz`, LLO `an-j7ky78edny`.
+
+Source `80bb1dd7e39915362461a51a1532fdb3d34ce866` is runner-only: give
+wrapped interleaved 1024 a 64 MiB kernel budget. The documented JAX 0.11
+enclosing flag is set to 65537 KiB for all four controls in
+`exp-vlkz2va9ap` / `art-ik0ib1mktu`, including PR13, retained two-body
+Q4096 and wrapped interleaved 512. Hardware capacity checks remain on.
+This closes the newly exposed near-fit configuration before attributing
+failure to the full-tile carried state or changing its storage model.
+
+The 64 MiB probe runs all four cases, but is rejected for performance:
+wrapped interleaved 1024 is **63.7419 ms** (live PR13 49.9464), versus
+wrapped 512 at 68.5751 ms and retained Q4096 at **44.1829 ms**. Their first
+device module / KV-loop times are 62.4382 / 61.6273, 67.3506 / 66.5406,
+and 42.9049 / 42.0955 ms, respectively. All captures retain 79,872 IMEM
+bytes / 3 descriptors and approximately 0.203 ms internal gaps. Allowing
+the near-fit configuration to execute does not cure its inner-loop cost.
+Final static MXU/transpose/load/store counts for interleaved 1024 are
+6,464/2,176/3,070/2,592; these remain compiler-body counts, not utilization.
+
+The 1024 candidate's complete four-head oracle and full-array PR13-distance
+statistics equal the retained 1024 control's: all finite, unchanged
+maximum absolute oracle errors, bitwise PR13 dK/dV, and 277 differing dQ
+elements with relative L2 distance 6.7329142e-6. Worst oracle L2 ratio is
+1.0000005386. Equality of reported statistics is not direct pairwise array
+equality. This precision screen does not override the performance rejection.
+
+All four analyses are terminal and their declared reports read: details
+`an-1chblk2oq5`, regions/final LLO `an-j0lt16iwvs`, operator `an-qt24kpb9s1`,
+LLO `an-f7ljeykjw9`. The retained joint result remains **61.5991 ms** versus
+live PR13 **70.1631 ms**, with no new production defaults enabled.
+
+### Explicit VMEM state instead of full-tile SSA carry
+
+The next default-off probe, `bwd_staged_kv_ref_buffers`, stores BF16 P/dS
+in two-bank VMEM references. It requires the wrapped producer path and
+uses the same single consumer loop, exact segment masking, FP32 P for dS,
+cast boundaries, and gradient accumulation order. Consumer loads occur
+at their use sites; neither P nor dS is a loop-carried SSA result. Both
+prepare-then-consume and interleaved schedules are covered. At Q4096 /
+compute-KV512 these two references request 16 MiB in total; compute-KV256
+requests 8 MiB. This is an explicit storage tradeoff, not an assumed
+reduction in actual allocated VMEM or proof of hardware overlap.
+
+The targeted suite passes **42 tests in 32.91 seconds**, including 12 new
+buffered public-VJP cases that are directly bitwise equal to the ordinary
+control and two invalid-buffer-configuration guards. It covers two seeds,
+three memory/compute KV pairs, both consumer schedules, and alias-slot
+reuse with repeated/negative/zero segment IDs. A trial memory=compute case
+was removed from this equivalence matrix because the existing native-dQ
+control correctly rejects that unsupported no-scratch configuration before
+execution; no kernel guard or numerical assertion was relaxed. Full CPU
+regression and TPU timing/precision remain separate checks.
