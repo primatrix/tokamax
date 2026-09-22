@@ -1541,7 +1541,8 @@ def _flash_attention_dkv_kernel(
       dp_dims = NT_DIM_NUMBERS
 
     packed_qk = packed_dp = None
-    if native_layout and k.shape[1] <= 128 and v.shape[1] <= 128:
+    if (native_layout and has_partial_mask
+        and k.shape[1] <= 128 and v.shape[1] <= 128):
       # Fill the two reduction halves with K/V, and use block-diagonal Q/dO
       # columns. The results are QK and dP without cross terms or dtype changes.
       query = jnp.pad(scaled_q, ((0, 128 - scaled_q.shape[0]), (0, 0)))
