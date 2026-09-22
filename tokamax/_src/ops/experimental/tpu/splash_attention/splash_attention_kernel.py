@@ -172,6 +172,9 @@ class SplashConfig:
   # Scheduling probe: interleave next-tile producers with native-dQ/dK-first
   # consumers. Source ordering alone does not guarantee hardware overlap.
   bwd_staged_kv_interleave: bool = False
+  # Remove producer conditionals by preparing an unused, valid tile 0 at the
+  # tail. This adds one producer tile; only measured schedules may justify it.
+  bwd_staged_kv_wrap_tail: bool = False
   # Split Q compute independently of the outer Q DMA tile to bound P/dS live
   # ranges. Optional producer/consumer carry holds only BF16 P and dS.
   bwd_block_q_compute: int | None = None
@@ -289,6 +292,8 @@ class SplashConfig:
         and self.bwd_dq_transposed_output and not self.bwd_dq_first
     ):
       raise ValueError("interleaved KV pipeline requires staged native-dQ/dK-first consumers")
+    if self.bwd_staged_kv_wrap_tail and not self.bwd_staged_kv_pipeline:
+      raise ValueError("wrapped KV tail requires the staged KV pipeline")
     if self.bwd_dq_output_seq_minor and not (
         self.bwd_dq_scratch_seq_minor and self.use_fused_bwd_kernel
     ):
@@ -1901,24 +1906,32 @@ def _flash_attention_dkv_kernel(
 
     def step(i, previous):
       has_next = i + 1 < num_iters
+      next_i = jnp.where(has_next, i + 1, 0) if config.bwd_staged_kv_wrap_tail else i + 1
+
+      def produce(producer, fallback):
+        if config.bwd_staged_kv_wrap_tail:
+          return producer()
+        return lax.cond(has_next, producer, fallback)
+
       if config.bwd_staged_kv_interleave:
         # Keep each gradient's KV accumulation order. Only independent next-
         # tile producer work is inserted between prior-tile consumers.
         empty = lambda: jnp.zeros(previous[0].shape, jnp.float32)
-        logits = lax.cond(has_next, lambda: prepare_logits(i + 1), empty)
+        logits = produce(lambda: prepare_logits(next_i), empty)
         consume_dv(i, previous[0])
-        p = lax.cond(has_next, lambda: prepare_probabilities(i + 1, logits), empty)
+        p = produce(lambda: prepare_probabilities(next_i, logits), empty)
         consume_dk(i, previous[1])
-        dp = lax.cond(has_next, lambda: prepare_dp(i + 1), empty)
+        dp = produce(lambda: prepare_dp(next_i), empty)
         consume_dq(i, previous[1])
         return finish_prepare(p, dp)
       else:
-        current = lax.cond(has_next, lambda: prepare(i + 1), lambda: previous)
+        current = produce(lambda: prepare(next_i), lambda: previous)
         consume(i, previous)
         return current
 
     # Use one consumer body, including the last tile, rather than duplicating
-    # a drain outside the loop. Do not issue an out-of-bounds tail producer.
+    # a drain outside the loop. Skip the tail producer or read valid tile 0;
+    # in neither case may it access an out-of-bounds input window.
     lax.fori_loop(0, num_iters, step, state, unroll=False)
 
   def run_q_tiled_loop(num_kv_iters, has_partial_mask):

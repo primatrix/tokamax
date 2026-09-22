@@ -380,7 +380,8 @@ def test_native_kv_segment_ids_preserve_public_vjp(seed, mode, compact_ids, part
 @pytest.mark.parametrize("seed", [29, 30])
 @pytest.mark.parametrize("memory_kv,compute_kv", [(256, 128), (512, 128), (512, 256)])
 @pytest.mark.parametrize("interleave", [False, True])
-def test_native_staged_kv_preserves_public_vjp(seed, memory_kv, compute_kv, interleave):
+@pytest.mark.parametrize("wrap_tail", [False, True])
+def test_native_staged_kv_preserves_public_vjp(seed, memory_kv, compute_kv, interleave, wrap_tail):
   from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
   from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_schedule_sweep as sweep
 
@@ -406,7 +407,8 @@ def test_native_staged_kv_preserves_public_vjp(seed, memory_kv, compute_kv, inte
 
   expected = run(cfg)
   actual = run(dataclasses.replace(
-      cfg, bwd_staged_kv_pipeline=True, bwd_staged_kv_interleave=interleave))
+      cfg, bwd_staged_kv_pipeline=True, bwd_staged_kv_interleave=interleave,
+      bwd_staged_kv_wrap_tail=wrap_tail))
   for name, value, control in zip(("output", "dq", "dk", "dv"), actual, expected):
     assert value.shape == control.shape and value.dtype == control.dtype
     assert np.isfinite(np.asarray(value)).all()
@@ -422,6 +424,11 @@ def test_interleaved_kv_rejects_unsupported_consumers(overrides):
   with pytest.raises(ValueError, match="interleaved KV pipeline requires"):
     splash.SplashConfig(block_q=128, block_kv=256,
                         bwd_staged_kv_interleave=True, **overrides)
+
+
+def test_wrapped_kv_tail_requires_staged_pipeline():
+  with pytest.raises(ValueError, match="wrapped KV tail requires"):
+    splash.SplashConfig(block_q=128, block_kv=256, bwd_staged_kv_wrap_tail=True)
 
 
 @pytest.mark.parametrize("mask_kind", ["numpy", "causal"])
