@@ -169,6 +169,9 @@ class SplashConfig:
   # ViT diagnostic: prepare the next KV block before consuming prior P/dS.
   # Carried P/dS are cast only where the reference gradient dots already cast.
   bwd_staged_kv_pipeline: bool = False
+  # Scheduling probe: interleave next-tile producers with native-dQ/dK-first
+  # consumers. Source ordering alone does not guarantee hardware overlap.
+  bwd_staged_kv_interleave: bool = False
   # Split Q compute independently of the outer Q DMA tile to bound P/dS live
   # ranges. Optional producer/consumer carry holds only BF16 P and dS.
   bwd_block_q_compute: int | None = None
@@ -281,6 +284,11 @@ class SplashConfig:
       raise ValueError(f"Invalid region_trace_mode: {self.region_trace_mode}")
     if self.bwd_dv_between_dq_dk and self.bwd_dv_last:
       raise ValueError("dV cannot be both between dQ/dK and last")
+    if self.bwd_staged_kv_interleave and not (
+        self.bwd_staged_kv_pipeline
+        and self.bwd_dq_transposed_output and not self.bwd_dq_first
+    ):
+      raise ValueError("interleaved KV pipeline requires staged native-dQ/dK-first consumers")
     if self.bwd_dq_output_seq_minor and not (
         self.bwd_dq_scratch_seq_minor and self.use_fused_bwd_kernel
     ):
@@ -1793,11 +1801,9 @@ def _flash_attention_dkv_kernel(
         and config.bwd_dkv_scratch_seq_minor
         and config.bwd_scale_after_dot
         and config.bwd_cast_before_transpose
-        and config.bwd_dq_first
         and not config.bwd_dp_before_qk
         and not config.bwd_keep_kv_seq_minor
         and not config.bwd_dq_contract_ds_axis0
-        and not config.bwd_dq_transposed_output
         and not config.bwd_dk_transposed_output
         and not config.bwd_dv_transposed_output
         and not config.bwd_qmajor_probabilities
@@ -1813,15 +1819,17 @@ def _flash_attention_dkv_kernel(
     ):
       raise ValueError("bwd_staged_kv_pipeline requires the ViT exact-layout configuration")
 
-    def prepare(i):
+    def prepare_logits(i):
       window = pl.ds(i * bkv_compute, bkv_compute)
       q = q_ref[...]
       k = k_ref[:, window].T
-      v = v_ref[:, window].T
-      do = do_ref[...]
       with _attention_scope(config, "splash_bwd_qk_recompute_mxu"):
         logits = lax.dot_general(k, q, NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
         logits *= jnp.float32(config.softmax_scale * LOG2E)
+      return logits
+
+    def prepare_probabilities(i, logits):
+      window = pl.ds(i * bkv_compute, bkv_compute)
       with _attention_scope(config, "splash_bwd_mask_softmax"):
         logits = _apply_mask_and_soft_cap(
             logits, mask_value, None, q_sequence_ref,
@@ -1832,42 +1840,86 @@ def _flash_attention_dkv_kernel(
             has_partial_mask=True,
             kv_segment_ids_seq_minor=config.bwd_kv_segment_ids_seq_minor,
         )
-        p = jnp.exp2(logits - logsumexp_ref[:1, :])
+        return jnp.exp2(logits - logsumexp_ref[:1, :])
+
+    def prepare_dp(i):
+      window = pl.ds(i * bkv_compute, bkv_compute)
+      v, do = v_ref[:, window].T, do_ref[...]
       with _attention_scope(config, "splash_bwd_dp_mxu"):
-        dp = lax.dot_general(v, do, NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        return lax.dot_general(v, do, NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
+
+    def finish_prepare(p, dp):
       with _attention_scope(config, "splash_bwd_softmax_grad"):
         ds = (dp - di_ref[:1, :]) * p
       # Do not reuse BF16 P in dS: the reference consumes FP32 probabilities.
-      return p.astype(do.dtype), ds.astype(do.dtype)
+      return p.astype(do_ref.dtype), ds.astype(do_ref.dtype)
 
-    def consume(i, state):
+    def prepare(i):
+      logits = prepare_logits(i)
+      p = prepare_probabilities(i, logits)
+      return finish_prepare(p, prepare_dp(i))
+
+    def consume_dv(i, p):
       window = pl.ds(i * bkv_compute, bkv_compute)
-      p, ds = state
-      q, do = q_ref[...], do_ref[...]
-      k = k_ref[:, window].T
+      do = do_ref[...]
       with _attention_scope(config, "splash_bwd_dv_mxu_accum"):
         dv = lax.dot_general(p, do, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
         dv = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[:, window].T
         dv_scratch_ref[:, window] = dv.T
+
+    def consume_dq(i, ds):
+      window = pl.ds(i * bkv_compute, bkv_compute)
+      k = k_ref[:, window].T
       with _attention_scope(config, "splash_bwd_dq_mxu_accum"):
-        dq = lax.dot_general(ds.T, k, NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        if config.bwd_dq_transposed_output:
+          dq = lax.dot_general(k, ds, TN_DIM_NUMBERS, preferred_element_type=jnp.float32).T
+        else:
+          dq = lax.dot_general(ds.T, k, NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
         dq *= jnp.float32(config.softmax_scale)
         dq_scratch_ref[...] += dq.T
+
+    def consume_dk(i, ds):
+      window = pl.ds(i * bkv_compute, bkv_compute)
+      q = q_ref[...]
       with _attention_scope(config, "splash_bwd_dk_mxu_accum"):
         dk = lax.dot_general(ds, q, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
         dk *= jnp.float32(config.softmax_scale)
         dk = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[:, window].T
         dk_scratch_ref[:, window] = dk.T
 
+    def consume(i, state):
+      p, ds = state
+      consume_dv(i, p)
+      if config.bwd_dq_first:
+        consume_dq(i, ds)
+        consume_dk(i, ds)
+      else:
+        consume_dk(i, ds)
+        consume_dq(i, ds)
+
     state = prepare(0)
 
     def step(i, previous):
-      current = prepare(i)
-      consume(i - 1, previous)
-      return current
+      has_next = i + 1 < num_iters
+      if config.bwd_staged_kv_interleave:
+        # Keep each gradient's KV accumulation order. Only independent next-
+        # tile producer work is inserted between prior-tile consumers.
+        empty = lambda: jnp.zeros(previous[0].shape, jnp.float32)
+        logits = lax.cond(has_next, lambda: prepare_logits(i + 1), empty)
+        consume_dv(i, previous[0])
+        p = lax.cond(has_next, lambda: prepare_probabilities(i + 1, logits), empty)
+        consume_dk(i, previous[1])
+        dp = lax.cond(has_next, lambda: prepare_dp(i + 1), empty)
+        consume_dq(i, previous[1])
+        return finish_prepare(p, dp)
+      else:
+        current = lax.cond(has_next, lambda: prepare(i + 1), lambda: previous)
+        consume(i, previous)
+        return current
 
-    state = lax.fori_loop(1, num_iters, step, state, unroll=False)
-    consume(num_iters - 1, state)
+    # Use one consumer body, including the last tile, rather than duplicating
+    # a drain outside the loop. Do not issue an out-of-bounds tail producer.
+    lax.fori_loop(0, num_iters, step, state, unroll=False)
 
   def run_q_tiled_loop(num_kv_iters, has_partial_mask):
     # This probe retains outer DMA tiles and reduction/output handling. Only

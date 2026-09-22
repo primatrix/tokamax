@@ -377,6 +377,53 @@ def test_native_kv_segment_ids_preserve_public_vjp(seed, mode, compact_ids, part
     np.testing.assert_array_equal(value, control)
 
 
+@pytest.mark.parametrize("seed", [29, 30])
+@pytest.mark.parametrize("memory_kv,compute_kv", [(256, 128), (512, 128), (512, 256)])
+@pytest.mark.parametrize("interleave", [False, True])
+def test_native_staged_kv_preserves_public_vjp(seed, memory_kv, compute_kv, interleave):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_schedule_sweep as sweep
+
+  q, k, v, do = [jax.random.normal(key, (1, 1024, 72), jnp.bfloat16)
+                 for key in jax.random.split(jax.random.key(seed), 4)]
+  # Repeated noncontiguous IDs exercise j % 3 alias reuse at memory_kv=256;
+  # negative IDs and the allowed zero-ID tail retain exact integer semantics.
+  ids = jnp.asarray(np.repeat(np.array([127, -130, 127, 0], np.int32), [256, 512, 248, 8]))
+  segments = base.SegmentIds(ids, ids)
+  cfg = splash.SplashConfig(
+      block_q=256, block_kv=512, block_kv_compute=128,
+      block_q_dkv=256, block_kv_dkv=memory_kv, block_kv_dkv_compute=compute_kv,
+      q_layout=splash.QKVLayout.SEQ_MINOR, k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR, softmax_scale=72**-0.5,
+      use_base2_exp=True, max_logit_const=0.0, interpret=True,
+      **(_TUNING | sweep._NATIVE_SHARED_BODY),
+  )
+
+  def run(config):
+    kernel = bench._make_kernel(segments, config)
+    return jax.jit(lambda q, k, v, do: sweep.joint_values(
+        kernel, q, k, v, segments, do))(q, k, v, do)
+
+  expected = run(cfg)
+  actual = run(dataclasses.replace(
+      cfg, bwd_staged_kv_pipeline=True, bwd_staged_kv_interleave=interleave))
+  for name, value, control in zip(("output", "dq", "dk", "dv"), actual, expected):
+    assert value.shape == control.shape and value.dtype == control.dtype
+    assert np.isfinite(np.asarray(value)).all()
+    np.testing.assert_array_equal(value, control, err_msg=name)
+
+
+@pytest.mark.parametrize("overrides", [
+    {},
+    dict(bwd_staged_kv_pipeline=True),
+    dict(bwd_staged_kv_pipeline=True, bwd_dq_transposed_output=True, bwd_dq_first=True),
+])
+def test_interleaved_kv_rejects_unsupported_consumers(overrides):
+  with pytest.raises(ValueError, match="interleaved KV pipeline requires"):
+    splash.SplashConfig(block_q=128, block_kv=256,
+                        bwd_staged_kv_interleave=True, **overrides)
+
+
 @pytest.mark.parametrize("mask_kind", ["numpy", "causal"])
 @pytest.mark.parametrize("seed", [27, 28])
 def test_native_kv_segment_ids_with_structural_mask(mask_kind, seed):
