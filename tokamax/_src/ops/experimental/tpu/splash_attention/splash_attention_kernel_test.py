@@ -17,6 +17,7 @@ from collections.abc import Callable
 import dataclasses
 import functools
 from typing import Any, TypeVar
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -362,6 +363,37 @@ def _generate_inputs(
 
 def attn_logits_soft_cap_strategy() -> hps.SearchStrategy[float | None]:
   return hps.one_of(hps.just(None), hps.floats(min_value=1.0, max_value=50.0))
+
+
+class SplashConfigAblationTest(absltest.TestCase):
+
+  def test_reads_ablation_stage_from_environment(self):
+    with mock.patch.dict(
+        "os.environ", {splash.SPLASH_ABLATION_ENV: "fwd_qk_dot"}
+    ):
+      config = splash.SplashConfig(block_q=128, block_kv=128)
+
+    self.assertEqual(config.ablation_stage, "fwd_qk_dot")
+
+  def test_explicit_ablation_stage_overrides_environment(self):
+    with mock.patch.dict(
+        "os.environ", {splash.SPLASH_ABLATION_ENV: "fwd_qk_dot"}
+    ):
+      config = splash.SplashConfig(
+          block_q=128,
+          block_kv=128,
+          ablation_stage="bwd_dp_dot",
+      )
+
+    self.assertEqual(config.ablation_stage, "bwd_dp_dot")
+
+  def test_rejects_unknown_ablation_stage(self):
+    with self.assertRaisesRegex(ValueError, "Unknown Splash ablation stage"):
+      splash.SplashConfig(
+          block_q=128,
+          block_kv=128,
+          ablation_stage="not_a_stage",
+      )
 
 
 @test_utils.thread_unsafe_test_class()  # hypothesis is not thread safe
