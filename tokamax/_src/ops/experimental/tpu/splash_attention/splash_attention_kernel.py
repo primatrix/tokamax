@@ -1744,7 +1744,9 @@ def _splash_attention_bwd_dkv(
       and do.dtype == q.dtype
   )
   # This changes only the inner computation, not the outer mask/DMA tiles.
-  if native_layout and bq == 4096 and bkv_compute == 1024 and bkv % 4096 == 0:
+  if (native_layout and bq == 4096 and bkv_compute == 1024
+      and bkv % 4096 == 0 and config.bwd_vmem_limit_bytes is not None
+      and config.bwd_vmem_limit_bytes >= 63 * 1024**2):
     bkv_compute = 2048
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   kv_seq_len, head_dim_v = v.shape[-2:]

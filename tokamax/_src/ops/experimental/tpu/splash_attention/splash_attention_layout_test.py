@@ -149,7 +149,8 @@ def test_native_layout_large_backward_compute_window():
   arrays, ids = _inputs(4096, 4096, 72, 72)
   config = _config(72, block_q=4096, block_kv=4096, block_kv_compute=256,
                    block_q_dkv=4096, block_kv_dkv=4096,
-                   block_kv_dkv_compute=1024)
+                   block_kv_dkv_compute=1024,
+                   bwd_vmem_limit_bytes=63 * 1024**2)
   _check(config, arrays, ids, np.ones((4096, 4096), bool))
 
 
