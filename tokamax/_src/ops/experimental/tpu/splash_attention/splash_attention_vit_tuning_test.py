@@ -329,7 +329,7 @@ def test_native_dq_output_preserves_public_vjp(seed, block_q, memory_kv, reducti
 
 
 @pytest.mark.parametrize("seed", [27, 28])
-@pytest.mark.parametrize("mode", ["ordinary", "qtile", "qtile_pipeline", "qmajor", "staged_kv"])
+@pytest.mark.parametrize("mode", ["ordinary", "ordinary_single", "qtile", "qtile_pipeline", "qmajor", "staged_kv"])
 @pytest.mark.parametrize("compact_ids", [False, True])
 @pytest.mark.parametrize("partial_only", [False, True])
 def test_native_kv_segment_ids_preserve_public_vjp(seed, mode, compact_ids, partial_only):
@@ -350,6 +350,8 @@ def test_native_kv_segment_ids_preserve_public_vjp(seed, mode, compact_ids, part
     options |= dict(bwd_block_q_compute=128, bwd_qtile_pipeline=mode == "qtile_pipeline")
   elif mode == "qmajor":
     options |= dict(bwd_qmajor_probabilities=True)
+  elif mode == "ordinary_single":
+    options |= dict(bwd_single_segment_mask_body=True)
   elif mode == "staged_kv":
     options |= dict(bwd_staged_kv_pipeline=True, bwd_dq_first=True,
                     bwd_dq_transposed_output=False,

@@ -1759,3 +1759,189 @@ ID window. A new reader must cover ordinary, Q-tiled and Q-major backward
 mask paths without changing segment equality or forward behavior. Fitting
 another tile will still require separate timing, precision and region
 validation; no large-tile or overlap improvement is assumed.
+
+## Native backward KV segment-ID windows
+
+Source `6b619e95608a6eb0ad35fafa1b16fd981180f1c6` adds default-off
+`bwd_kv_segment_ids_seq_minor`. It exposes the int32 KV IDs as `(1, KV)`
+and maps each backward memory tile to `(1, block_kv_dkv)`. Local mask
+construction reads the compute slice as a logical column, without the
+old input's per-token 128-column broadcast. The original compact-width
+flag is independent: `(KV,1)` is not assumed to remove physical padding.
+
+Ordinary and staged backward masking share the layout-aware mask helper;
+Q-compute-tiling and Q-major probability paths use the same ID-column
+reader. Forward inputs, integer width/equality (including `0 == 0`),
+BF16 dot operands, FP32 softmax/accumulation and gradient reduction
+boundaries remain unchanged. No fast path is enabled by default.
+
+All 44 new CPU cases are directly bitwise equal to their matched controls.
+They cover two seeds, ordinary/Q-tiled/staged-Q/Q-major/staged-KV paths,
+compact IDs on/off, partial-only masks on/off, negative and >8-bit IDs,
+zero-ID tails, NumPy structural masks, causal mask functions and multiple
+heads. The initial staged test lacked its required single-mask-body
+configuration; fixing that test premise made all cases pass without
+changing numerical tolerances. All **358 kernel/oracle tests** then passed
+in 289.25 seconds. This CPU evidence does not certify TPU scheduling or
+allocation behavior; those measurements follow below.
+
+`exp-xq27dol6o8` / `art-mhew4bxhtf` (seed 28, coarse scopes) completes six
+measured cases and three caught compilation failures:
+
+| Backward case | Wall ms | Live PR13 ms | KV loops ms |
+| --- | ---: | ---: | ---: |
+| Native dQ Q4096 / compute-KV1024 | 44.6911 | 49.8002 | 42.4831 |
+| + native KV IDs | 44.5778 | 50.0490 | 42.4282 |
+| Native dQ Q8192 / compute-KV512 | 45.4925 | 50.1197 | 43.5028 |
+| + native KV IDs | 45.2778 | 49.6161 | 43.3482 |
+| Native dQ+IDs Q16384 / compute-KV256 | 54.2643 | 50.2267 | 52.3098 |
+
+The small matched improvements occur mainly in partial-mask regions:
+Q4096 partial loop 13.6814 -> 13.6275 ms while the full loop remains
+28.802 ms; Q8192/compute-KV512 partial loop 16.6130 -> 16.4581 ms while
+the full loop remains 26.890 ms. All measured captures have 79,872 DIE0
+TCS IMEM bytes / 3 descriptors. Q4096 final body MXU/store counts remain
+8,832/3,024; explicit loads fall 3,296 -> 3,169, transpose rises 3,456 ->
+3,584. The smaller input needs a local transpose for the logical mask.
+These are static final-body counts, not runtime utilization.
+
+The failed **matched Q8192/compute-KV1024** compilations provide direct
+allocation evidence: KV-ID input window `s32[8192,128]`, two buffers,
+**8,388,608 bytes**, becomes `s32[1,8192]`, two buffers,
+**65,536 bytes (64 KiB)**. No physical-padding assumption is needed.
+Total required VMEM falls 71.00M -> 64.33M against a 63.94M limit, but
+register-allocation spill slots rise 36.75M -> 38.02M, leaving a 404 KiB
+overflow. Both cases remain unexecuted, with no precision/timing result.
+This distinguishes saved input-window capacity from the compiler's
+resulting total working set.
+
+Q16384/compute-KV256 now fits (the dQ-only layout needed 68.02M), but its
+54.26 ms runtime rejects it. Q16384/compute-KV512 still needs 78.80M with
+39.73M explicit spill slots, so it is not a promising near-fit tile.
+
+All measured candidate/oracle arrays are finite, and all four heads'
+maximum absolute gradient oracle errors are unchanged. At both matched
+Q4096 and Q8192/compute-KV512 tile sizes, new and old ID layouts report
+identical PR13-distance and complete oracle statistics. Q4096 dK/dV remain
+bitwise PR13; the 302 differing dQ elements and worst dQ oracle L2 ratio
+1.000000561 are unchanged. The new Q16384/256 sample's worst ratios are
+dQ 1.000005239, dK 1.000007177, dV 1.000006744; it is rejected for speed,
+not promoted based on fitting. Summary equality is not direct pairwise
+bitwise proof. No precision bound changes.
+
+Evidence: details `an-oltv3ic5qx`, regions/final LLO `an-kar7yfujxd`,
+operator `an-txr50gvah2`, LLO `an-en4zff4u2r`, all reports read.
+The ID-layout gains are small; joint no-scope/all-head validation is still
+required before replacing the retained 61.933 ms configuration.
+
+Source `14f38a052b9d82d17b315599dc9cb9df70e0350f` adds two runner-only
+controls: combine native KV IDs with the existing compact Q-ID input at
+Q4096, then try Q8192/compute-KV1024. This is motivated by the measured
+404 KiB overflow, not by assuming a larger tile is faster. The combination
+is already covered by the 44 new bitwise CPU cases above.
+
+### Compact Q-ID follow-up
+
+`exp-cmx0nxrr8i` / `art-ob2a65jroa` keeps seed 28 and coarse regions.
+At Q4096, adding compact Q IDs to native KV IDs improves backward median
+44.5187 -> 44.2301 ms (live PR13 50.0990 / 50.1461 ms). The trace's full
+KV loop remains 28.802 ms; the partial-mask loop improves 13.6297 ->
+13.2962 ms, making total loop time 42.4313 -> 42.0969 ms. Drain timings,
+0.203 ms internal scope gaps, and 79,872 IMEM bytes / 3 descriptors are
+unchanged. Final body MXU/transpose/store counts remain 8,832/3,584/3,024;
+loads rise 3,169 -> 3,173. This is a partial-mask-layout/scheduling benefit,
+not fewer gradient dots, and counts alone do not prove its detailed
+hardware-overlap mechanism.
+
+Both Q4096 controls have identical PR13-distance and complete four-head
+oracle statistics: all finite, unchanged maximum absolute oracle errors,
+dK/dV bitwise PR13, and the same 302 dQ mismatches / 1.000000561 worst
+dQ L2 error ratio. No acceptance threshold changes. Joint no-scope and
+all-head validation remains required before promotion.
+
+Q8192/compute-KV1024 advances to a different compiler failure:
+`CompileTimeScopedVmemOom`, requiring **63.74M** against the configured
+**63.00M** scoped limit, exceeding it by 760 KiB. It has no runtime or
+precision result. This is distinct from the prior capacity-stage 64.33M
+versus 63.94M failure; the next test must address the explicit kernel
+budget, rather than claiming another layout change is required.
+
+Evidence, all reports read: details `an-bjxt1r895n`, regions/final LLO
+`an-6wuik67qu0`, operator `an-oozrvudnpy`, LLO `an-bgdyc32skt`.
+
+Source `5038a875d5cc78ca4aaa85fdcc25800c0df90252` adds the joint native
+dQ + native KV-ID + compact Q-ID validation case. Source
+`73aef2ba43eabf9db54882c224629c4839716c6b` adds a Q8192/1024 control
+with `bwd_vmem_limit_bytes=64*1024**2`. The JAX 0.11 local compiler-parameter
+documentation requires an enclosing `xla_tpu_scoped_vmem_limit_kib` strictly
+above that budget, so the budget screen uses 65537 KiB for **all** cases,
+including remeasured PR13 and the Q4096 control. Hardware-capacity checks
+remain enabled; changing a budget does not create additional VMEM.
+
+### Joint all-head validation of native compact IDs
+
+`exp-l5c175b961` / `art-8ms3gjs8dy`, source `5038a875d5cc78ca4aaa85fdcc25800c0df90252`,
+uses seed 29, no custom scopes, public `jax.vjp`, 30 timing samples and
+independent full-length FP32 oracle checks for all 32 heads.
+
+| Joint configuration | Median ms | p95 ms | Live PR13 ms |
+| --- | ---: | ---: | ---: |
+| Previous native dQ output | 62.0467 | 62.3203 | 70.1894 |
+| + native KV IDs and compact Q IDs | 61.5991 | 61.8511 | 70.1631 |
+
+The matched improvement is 0.4476 ms (0.7214% latency reduction). Relative
+to live PR13, the new candidate reduces latency by **12.2059%** and raises
+throughput by **13.9028%**. This replaces 61.9334 ms as the retained
+configuration, not as an assertion of a noise-free cross-run improvement.
+The 20–30% goal remains unmet.
+
+All 32 heads' complete candidate oracle statistics and all full-array
+PR13-distance statistics match the previous native-dQ control exactly.
+All arrays are finite. Against PR13, per-head maximum absolute output and
+gradient oracle errors are unchanged; LSE maxima do not increase. The
+worst per-head L2-error ratios remain output 1.000008658, dQ 1.000028169,
+dK 1.000043750, dV 1.000023891 and LSE 1.004493902. Aggregate ratios remain
+output 1.000000572, dQ 1.000002145, dK 0.999997547, dV 1.000002588 and
+LSE 0.999930442. These statistics do not prove pairwise bitwise equality
+to the previous candidate or all-input/training convergence equivalence.
+No precision tolerance is relaxed. LSE is checked separately and is not
+a fifth timed joint output.
+
+Evidence: details `an-hc2nwv7gxm`, operator `an-4pr4skkqtm`, LLO
+`an-6q92m9jaid`, all declared reports read. The generic operator plugin's
+zero trace count does not imply no nested variant traces were captured.
+
+### Q8192 budget probe: fitting does not make it fast
+
+`exp-mk1nalz0vh` / `art-0veplufqel`, source
+`73aef2ba43eabf9db54882c224629c4839716c6b`, successfully compiles and
+executes Q8192/compute-KV1024 with a 64 MiB kernel budget. PR13, Q4096 and
+Q8192 use identical enclosing process flags. Medians are PR13 49.9276 ms,
+compact/native Q4096 44.4623 ms, and Q8192 **51.8902 ms** (its live PR13
+50.0220 ms). Q8192 is rejected for speed.
+
+The first device call is 42.9152 -> 50.6456 ms. Its KV-loop union changes
+only 42.1068 -> 42.4904 ms: full regions 28.8067 -> 26.2100 ms, partial
+regions 13.3002 -> 16.2804 ms. Internal uncovered scope time instead rises
+**0.2047 -> 7.5274 ms**. The three-call capture's DIE0 Any2IMEM traffic
+rises from **79,872 bytes / 3 descriptors** to **3,710,180,352 bytes /
+2,319 descriptors**. This strongly motivates a code-footprint test; it
+does not establish a hardware-utilization percentage or prove every
+uncovered interval is instruction DMA.
+
+Final-body static MXU/transpose/load/store counts change
+8,832/3,584/3,173/3,024 -> 17,664/5,632/4,761/4,032. They include both
+full and partial bodies and are not dynamic instruction counts. Q8192
+has the same 302 dQ mismatches to PR13 as Q4096; dK/dV have 8,922/5,640
+mismatches. All four sampled heads are finite and have unchanged maximum
+absolute gradient oracle errors. Worst per-head L2-error ratios are
+dQ 1.000000561, dK 1.000002761 and dV 1.000005374. No promotion follows
+from these diagnostic precision checks.
+
+Evidence: details `an-zb7iuy4x4m`, regions/final LLO `an-obhmndjjto`,
+operator `an-tf3f739u3a`, LLO `an-yyf1gm785n`, all reports read.
+The next bounded test reuses the existing segment-only shared body with
+the newly compact/native ID layouts at Q4096 and Q8192. It must measure
+both instruction-loading gaps and redundant full-tile masking cost;
+eliminating the Q8192 regression alone is not progress over the retained
+Q4096 baseline.
