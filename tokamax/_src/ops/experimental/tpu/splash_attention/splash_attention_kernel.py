@@ -702,18 +702,17 @@ def _splash_attention_forward(
       and max_logit_value is None
   )
   if native_layout:
-    native_kv_compute = config.block_kv_compute
-    if (native_kv_compute == 256 and config.block_q >= 2048
-        and config.block_kv % 512 == 0):
-      native_kv_compute = 512
-      if (config.block_q == 4096 and config.block_kv % 1024 == 0
-          and (config.fwd_vmem_limit_bytes or 0) >= 60 * 1024**2):
-        native_kv_compute = 1024
     config = dataclasses.replace(
         config, compact_softmax_scratch=True, compact_stats_output=True,
         # The mask describes outer DMA blocks, not this inner compute tile.
         # A wider inner tile amortizes the per-query state update.
-        block_kv_compute=native_kv_compute,
+        block_kv_compute=(
+            512
+            if config.block_kv_compute == 256
+            and config.block_q >= 2048
+            and config.block_kv % 512 == 0
+            else config.block_kv_compute
+        ),
     )
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   head_dim_v = v.shape[-1]
