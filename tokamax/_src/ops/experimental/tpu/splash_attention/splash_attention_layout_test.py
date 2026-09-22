@@ -118,7 +118,10 @@ def _check(config, arrays, ids, mask, *, mode="native", native=True):
   np.testing.assert_allclose(stats["logsumexp"], lse, rtol=2e-5, atol=2e-5)
 
 
-@pytest.mark.parametrize("shape", [(256, 512, 64, 64), (512, 256, 72, 96), (256, 512, 128, 128)])
+@pytest.mark.parametrize("shape", [
+    (256, 512, 64, 64), (512, 256, 72, 96), (256, 512, 128, 128),
+    (256, 512, 72, 72), (256, 512, 72, 56),
+])
 @pytest.mark.parametrize("reduction_steps", [None, 3])
 @pytest.mark.parametrize("fuse_reciprocal", [False, True])
 def test_native_layout_outputs_and_gradients(shape, reduction_steps, fuse_reciprocal):

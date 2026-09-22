@@ -248,6 +248,19 @@ def _use_native_layout(
   )
 
 
+def _pack_native_kv(native_layout, head_dim_qk, head_dim_v):
+  # Two BF16 elements share each 32-bit sublane. Only join buffers when
+  # doing so can eliminate a physical padding tile, without padding operands.
+  packing = 2 * NUM_SUBLANES
+  rounded = lambda size: pl.cdiv(size, packing) * packing
+  return (
+      native_layout
+      and head_dim_qk % NUM_SUBLANES == head_dim_v % NUM_SUBLANES == 0
+      and rounded(head_dim_qk + head_dim_v)
+      < rounded(head_dim_qk) + rounded(head_dim_v)
+  )
+
+
 def _apply_mask_and_soft_cap(
     qk: jax.Array,
     mask_value: float,
@@ -391,8 +404,14 @@ def flash_attention_kernel(
     fuse_reciprocal: bool,  # config.fuse_reciprocal or not save_residuals
     config: SplashConfig,
     native_layout: bool = False,
+    packed_kv: bool = False,
 ):
   del mask_next_ref, active_rows_ref
+  if packed_kv:
+    kv_ref = k_ref
+    head_dim_qk = q_ref.shape[0]
+    k_ref = kv_ref.at[:head_dim_qk, :]
+    v_ref = kv_ref.at[head_dim_qk:, :]
   float32 = jnp.float32
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
   attn_logits_soft_cap = config.attn_logits_soft_cap
@@ -707,6 +726,7 @@ def _splash_attention_forward(
     )
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   head_dim_v = v.shape[-1]
+  packed_kv = _pack_native_kv(native_layout, head_dim_qk, head_dim_v)
   bq, bkv = config.block_q, config.block_kv
   bkv_compute = config.block_kv_compute
   fuse_reciprocal = config.fuse_reciprocal or not save_residuals
@@ -841,6 +861,11 @@ def _splash_attention_forward(
           v_index_map,
       ),
   ]
+  if packed_kv:
+    in_specs[1] = pl.BlockSpec(
+        (None, head_dim_qk + head_dim_v, bkv), k_index_map
+    )
+    in_specs[2] = None
   if segment_ids is not None:
     in_specs += [
         pl.BlockSpec((bq, NUM_LANES), q_segment_ids_index_map),
@@ -1036,6 +1061,7 @@ def _splash_attention_forward(
             config=config,
             mask_function=mask_function,
             native_layout=native_layout,
+            packed_kv=packed_kv,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=6,
@@ -1085,8 +1111,9 @@ def _splash_attention_forward(
         bounds_end,
         mask_info.block_mask,
         q if q_layout == QKVLayout.HEAD_DIM_MINOR else q.mT,
-        k if k_layout == QKVLayout.HEAD_DIM_MINOR else k.mT,
-        v if v_layout == QKVLayout.HEAD_DIM_MINOR else v.mT,
+        jnp.concatenate((k, v), axis=-1).mT
+        if packed_kv else k if k_layout == QKVLayout.HEAD_DIM_MINOR else k.mT,
+        None if packed_kv else v if v_layout == QKVLayout.HEAD_DIM_MINOR else v.mT,
         q_segment_ids,
         kv_segment_ids,
         sinks,
@@ -1445,8 +1472,14 @@ def _flash_attention_dkv_kernel(
     q_heads_per_kv_head: int,
     config: SplashConfig,
     native_layout: bool = False,
+    packed_kv: bool = False,
 ):
   del mask_next_ref, active_cols_ref
+  if packed_kv:
+    kv_ref = k_ref
+    head_dim_qk = q_ref.shape[0]
+    k_ref = kv_ref.at[:head_dim_qk, :]
+    v_ref = kv_ref.at[head_dim_qk:, :]
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
   attn_logits_soft_cap = config.attn_logits_soft_cap
   if attn_logits_soft_cap is not None and config.use_base2_exp:
@@ -1736,6 +1769,7 @@ def _splash_attention_bwd_dkv(
   )
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   kv_seq_len, head_dim_v = v.shape[-2:]
+  packed_kv = _pack_native_kv(native_layout, head_dim_qk, head_dim_v)
   num_kv_heads = 1 if is_mqa else k.shape[0]
   dynamic_grid = mask_info.active_rows is not None
 
@@ -1935,6 +1969,11 @@ def _splash_attention_bwd_dkv(
       do_spec,
       di_spec,
   ]
+  if packed_kv:
+    in_specs[1] = pl.BlockSpec(
+        (None, head_dim_qk + head_dim_v, bkv), k_index_map
+    )
+    in_specs[2] = None
   if mask_info.partial_mask_blocks is not None:
     in_specs.append(mask_spec)
   else:
@@ -2024,6 +2063,7 @@ def _splash_attention_bwd_dkv(
       mask_function=mask_function,
       q_heads_per_kv_head=q_heads_per_kv_head,
       native_layout=native_layout,
+      packed_kv=packed_kv,
   )
 
   kernel_name = get_kernel_name(
@@ -2055,8 +2095,9 @@ def _splash_attention_bwd_dkv(
       mask_info.block_mask,
       # inputs
       q if config.q_layout == QKVLayout.HEAD_DIM_MINOR else q.mT,
-      k if config.k_layout == QKVLayout.HEAD_DIM_MINOR else k.mT,
-      v if config.v_layout == QKVLayout.HEAD_DIM_MINOR else v.mT,
+      jnp.concatenate((k, v), axis=-1).mT
+      if packed_kv else k if config.k_layout == QKVLayout.HEAD_DIM_MINOR else k.mT,
+      None if packed_kv else v if config.v_layout == QKVLayout.HEAD_DIM_MINOR else v.mT,
       q_segment_ids,
       kv_segment_ids,
       logsumexp,
