@@ -2253,7 +2253,6 @@ def _splash_attention_bwd_dkv(
             else {"XLA_TPU_FORCE_LP_LLO_SCHEDULER": config.bwd_scheduler},
             vmem_limit_bytes=config.bwd_vmem_limit_bytes,
             allow_input_fusion=allow_input_fusion,
-            fuse_transposed_lhs_in_matmul=native_layout,
         ),
         name=kernel_name,
         cost_estimate=cost_estimate,
