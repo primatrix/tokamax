@@ -1549,30 +1549,24 @@ def _flash_attention_dkv_kernel(
       )
 
     if native_layout and bq >= 2048 and bq % 1024 == 0:
-      # Materialize FP32 P a query chunk at a time. The gradient contractions
-      # below still use the original complete Q tile and reduction order.
-      def produce_probabilities(p_ref):
-        def query_body(query_index, _):
-          query_slice = pl.ds(query_index * 1024, 1024)
-          logits = lax.dot_general(
-              k, q_ref[:, query_slice], NN_DIM_NUMBERS,
-              preferred_element_type=jnp.float32,
-          )
-          logits *= jnp.float32(config.softmax_scale * LOG2E)
-          if not config.segment_mask_on_partial_only or has_partial_mask:
-            q_ids = q_segment_ids_ref[:1, query_slice]
-            kv_ids = kv_segment_ids_ref[:1, slice_k].T
-            logits = jnp.where(kv_ids == q_ids, logits, mask_value)
-          p_ref[:, query_slice] = jnp.exp2(
-              logits - logsumexp_ref[:1, query_slice]
-          )
-
-        lax.fori_loop(0, bq // 1024, query_body, None, unroll=True)
-        return p_ref[...]
-
-      p = pl.run_scoped(
-          produce_probabilities, pltpu.VMEM((bkv_compute, bq), jnp.float32)
-      )
+      # Keep QK and softmax producers local to each query chunk, without
+      # changing the full-tile gradient contractions or adding a P buffer.
+      probability_chunks = []
+      for query_index in range(bq // 1024):
+        query_slice = pl.ds(query_index * 1024, 1024)
+        logits = lax.dot_general(
+            k, q_ref[:, query_slice], NN_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
+        logits *= jnp.float32(config.softmax_scale * LOG2E)
+        if not config.segment_mask_on_partial_only or has_partial_mask:
+          q_ids = q_segment_ids_ref[:1, query_slice]
+          kv_ids = kv_segment_ids_ref[:1, slice_k].T
+          logits = jnp.where(kv_ids == q_ids, logits, mask_value)
+        probability_chunks.append(jnp.exp2(
+            logits - logsumexp_ref[:1, query_slice]
+        ))
+      p = jnp.concatenate(probability_chunks, axis=1)
     else:
       qk_dims = (
           NT_DIM_NUMBERS
