@@ -601,13 +601,15 @@ def flash_attention_kernel(
 
   @pl.when(should_not_mask)
   def _():
-    lax.fori_loop(0, num_iters, body, None, unroll=True)
+    with jax.named_scope("splash_fwd_kv_loop_full"):
+      lax.fori_loop(0, num_iters, body, None, unroll=True)
 
   @pl.when(jnp.logical_not(should_not_mask))
   def _():
-    lax.fori_loop(
-        0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
-    )
+    with jax.named_scope("splash_fwd_kv_loop_partial"):
+      lax.fori_loop(
+          0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
+      )
 
   @pl.when(should_write)
   def end():
@@ -1669,11 +1671,13 @@ def _flash_attention_dkv_kernel(
 
   @pl.when(jnp.logical_and(should_not_mask, should_run))
   def _():
-    run_inner_loop(False)
+    with jax.named_scope("splash_bwd_kv_loop_full"):
+      run_inner_loop(False)
 
   @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
   def _():
-    run_inner_loop(True)
+    with jax.named_scope("splash_bwd_kv_loop_partial"):
+      run_inner_loop(True)
 
   if dq_scratch_ref is not None:
     if dq_alias is not None:
