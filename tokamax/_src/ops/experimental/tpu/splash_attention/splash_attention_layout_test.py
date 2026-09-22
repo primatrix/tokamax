@@ -145,6 +145,14 @@ def test_native_layout_large_query_window(block_q):
          np.ones((block_q, 512), bool))
 
 
+def test_native_layout_large_backward_compute_window():
+  arrays, ids = _inputs(4096, 4096, 72, 72)
+  config = _config(72, block_q=4096, block_kv=4096, block_kv_compute=256,
+                   block_q_dkv=4096, block_kv_dkv=4096,
+                   block_kv_dkv_compute=1024)
+  _check(config, arrays, ids, np.ones((4096, 4096), bool))
+
+
 @pytest.mark.parametrize("partial_only", [False, True])
 def test_native_segment_ids_across_full_and_partial_tiles(partial_only):
   arrays, _ = _inputs(512, 512, 72, 72)

@@ -483,14 +483,12 @@ def flash_attention_kernel(
       kv_ids = kv_segment_ids_ref[:1, window].T
       logits = jnp.where(kv_ids == q_ids, logits, mask_value)
     probabilities = jnp.exp2(logits - max_logit_estimate)
-    # Expose a packed PV operand to shorten FP32 probability live ranges.
-    # Keep the normalization reduction in FP32; only PV consumes this copy.
-    probabilities_for_pv = probabilities.astype(v_ref.dtype)
     current_l = jnp.sum(probabilities, axis=0, keepdims=True)
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
+    # Keep the original FP32 PV operand and its contraction precision.
     values = v_ref[:, window]
     output_t = lax.dot_general(
-        values, probabilities_for_pv, NN_DIM_NUMBERS,
+        values, probabilities, NN_DIM_NUMBERS,
         preferred_element_type=jnp.float32,
     )
     o_scratch_ref[...] += output_t
@@ -1745,6 +1743,9 @@ def _splash_attention_bwd_dkv(
       and bkv > bkv_compute
       and do.dtype == q.dtype
   )
+  # This changes only the inner computation, not the outer mask/DMA tiles.
+  if native_layout and bq == 4096 and bkv_compute == 1024 and bkv % 4096 == 0:
+    bkv_compute = 2048
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   kv_seq_len, head_dim_v = v.shape[-2:]
   num_kv_heads = 1 if is_mqa else k.shape[0]
