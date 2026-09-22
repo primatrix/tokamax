@@ -484,12 +484,14 @@ def flash_attention_kernel(
       first_kv_id = kv_ids[:1, :1]
       # A partial outer block may contain uniform inner KV blocks. Check
       # every ID: arbitrary/non-monotone segments must retain the full mask.
+      # Mosaic cannot carry vector<i1> through this conditional. Byte flags
+      # preserve the boolean mask exactly and keep FP32 scores outside it.
       segment_mask = lax.cond(
           jnp.all(kv_ids == first_kv_id),
-          lambda: jnp.broadcast_to(first_kv_id == q_ids, logits.shape),
-          lambda: kv_ids.T == q_ids,
+          lambda: jnp.broadcast_to(first_kv_id == q_ids, logits.shape).astype(jnp.uint8),
+          lambda: (kv_ids.T == q_ids).astype(jnp.uint8),
       )
-      logits = jnp.where(segment_mask, logits, mask_value)
+      logits = jnp.where(segment_mask != 0, logits, mask_value)
     probabilities = jnp.exp2(logits - max_logit_estimate)
     current_l = jnp.sum(probabilities, axis=0, keepdims=True)
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
