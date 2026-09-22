@@ -469,17 +469,14 @@ def flash_attention_kernel(
         else value
     ).astype(ref.dtype)
 
-  def kvmajor_scores(kv_compute_index):
+  def kvmajor_body(kv_compute_index, has_partial_mask):
     # Keep P as [KV, Q] so V @ P accumulates directly into [D, Q].
     # This avoids padding D in the minor axis of the output scratch buffer.
     window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-    return lax.dot_general(
+    logits = lax.dot_general(
         k_ref[:, window], q_ref[...], TN_DIM_NUMBERS,
         preferred_element_type=jnp.float32,
     )
-
-  def kvmajor_consume(kv_compute_index, logits, has_partial_mask):
-    window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
     logits *= jnp.float32(config.softmax_scale * LOG2E)
     if not config.segment_mask_on_partial_only or has_partial_mask:
       q_ids = q_segment_ids_ref[:1, :]
@@ -498,8 +495,7 @@ def flash_attention_kernel(
 
   def body(kv_compute_index, _, has_partial_mask=False):
     if native_layout:
-      scores = kvmajor_scores(kv_compute_index)
-      kvmajor_consume(kv_compute_index, scores, has_partial_mask)
+      kvmajor_body(kv_compute_index, has_partial_mask)
       return
     slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
     m_prev, l_prev = load_state(m_scratch_ref), load_state(l_scratch_ref)
@@ -603,37 +599,17 @@ def flash_attention_kernel(
       k_ref.shape[0 if config.k_layout == HEAD_DIM_MINOR else 1] // bkv_compute
   )
 
-  def run_inner_loop(has_partial_mask):
-    if not native_layout:
-      lax.fori_loop(
-          0, num_iters, partial(body, has_partial_mask=has_partial_mask), None,
-          unroll=True,
-      )
-      return
-
-    # Issue next QK before current softmax/PV. Keep every probability FP32
-    # and preserve the original order of l/o additions.
-    scores = kvmajor_scores(0)
-
-    def staged(i, previous):
-      following = kvmajor_scores(i)
-      kvmajor_consume(i - 1, previous, has_partial_mask)
-      return following
-
-    scores = lax.fori_loop(
-        1, num_iters, staged, scores, unroll=True
-    )
-    kvmajor_consume(num_iters - 1, scores, has_partial_mask)
-
   @pl.when(should_not_mask)
   def _():
     with jax.named_scope("splash_fwd_kv_loop_full"):
-      run_inner_loop(False)
+      lax.fori_loop(0, num_iters, body, None, unroll=True)
 
   @pl.when(jnp.logical_not(should_not_mask))
   def _():
     with jax.named_scope("splash_fwd_kv_loop_partial"):
-      run_inner_loop(True)
+      lax.fori_loop(
+          0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
+      )
 
   @pl.when(should_write)
   def end():
