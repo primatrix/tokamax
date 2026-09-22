@@ -214,6 +214,7 @@ def variants(phase="backward"):
       ("native_staged_wrap_c1024", _NATIVE_SHARED_BODY | dict(bwd_staged_kv_pipeline=True, bwd_staged_kv_wrap_tail=True)),
       ("native_interleaved_wrap_c512", _NATIVE_SHARED_BODY | dict(bwd_staged_kv_pipeline=True, bwd_staged_kv_interleave=True, bwd_staged_kv_wrap_tail=True, block_kv_dkv_compute=512)),
       ("native_interleaved_wrap_c1024", _NATIVE_SHARED_BODY | dict(bwd_staged_kv_pipeline=True, bwd_staged_kv_interleave=True, bwd_staged_kv_wrap_tail=True)),
+      ("native_interleaved_wrap_c1024_vmem64", _NATIVE_SHARED_BODY | dict(bwd_staged_kv_pipeline=True, bwd_staged_kv_interleave=True, bwd_staged_kv_wrap_tail=True, bwd_vmem_limit_bytes=64 * 1024**2)),
       ("dq_and_ids_compact_q8192", _NATIVE_DQ_AND_KV_IDS | dict(bwd_compact_segment_ids=True, block_q_dkv=8192)),
       ("dq_and_ids_compact_q8192_vmem64", _NATIVE_DQ_AND_KV_IDS | dict(bwd_compact_segment_ids=True, block_q_dkv=8192, bwd_vmem_limit_bytes=64 * 1024**2)),
       ("dq_and_ids_compact_q8192_single_vmem64", _NATIVE_DQ_AND_KV_IDS | dict(bwd_compact_segment_ids=True, block_q_dkv=8192, bwd_vmem_limit_bytes=64 * 1024**2, bwd_single_segment_mask_body=True)),
