@@ -473,9 +473,9 @@ def flash_attention_kernel(
     # Keep P as [KV, Q] so V @ P accumulates directly into [D, Q].
     # This avoids padding D in the minor axis of the output scratch buffer.
     window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-    # Expose two smaller independent query tiles to the same basic block.
+    # Expose four smaller independent query tiles to the same basic block.
     # Each row retains its original KV reduction and accumulation order.
-    compute_q = 2048 if bq == 4096 else bq
+    compute_q = 1024 if bq == 4096 else bq
     for query_start in range(0, bq, compute_q):
       query = pl.ds(query_start, compute_q)
       logits = lax.dot_general(
