@@ -473,25 +473,38 @@ def flash_attention_kernel(
     # Keep P as [KV, Q] so V @ P accumulates directly into [D, Q].
     # This avoids padding D in the minor axis of the output scratch buffer.
     window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-    logits = lax.dot_general(
-        k_ref[:, window], q_ref[...], TN_DIM_NUMBERS,
-        preferred_element_type=jnp.float32,
-    )
-    logits *= jnp.float32(config.softmax_scale * LOG2E)
-    if not config.segment_mask_on_partial_only or has_partial_mask:
-      q_ids = q_segment_ids_ref[:1, :]
-      kv_ids = kv_segment_ids_ref[:1, window].T
-      logits = jnp.where(kv_ids == q_ids, logits, mask_value)
-    probabilities = jnp.exp2(logits - max_logit_estimate)
-    current_l = jnp.sum(probabilities, axis=0, keepdims=True)
-    l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
-    # The reference PV consumes FP32 P; do not introduce a BF16 cast here.
-    values = v_ref[:, window]
-    output_t = lax.dot_general(
-        values, probabilities, NN_DIM_NUMBERS,
-        preferred_element_type=jnp.float32,
-    )
-    o_scratch_ref[...] += output_t
+    # Bound the live probability tile without changing the outer DMA windows
+    # or the KV reduction/accumulation order of any query row.
+    compute_q = 1024 if bq > 1024 and bq % 1024 == 0 else bq
+
+    def query_body(query_index, _):
+      query = pl.ds(query_index * compute_q, compute_q)
+      logits = lax.dot_general(
+          k_ref[:, window], q_ref[:, query], TN_DIM_NUMBERS,
+          preferred_element_type=jnp.float32,
+      )
+      logits *= jnp.float32(config.softmax_scale * LOG2E)
+      if not config.segment_mask_on_partial_only or has_partial_mask:
+        q_ids = q_segment_ids_ref[:1, query]
+        kv_ids = kv_segment_ids_ref[:1, window].T
+        logits = jnp.where(kv_ids == q_ids, logits, mask_value)
+      probabilities = jnp.exp2(logits - max_logit_estimate)
+      current_l = jnp.sum(probabilities, axis=0, keepdims=True)
+      l_scratch_ref[:, query] += jnp.broadcast_to(
+          current_l, (l_scratch_ref.shape[0], compute_q)
+      )
+      # The reference PV consumes FP32 P; do not introduce a BF16 cast here.
+      values = v_ref[:, window]
+      output_t = lax.dot_general(
+          values, probabilities, NN_DIM_NUMBERS,
+          preferred_element_type=jnp.float32,
+      )
+      o_scratch_ref[:, query] += output_t
+
+    if compute_q == bq:
+      query_body(0, None)
+    else:
+      lax.fori_loop(0, bq // compute_q, query_body, None, unroll=False)
 
   def body(kv_compute_index, _, has_partial_mask=False):
     if native_layout:

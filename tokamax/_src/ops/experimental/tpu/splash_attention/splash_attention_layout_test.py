@@ -138,6 +138,13 @@ def test_native_layout_preserves_block_sparse_mask():
   _check(_config(72), arrays, ids, mask)
 
 
+@pytest.mark.parametrize("block_q", [2048, 4096])
+def test_native_layout_large_query_window(block_q):
+  arrays, ids = _inputs(block_q, 512, 72, 72)
+  _check(_config(72, block_q=block_q), arrays, ids,
+         np.ones((block_q, 512), bool))
+
+
 @pytest.mark.parametrize("partial_only", [False, True])
 def test_native_segment_ids_across_full_and_partial_tiles(partial_only):
   arrays, _ = _inputs(512, 512, 72, 72)
