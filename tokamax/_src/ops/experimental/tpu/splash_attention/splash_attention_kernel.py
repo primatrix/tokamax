@@ -1678,15 +1678,23 @@ def _flash_attention_dkv_kernel(
         unroll=config.bwd_kv_unroll,
     )
 
-  @pl.when(jnp.logical_and(should_not_mask, should_run))
-  def _():
-    with jax.named_scope("splash_bwd_kv_loop_full"):
-      run_inner_loop(False)
+  if native_layout and bq == 4096 and bkv_compute == 2048:
+    # Keep one body at this compute size. Full blocks also apply the exact
+    # segment mask, trading vector work for a smaller instruction footprint.
+    @pl.when(should_run)
+    def _():
+      with jax.named_scope("splash_bwd_kv_loop_shared"):
+        run_inner_loop(True)
+  else:
+    @pl.when(jnp.logical_and(should_not_mask, should_run))
+    def _():
+      with jax.named_scope("splash_bwd_kv_loop_full"):
+        run_inner_loop(False)
 
-  @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
-  def _():
-    with jax.named_scope("splash_bwd_kv_loop_partial"):
-      run_inner_loop(True)
+    @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
+    def _():
+      with jax.named_scope("splash_bwd_kv_loop_partial"):
+        run_inner_loop(True)
 
   if dq_scratch_ref is not None:
     if dq_alias is not None:
