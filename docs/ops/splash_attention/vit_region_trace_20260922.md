@@ -1593,3 +1593,169 @@ improvement. No new default is enabled. Two concrete follow-ups remain:
    Preserve dQ partial dtype/rounding and segment equality, and include all
    wrapper conversions in joint timing. The existing compact-ID flag alone
    changes logical width, not a proven native-layout allocation reduction.
+
+## Matched compiler-scheduler controls on retained joint VJP
+
+Source `ad59926` adds controls which differ from the retained Q4096 native
+forward plus dK-first/transposed-dQ backward only in scheduler flags.
+The backward compute-KV remains **1024**, not 256 (256 is the retained
+forward compute-KV). Ten focused configuration/public-VJP tests passed.
+`exp-beth17rdj8` / `art-8212q4rkcg` runs seed 28, 30 timing samples and
+four full-length oracle heads with coarse scopes. No scheduler is promoted.
+
+| Scheduler FWD / BWD | Joint ms | Live PR13 ms | FWD loops ms | BWD loops ms |
+| --- | ---: | ---: | ---: | ---: |
+| false / false (retained) | 62.5565 | 70.1456 | 16.9013 | 42.4748 |
+| false / true | 62.6617 | 70.1755 | 16.9025 | 42.4518 |
+| false / compiler default | 62.5304 | 70.0853 | 16.9036 | 42.4749 |
+| true / false | 62.7030 | 69.9170 | 17.1379 | 42.4755 |
+| true / true | 62.7514 | 69.8477 | 17.1359 | 42.4556 |
+
+Region columns use the first of three profiled calls. Default and false
+backward scheduling have essentially the same region durations; the
+0.026 ms wall-time difference is not a credible new optimization. Enabling
+backward scheduling shifts time between full/partial loops but saves only
+about 0.023 ms total, while dK/dV drain grows 0.0277 -> 0.0627 ms. Enabling
+forward scheduling worsens total forward loop time and grows its drain
+0.0246 -> 0.0703 ms. Joint scope gaps remain 0.860–0.894 ms; these include
+inter-kernel transitions and are not a hardware utilization measurement.
+
+Final body instruction counts are unchanged across these scheduler controls:
+backward 8,832 MXU / 3,968 transpose / 3,664 load / 2,880 store instructions;
+forward 10,752 / 9,216 / 23,968 / 10,768. The capture-wide DIE0 TCS IMEM
+bytes are 21,533,184 (retained/default), 21,688,320 (BWD true), 21,823,488
+(FWD true), and 21,978,624 (both), each 18 descriptors across three joint
+calls. This joint footprint must not be confused with the earlier
+79,872-byte standalone backward captures. Static counts do not quantify
+overlap, and these controls do not establish optimal scheduling.
+
+All candidate arrays and oracle arrays are finite. Every scheduler variant
+reports the same PR13-distance and four-head oracle statistics as the
+retained candidate; matching summaries are not direct pairwise bitwise
+proof. Output/dQ/dK/dV/LSE maximum absolute oracle errors are unchanged
+versus PR13 on all four heads. Worst per-head L2 error ratios are output
+1.000003214, dQ 1.000012902, dK 1.000008502, dV 0.999997155, and LSE
+1.001825766. No threshold was relaxed.
+
+All declared reports read: details `an-dgaq2t645g`, regions/final LLO
+`an-bxayjxmye2`, operator `an-11xegeqsrv`, LLO `an-a0gtq83hha`.
+The generic operator plugin does not discover nested per-variant trace
+directories; the custom region reader explicitly reads all six profiles.
+
+## Native dQ partial output and alias layout
+
+Source `c7897072efa9c667f40d90c406cbb5e63e3497cd` adds default-off
+`bwd_dq_output_seq_minor`. The Pallas partial output and optional aliased
+input use `[reduction_slot, head, D, Q]`; the scratch drain no longer
+transposes FP32 dQ back to Q-major inside the custom call. Partial dtype,
+BF16 cast before alias addition, `j % 3` slot assignment, and the final
+slot reduction are preserved. Public Q-major shape is restored after
+reduction and this conversion is included in timing.
+
+The flag requires fused backward and sequence-minor scratch; it rejects
+MQA/GQA, grouped heads, and the direct-output path without dQ scratch.
+Sixteen public-VJP CPU cases cover two seeds, two asymmetric Q blocks,
+BF16 and FP32 non-aliased partials, three-slot alias collisions, and
+segmented tails including allowed `0 == 0`. They are directly bitwise
+equal to their matched controls. All **314 kernel/oracle tests** passed
+in 249.56 seconds. TPU evidence is recorded below, not inferred from CPU.
+
+`exp-a57ghp768i` / `art-rqryw8kod2` (seed 28, coarse regions, 30 samples)
+shows a small backward improvement, but does not rescue large-Q performance:
+
+| Backward variant | Wall ms | Live PR13 ms | Device module ms | KV loops ms | dQ drain ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Retained Q4096 / compute-KV1024 | 45.0283 | 49.9645 | 43.9261 | 42.4792 | 0.1721 |
+| + native dQ output | 44.7237 | 49.8759 | 43.3462 | 42.4881 | 0.0388 |
+| Q8192 / compute-KV512 | 46.0029 | 50.0100 | 44.8441 | 43.5129 | 0.1539 |
+| + native dQ output | 45.5922 | 49.9268 | 44.2572 | 43.5041 | 0.0389 |
+| Native Q16384 / compute-KV128 | 72.3823 | 49.8481 | 71.2666 | 70.5601 | 0.0383 |
+
+Device/region columns are the first profiled call, not wall-time components
+measured in the unprofiled samples. At the retained tile the primary loop
+does not improve; dQ drain saves 0.133 ms. Module time outside the coarse
+scope span also drops about 0.464 ms. The latter includes surrounding
+operations and cannot be attributed to one HLO without finer evidence.
+Final backward body MXU count stays 8,832; transpose falls 3,968 -> 3,456,
+loads 3,664 -> 3,296, stores increase 2,880 -> 3,024. All measured captures
+still have 79,872 DIE0 TCS IMEM bytes / 3 descriptors. Thus this is a native
+output/alias formatting improvement, not improved main-loop overlap.
+
+Native Q16384/compute-KV128 now compiles where the old layout required
+66.35M versus 63.94M VMEM, but its 70.56 ms main loop rejects it. Native
+Q16384/compute-KV256 still fails: 68.02M required versus 63.94M, compared
+with 75.10M before. Its explicit compiler spill allocation is 21.02M
+(previously 21.10M), and the doubled KV-segment-ID window still occupies
+8.00M. The new alias operand has `[3,32,72,32768]` physical shape. The
+failed candidate has no timing or precision result despite the runner's
+overall SUCCEEDED state; it is not counted as a measured configuration.
+
+All measured outputs and oracle arrays are finite; four-head maximum
+absolute oracle gradient errors are unchanged. Native and non-native
+controls at each matched Q tile have identical reported PR13-distance
+and oracle statistics. At the retained tile dK/dV remain bitwise equal
+to PR13; dQ differs in 302 elements (max 0.000244140625, relative L2
+7.70492534e-6), exactly the retained control's statistics. Worst dQ oracle
+L2 ratio is 1.000000561. No threshold is relaxed and matching summary
+statistics do not establish pairwise bitwise equality.
+
+Evidence: details `an-hx4589f7gp`, regions/final LLO `an-e5n6mv2gvl`,
+operator `an-ds0l7yoay3`, LLO `an-0mnggklqob`; all reports read. The next
+check is the actual joint public VJP, tracing disabled, with a different
+seed and all 32 full-length oracle heads; standalone backward timings
+alone do not promote a joint candidate.
+
+### Joint no-scope, all-head oracle validation
+
+`exp-fyifkyaus0` / `art-cj9ttjfbsh` uses the same `c789707` source,
+seed 29, all **32** full-length FP32 HIGHEST-precision oracle heads, and
+both `region_trace_mode=none` and custom-call region tracing disabled.
+The public VJP timing returns output/dQ/dK/dV and includes all wrapper
+conversions. LSE is checked separately using the untimed standalone forward.
+
+| Joint variant | Median ms | Live PR13 ms | p95 ms | Max ms |
+| --- | ---: | ---: | ---: | ---: |
+| PR13 self-control | 69.9817 | 69.9252 | 70.2044 | 70.3253 |
+| Previous retained Q4096 native FWD | 62.3787 | 69.9968 | 62.5916 | 62.6063 |
+| + native dQ output/alias | **61.9334** | **70.2271** | **62.2037** | **62.2455** |
+
+p95 is linearly interpolated over 30 samples. The new opt-in candidate
+saves 0.4453 ms (0.714%) against the matched retained candidate in this run.
+Against its live PR13 measurement it is **11.810% lower latency / 13.391%
+higher throughput**. Reference drift is exposed in the table, not hidden
+by comparing only against an old run. This is a small, trace-supported
+layout gain, not achievement of the 20–30% goal or a full-model/remat result.
+It remains default-off and requires no precision, model or device-count
+change.
+
+All full-size candidate arrays and all 32-head oracle arrays are finite.
+The new candidate's PR13-distance summaries and every head's complete
+oracle statistics are identical to the previous retained candidate in
+this run. Output/dQ/dK/dV max absolute oracle errors are unchanged versus
+PR13 at every head; LSE max absolute error never increases (one head
+improves). As before, this is not direct pairwise bitwise proof or a
+training-convergence guarantee.
+
+| Value | Worst per-head L2 error ratio vs PR13 | Aggregate L2 error ratio |
+| --- | ---: | ---: |
+| Output | 1.000008658 | 1.000000572 |
+| dQ | 1.000028169 | 1.000002145 |
+| dK | 1.000043750 | 0.999997547 |
+| dV | 1.000023891 | 1.000002588 |
+| LSE | 1.004493902 | 0.999930442 |
+
+The LSE worst-head relative metric is not claimed unchanged versus PR13;
+its tiny absolute errors and aggregate metric must be read alongside it.
+These statistics reproduce the earlier retained Q4096 seed-29 validation.
+No accuracy acceptance bound is loosened for the new layout.
+
+Evidence: details `an-0syf524g2x`, operator `an-lx22rutgkm`, LLO
+`an-4g0a3e3a4o`. All analyses reached SUCCEEDED; declared reports were read.
+
+The next bounded layout check is a genuinely sequence-minor KV segment-ID
+window, not the existing `(KV,1)` compact-width flag. The failed Q16384
+allocation still exposes 8 MiB in its double-buffered `(8192,128)` int32
+ID window. A new reader must cover ordinary, Q-tiled and Q-major backward
+mask paths without changing segment equality or forward behavior. Fitting
+another tile will still require separate timing, precision and region
+validation; no large-tile or overlap improvement is assumed.
