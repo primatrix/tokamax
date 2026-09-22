@@ -478,11 +478,16 @@ def flash_attention_kernel(
         preferred_element_type=jnp.float32,
     )
     logits *= jnp.float32(config.softmax_scale * LOG2E)
+    probabilities = jnp.exp2(logits - max_logit_estimate)
     if not config.segment_mask_on_partial_only or has_partial_mask:
       q_ids = q_segment_ids_ref[:1, :]
       kv_ids = kv_segment_ids_ref[:1, window].T
-      logits = jnp.where(kv_ids == q_ids, logits, mask_value)
-    probabilities = jnp.exp2(logits - max_logit_estimate)
+      masked_probability = jnp.exp2(
+          jnp.float32(mask_value) - max_logit_estimate
+      )
+      probabilities = jnp.where(
+          kv_ids == q_ids, probabilities, masked_probability
+      )
     current_l = jnp.sum(probabilities, axis=0, keepdims=True)
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
     # Keep the original FP32 PV operand and its contraction precision.
@@ -1563,21 +1568,16 @@ def _flash_attention_dkv_kernel(
         qk_uncapped *= jnp.float32(config.softmax_scale)
         if config.use_base2_exp:
           qk_uncapped *= jnp.float32(LOG2E)
-    post_exp_segment_mask = native_layout and (
-        not config.segment_mask_on_partial_only or has_partial_mask
-    )
     qk = _apply_mask_and_soft_cap(
         qk_uncapped,
         mask_value,
         mask_ref,
         q_sequence_ref,
         q_segment_ids_ref
-        if (not post_exp_segment_mask
-            and (not config.segment_mask_on_partial_only or has_partial_mask))
+        if (not config.segment_mask_on_partial_only or has_partial_mask)
         else None,
         kv_segment_ids_ref
-        if (not post_exp_segment_mask
-            and (not config.segment_mask_on_partial_only or has_partial_mask))
+        if (not config.segment_mask_on_partial_only or has_partial_mask)
         else None,
         attn_logits_soft_cap=attn_logits_soft_cap,
         k_slice=slice_k,
@@ -1590,14 +1590,6 @@ def _flash_attention_dkv_kernel(
     )
     exp = jnp.exp2 if config.use_base2_exp else jnp.exp
     p = exp(qk - logsumexp)
-    if post_exp_segment_mask:
-      # Native-layout eligibility excludes arbitrary masks and soft caps.
-      # Evaluate the masked branch per query, preserving the original finite
-      # mask value and exceptional LSE behavior instead of replacing it by 0.
-      q_ids = q_segment_ids_ref[:1, :]
-      kv_ids = kv_segment_ids_ref[:1, slice_k].T
-      masked_p = exp(jnp.float32(mask_value) - logsumexp)
-      p = jnp.where(q_ids == kv_ids, p, masked_p)
     p_bf16 = p.astype(do.dtype)
 
     def compute_dv():
