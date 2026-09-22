@@ -1565,7 +1565,7 @@ def _flash_attention_dkv_kernel(
       return dk_acc + dk, dv_acc + dv
 
     dk, dv = lax.fori_loop(
-        0, bq // q_compute, query_half, (dk_init, dv_init), unroll=False
+        0, bq // q_compute, query_half, (dk_init, dv_init), unroll=True
     )
     dk_scratch_ref[:, k_slice] += dk * jnp.float32(config.softmax_scale)
     dv_scratch_ref[:, k_slice] += dv
