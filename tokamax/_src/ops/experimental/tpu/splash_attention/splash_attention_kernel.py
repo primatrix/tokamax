@@ -1540,7 +1540,29 @@ def _flash_attention_dkv_kernel(
     else:
       dp_dims = NT_DIM_NUMBERS
 
+    packed_qk = packed_dp = None
+    if native_layout and k.shape[1] <= 128 and v.shape[1] <= 128:
+      # Fill the two reduction halves with K/V, and use block-diagonal Q/dO
+      # columns. The results are QK and dP without cross terms or dtype changes.
+      query = jnp.pad(scaled_q, ((0, 128 - scaled_q.shape[0]), (0, 0)))
+      dout = jnp.pad(do, ((0, 128 - do.shape[0]), (0, 0)))
+      zero = jnp.zeros_like(query)
+      lhs = jnp.concatenate((
+          jnp.pad(k, ((0, 0), (0, 128 - k.shape[1]))),
+          jnp.pad(v, ((0, 0), (0, 128 - v.shape[1]))),
+      ), axis=1)
+      rhs = jnp.concatenate((
+          jnp.concatenate((query, zero), axis=0),
+          jnp.concatenate((zero, dout), axis=0),
+      ), axis=1)
+      paired = lax.dot_general(
+          lhs, rhs, NN_DIM_NUMBERS, preferred_element_type=jnp.float32
+      )
+      packed_qk, packed_dp = paired[:, :bq], paired[:, bq:]
+
     def compute_dp():
+      if packed_dp is not None:
+        return packed_dp
       return lax.dot_general(
           v,
           do,
@@ -1553,7 +1575,7 @@ def _flash_attention_dkv_kernel(
         if config.q_layout == HEAD_DIM_MINOR
         else NN_DIM_NUMBERS
     )
-    qk_uncapped = lax.dot_general(
+    qk_uncapped = packed_qk if packed_qk is not None else lax.dot_general(
         k, scaled_q, qk_dims, preferred_element_type=jnp.float32
     )
     if config.softmax_scale is not None:
