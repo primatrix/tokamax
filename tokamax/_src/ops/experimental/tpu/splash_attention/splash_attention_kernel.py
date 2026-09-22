@@ -483,6 +483,8 @@ def flash_attention_kernel(
       kv_ids = kv_segment_ids_ref[:1, window].T
       logits = jnp.where(kv_ids == q_ids, logits, mask_value)
     probabilities = jnp.exp2(logits - max_logit_estimate)
+    current_l = jnp.sum(probabilities, axis=0, keepdims=True)
+    l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
     # The reference PV consumes FP32 P; do not introduce a BF16 cast here.
     values = v_ref[:, window]
     output_t = lax.dot_general(
@@ -490,10 +492,6 @@ def flash_attention_kernel(
         preferred_element_type=jnp.float32,
     )
     o_scratch_ref[...] += output_t
-    # This independent vector reduction follows PV in source order so it can
-    # overlap the matrix-unit work; each accumulator retains its KV order.
-    current_l = jnp.sum(probabilities, axis=0, keepdims=True)
-    l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
 
   def body(kv_compute_index, _, has_partial_mask=False):
     if native_layout:
