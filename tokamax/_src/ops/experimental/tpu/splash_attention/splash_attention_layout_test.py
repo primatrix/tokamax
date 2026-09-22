@@ -146,12 +146,14 @@ def test_native_layout_large_query_window(block_q):
 
 
 def test_native_layout_large_backward_compute_window():
-  arrays, ids = _inputs(4096, 4096, 72, 72)
+  arrays, ids = _inputs(4096, 8192, 72, 72)
+  arrays = [x[:1] for x in arrays]
   config = _config(72, block_q=4096, block_kv=4096, block_kv_compute=256,
-                   block_q_dkv=4096, block_kv_dkv=4096,
-                   block_kv_dkv_compute=1024,
+                   block_q_dkv=4096, block_kv_dkv=8192,
+                   block_kv_dkv_compute=1024, bwd_kv_unroll=False,
+                   dq_reduction_steps=3, bwd_cast_before_transpose=True,
                    bwd_vmem_limit_bytes=63 * 1024**2)
-  _check(config, arrays, ids, np.ones((4096, 4096), bool))
+  _check(config, arrays, ids, np.ones((4096, 8192), bool))
 
 
 @pytest.mark.parametrize("partial_only", [False, True])
