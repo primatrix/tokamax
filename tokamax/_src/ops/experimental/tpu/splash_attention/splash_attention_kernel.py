@@ -1084,7 +1084,6 @@ def _splash_attention_forward(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary"),
             vmem_limit_bytes=config.fwd_vmem_limit_bytes,
-            fuse_transposed_lhs_in_matmul=native_layout,
             flags={
                 "XLA_TPU_FORCE_LP_LLO_SCHEDULER": (
                     config.use_experimental_scheduler
