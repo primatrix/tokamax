@@ -1430,67 +1430,60 @@ def _flash_attention_dkv_kernel(
     qk_dims = (
         NT_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
     )
-    with jax.named_scope("bwd_recompute_qk"):
-      qk_uncapped = lax.dot_general(
-          k, scaled_q, qk_dims, preferred_element_type=jnp.float32
-      )
-    with jax.named_scope("bwd_logits_transform"):
-      if config.softmax_scale is not None:
-        if config.use_base2_exp and config.combine_log2_scale:
-          qk_uncapped *= jnp.float32(config.softmax_scale * LOG2E)
-        else:
-          qk_uncapped *= jnp.float32(config.softmax_scale)
-          if config.use_base2_exp:
-            qk_uncapped *= jnp.float32(LOG2E)
+    qk_uncapped = lax.dot_general(
+        k, scaled_q, qk_dims, preferred_element_type=jnp.float32
+    )
+    if config.softmax_scale is not None:
+      if config.use_base2_exp and config.combine_log2_scale:
+        qk_uncapped *= jnp.float32(config.softmax_scale * LOG2E)
+      else:
+        qk_uncapped *= jnp.float32(config.softmax_scale)
+        if config.use_base2_exp:
+          qk_uncapped *= jnp.float32(LOG2E)
 
-      qk = _apply_mask_and_soft_cap(
-          qk_uncapped,
-          mask_value,
-          mask_ref,
-          q_sequence_ref,
-          q_segment_ids_ref
-          if (not config.segment_mask_on_partial_only or has_partial_mask)
-          else None,
-          kv_segment_ids_ref
-          if (not config.segment_mask_on_partial_only or has_partial_mask)
-          else None,
-          attn_logits_soft_cap=attn_logits_soft_cap,
-          k_slice=slice_k,
-          k_offset=kv_index * bkv + i * bkv_compute,
-          bq=bq,
-          k_in_lanes=False,
-          mask_function=mask_function,
-          has_partial_mask=has_partial_mask,
-      )
-    with jax.named_scope("bwd_recompute_probability"):
-      exp = jnp.exp2 if config.use_base2_exp else jnp.exp
-      p = exp(qk - logsumexp)
+    qk = _apply_mask_and_soft_cap(
+        qk_uncapped,
+        mask_value,
+        mask_ref,
+        q_sequence_ref,
+        q_segment_ids_ref
+        if (not config.segment_mask_on_partial_only or has_partial_mask)
+        else None,
+        kv_segment_ids_ref
+        if (not config.segment_mask_on_partial_only or has_partial_mask)
+        else None,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+        k_slice=slice_k,
+        k_offset=kv_index * bkv + i * bkv_compute,
+        bq=bq,
+        k_in_lanes=False,
+        mask_function=mask_function,
+        has_partial_mask=has_partial_mask,
+    )
+    exp = jnp.exp2 if config.use_base2_exp else jnp.exp
+    p = exp(qk - logsumexp)
 
     def compute_dv():
-      with jax.named_scope("bwd_dv_dot"):
-        dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32)
-      with jax.named_scope("bwd_dv_accumulate"):
-        dv = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[slice_k, :]
-        dv_scratch_ref[slice_k, :] = dv
+      dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32)
+      dv = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[slice_k, :]
+      dv_scratch_ref[slice_k, :] = dv
 
     if not config.bwd_dv_last:
       compute_dv()
 
-    with jax.named_scope("bwd_dp_dot"):
-      dp = lax.dot_general(
-          v,
-          do,
-          NT_DIM_NUMBERS,
-          preferred_element_type=jnp.float32,
-      )
-    with jax.named_scope("bwd_softmax_grad"):
-      ds = (dp - di) * p
-      if attn_logits_soft_cap is not None:
-        normalized = qk_uncapped / attn_logits_soft_cap
-        d = jnp.tanh(normalized)
-        ds = ds * (1 - d * d)
-      if config.softmax_scale is not None and not config.bwd_scale_after_dot:
-        ds *= jnp.float32(config.softmax_scale)
+    dp = lax.dot_general(
+        v,
+        do,
+        NT_DIM_NUMBERS,
+        preferred_element_type=jnp.float32,
+    )
+    ds = (dp - di) * p
+    if attn_logits_soft_cap is not None:
+      normalized = qk_uncapped / attn_logits_soft_cap
+      d = jnp.tanh(normalized)
+      ds = ds * (1 - d * d)
+    if config.softmax_scale is not None and not config.bwd_scale_after_dot:
+      ds *= jnp.float32(config.softmax_scale)
 
     def compute_dk():
       dk_dims = (
@@ -1498,40 +1491,36 @@ def _flash_attention_dkv_kernel(
           if config.q_layout == HEAD_DIM_MINOR
           else NT_DIM_NUMBERS
       )
-      with jax.named_scope("bwd_dk_dot"):
-        dk = lax.dot_general(
-            ds.astype(do.dtype), q, dk_dims, preferred_element_type=jnp.float32
-        )
-        if config.softmax_scale is not None and config.bwd_scale_after_dot:
-          dk *= jnp.float32(config.softmax_scale)
-      with jax.named_scope("bwd_dk_accumulate"):
-        dk = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[slice_k, :]
-        dk_scratch_ref[slice_k, :] = dk
+      dk = lax.dot_general(
+          ds.astype(do.dtype), q, dk_dims, preferred_element_type=jnp.float32
+      )
+      if config.softmax_scale is not None and config.bwd_scale_after_dot:
+        dk *= jnp.float32(config.softmax_scale)
+      dk = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[slice_k, :]
+      dk_scratch_ref[slice_k, :] = dk
 
     if not config.bwd_dq_first:
       compute_dk()
     if dq_scratch_ref is not None or dq_ref is not None:
-      with jax.named_scope("bwd_dq_dot"):
-        dq = lax.dot_general(
-            ds.astype(k.dtype).T
-            if config.bwd_cast_before_transpose
-            else ds.T.astype(k.dtype),
-            k,
-            NN_DIM_NUMBERS,
-            preferred_element_type=jnp.float32,
-        )
-        if config.softmax_scale is not None and config.bwd_scale_after_dot:
-          dq *= jnp.float32(config.softmax_scale)
-      with jax.named_scope("bwd_dq_accumulate"):
-        if dq_scratch_ref is not None:
-          # Compute block size != memory block size
-          dq_scratch_ref[...] += dq
+      dq = lax.dot_general(
+          ds.astype(k.dtype).T
+          if config.bwd_cast_before_transpose
+          else ds.T.astype(k.dtype),
+          k,
+          NN_DIM_NUMBERS,
+          preferred_element_type=jnp.float32,
+      )
+      if config.softmax_scale is not None and config.bwd_scale_after_dot:
+        dq *= jnp.float32(config.softmax_scale)
+      if dq_scratch_ref is not None:
+        # Compute block size != memory block size
+        dq_scratch_ref[...] += dq
+      else:
+        # Compute block size == memory block size
+        if dq_alias is not None:
+          dq_ref[...] = dq_alias[...] + dq.astype(dq_ref.dtype)
         else:
-          # Compute block size == memory block size
-          if dq_alias is not None:
-            dq_ref[...] = dq_alias[...] + dq.astype(dq_ref.dtype)
-          else:
-            dq_ref[...] = dq.astype(dq_ref.dtype)
+          dq_ref[...] = dq.astype(dq_ref.dtype)
 
     if config.bwd_dq_first:
       compute_dk()
@@ -1563,34 +1552,33 @@ def _flash_attention_dkv_kernel(
         unroll=config.bwd_kv_unroll,
     )
 
-  with jax.named_scope("bwd_writeback"):
-    if dq_scratch_ref is not None:
-      if dq_alias is not None:
-        dq_ref[...] = dq_alias[...] + dq_scratch_ref[...].astype(dq_ref.dtype)
-      else:
-        dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
-
-    if dk_alias is None:
-      assert dv_alias is None
-
-      @pl.when(should_write)
-      def _():
-        dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
-        dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
-
+  if dq_scratch_ref is not None:
+    if dq_alias is not None:
+      dq_ref[...] = dq_alias[...] + dq_scratch_ref[...].astype(dq_ref.dtype)
     else:
-      q_head = pl.program_id(0)
-      first_q_head_in_kv_group = lax.rem(q_head, q_heads_per_kv_head) == 0
+      dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
 
-      @pl.when(jnp.logical_and(should_write, first_q_head_in_kv_group))
-      def _():
-        dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
-        dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
+  if dk_alias is None:
+    assert dv_alias is None
 
-      @pl.when(jnp.logical_and(should_write, _not(first_q_head_in_kv_group)))
-      def _():
-        dk_ref[...] = dk_alias[...] + dk_scratch_ref[...].astype(dk_ref.dtype)
-        dv_ref[...] = dv_alias[...] + dv_scratch_ref[...].astype(dv_ref.dtype)
+    @pl.when(should_write)
+    def _():
+      dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
+      dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
+
+  else:
+    q_head = pl.program_id(0)
+    first_q_head_in_kv_group = lax.rem(q_head, q_heads_per_kv_head) == 0
+
+    @pl.when(jnp.logical_and(should_write, first_q_head_in_kv_group))
+    def _():
+      dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
+      dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
+
+    @pl.when(jnp.logical_and(should_write, _not(first_q_head_in_kv_group)))
+    def _():
+      dk_ref[...] = dk_alias[...] + dk_scratch_ref[...].astype(dk_ref.dtype)
+      dv_ref[...] = dv_alias[...] + dv_scratch_ref[...].astype(dv_ref.dtype)
 
 
 def _splash_attention_bwd_dkv(
@@ -2005,12 +1993,10 @@ def _splash_attention_bwd_dkv(
         interpret=config.interpret,
         metadata=metadata,
     )(*args, dq, dk, dv)
-  with jax.named_scope("splash_bwd_dq_reduction"):
-    dq = dq_unreduced.sum(axis=0)
-  with jax.named_scope("splash_bwd_output_cast"):
-    dq = dq.astype(q.dtype)
-    dk = dk.astype(k.dtype)
-    dv = dv.astype(v.dtype)
+  dq = dq_unreduced.sum(axis=0)
+  dq = dq.astype(q.dtype)
+  dk = dk.astype(k.dtype)
+  dv = dv.astype(v.dtype)
   return dq, dk, dv
 
 
@@ -2052,10 +2038,9 @@ def _splash_attention_bwd(
   q, k, v, segment_ids, sinks, o, logsumexp, dkv_mask_info = res
 
   # di: [num_heads, q_seq_len]
-  with jax.named_scope("splash_bwd_di"):
-    di = jnp.einsum(
-        "hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32)
-    )  # pytype: disable=attribute-error
+  di = jnp.einsum(
+      "hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32)
+  )  # pytype: disable=attribute-error
   dq, dk, dv = _splash_attention_bwd_dkv(
       q,
       k,
@@ -2076,13 +2061,12 @@ def _splash_attention_bwd(
   )
   dsinks = None
   if sinks is not None:
-    with jax.named_scope("splash_bwd_dsinks"):
-      logsumexp_ = (logsumexp / LOG2E) if config.use_base2_exp else logsumexp
-      sinks_exp = -jnp.exp(
-          sinks[..., None, None].astype(jnp.float32)
-          - logsumexp_[..., None].astype(jnp.float32)
-      )
-      dsinks = jnp.sum(sinks_exp.astype(o.dtype) * o * do, axis=(-1, -2))
+    logsumexp_ = (logsumexp / LOG2E) if config.use_base2_exp else logsumexp
+    sinks_exp = -jnp.exp(
+        sinks[..., None, None].astype(jnp.float32)
+        - logsumexp_[..., None].astype(jnp.float32)
+    )
+    dsinks = jnp.sum(sinks_exp.astype(o.dtype) * o * do, axis=(-1, -2))
   # Match the signature of the fwd function.
   assert dq is not None
   return (
