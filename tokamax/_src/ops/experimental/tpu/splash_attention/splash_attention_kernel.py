@@ -171,6 +171,11 @@ class SplashConfig:
   # Caller contract: every full tile in MaskInfo must also be fully allowed
   # by the runtime segment IDs. Partial tiles retain exact segment checks.
   segment_mask_on_partial_only: bool = False
+  # Run homogeneous and boundary dKV tiles in separate Pallas calls. The
+  # homogeneous call omits segment IDs, avoiding their DMA and the mask branch.
+  # The caller must provide two disjoint dKV MaskInfos whose union is the
+  # original active tile set.
+  split_segmented_dkv: bool = False
   fwd_vmem_limit_bytes: int | None = None
   bwd_vmem_limit_bytes: int | None = None
   # An experimental scheduler that sometimes produces better softmax overlap.
@@ -2024,24 +2029,40 @@ def _splash_attention_bwd(
   di = jnp.einsum(
       "hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32)
   )  # pytype: disable=attribute-error
-  dq, dk, dv = _splash_attention_bwd_dkv(
-      q,
-      k,
-      v,
-      segment_ids,
-      logsumexp,
-      do,
-      di,
-      bq=bq_dkv,
-      bkv=bkv_dkv_memory,
-      bkv_compute=bkv_dkv_compute,
-      is_mqa=is_mqa,
-      mask_info=dkv_mask_info,
-      mask_value=mask_value,
-      mask_function=mask_function,
-      config=config,
-      dkv_mask_sparsity=dkv_mask_sparsity,
-  )
+  def run_dkv(info, ids):
+    return _splash_attention_bwd_dkv(
+        q,
+        k,
+        v,
+        ids,
+        logsumexp,
+        do,
+        di,
+        bq=bq_dkv,
+        bkv=bkv_dkv_memory,
+        bkv_compute=bkv_dkv_compute,
+        is_mqa=is_mqa,
+        mask_info=info,
+        mask_value=mask_value,
+        mask_function=mask_function,
+        config=config,
+        dkv_mask_sparsity=dkv_mask_sparsity,
+    )
+
+  if config.split_segmented_dkv:
+    if not isinstance(dkv_mask_info, tuple) or len(dkv_mask_info) != 2:
+      raise ValueError(
+          "split_segmented_dkv requires (homogeneous, boundary) dKV MaskInfos"
+      )
+    homogeneous_info, boundary_info = dkv_mask_info
+    homogeneous_grads = run_dkv(homogeneous_info, None)
+    boundary_grads = run_dkv(boundary_info, segment_ids)
+    dq, dk, dv = tuple(
+        homogeneous + boundary
+        for homogeneous, boundary in zip(homogeneous_grads, boundary_grads)
+    )
+  else:
+    dq, dk, dv = run_dkv(dkv_mask_info, segment_ids)
   dsinks = None
   if sinks is not None:
     logsumexp_ = (logsumexp / LOG2E) if config.use_base2_exp else logsumexp
@@ -2176,9 +2197,11 @@ class SplashAttentionKernel:
   def tree_unflatten(cls, kwargs, values):
     fwd_mask_info, dkv_mask_info = values
     # NamedTuples are not preserved during pytree serialization.
-    dkv_mask_info = (
-        MaskInfo(*dkv_mask_info) if dkv_mask_info is not None else None
-    )
+    if dkv_mask_info is not None:
+      if kwargs.get("config").split_segmented_dkv:
+        dkv_mask_info = tuple(MaskInfo(*info) for info in dkv_mask_info)
+      else:
+        dkv_mask_info = MaskInfo(*dkv_mask_info)
     return SplashAttentionKernel(
         MaskInfo(*fwd_mask_info), dkv_mask_info, **kwargs
     )
