@@ -469,7 +469,7 @@ def flash_attention_kernel(
         else value
     ).astype(ref.dtype)
 
-  def kvmajor_body(kv_compute_index, has_partial_mask):
+  def kvmajor_probabilities(kv_compute_index, has_partial_mask):
     # Keep P as [KV, Q] so V @ P accumulates directly into [D, Q].
     # This avoids padding D in the minor axis of the output scratch buffer.
     window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
@@ -482,7 +482,10 @@ def flash_attention_kernel(
       q_ids = q_segment_ids_ref[:1, :]
       kv_ids = kv_segment_ids_ref[:1, window].T
       logits = jnp.where(kv_ids == q_ids, logits, mask_value)
-    probabilities = jnp.exp2(logits - max_logit_estimate)
+    return jnp.exp2(logits - max_logit_estimate)
+
+  def kvmajor_consume(kv_compute_index, probabilities):
+    window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
     current_l = jnp.sum(probabilities, axis=0, keepdims=True)
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
     # Keep the original FP32 PV operand and its contraction precision.
@@ -495,7 +498,8 @@ def flash_attention_kernel(
 
   def body(kv_compute_index, _, has_partial_mask=False):
     if native_layout:
-      kvmajor_body(kv_compute_index, has_partial_mask)
+      probabilities = kvmajor_probabilities(kv_compute_index, has_partial_mask)
+      kvmajor_consume(kv_compute_index, probabilities)
       return
     slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
     m_prev, l_prev = load_state(m_scratch_ref), load_state(l_scratch_ref)
@@ -599,17 +603,37 @@ def flash_attention_kernel(
       k_ref.shape[0 if config.k_layout == HEAD_DIM_MINOR else 1] // bkv_compute
   )
 
+  def run_inner_loop(has_partial_mask):
+    if not native_layout:
+      lax.fori_loop(
+          0, num_iters, partial(body, has_partial_mask=has_partial_mask), None,
+          unroll=True,
+      )
+      return
+
+    # Prepare the next tile before consuming the previous one. Keep every
+    # probability FP32, and preserve the original order of l/o additions.
+    probabilities = kvmajor_probabilities(0, has_partial_mask)
+
+    def staged(i, previous):
+      following = kvmajor_probabilities(i, has_partial_mask)
+      kvmajor_consume(i - 1, previous)
+      return following
+
+    probabilities = lax.fori_loop(
+        1, num_iters, staged, probabilities, unroll=True
+    )
+    kvmajor_consume(num_iters - 1, probabilities)
+
   @pl.when(should_not_mask)
   def _():
     with jax.named_scope("splash_fwd_kv_loop_full"):
-      lax.fori_loop(0, num_iters, body, None, unroll=True)
+      run_inner_loop(False)
 
   @pl.when(jnp.logical_not(should_not_mask))
   def _():
     with jax.named_scope("splash_fwd_kv_loop_partial"):
-      lax.fori_loop(
-          0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
-      )
+      run_inner_loop(True)
 
   @pl.when(should_write)
   def end():
