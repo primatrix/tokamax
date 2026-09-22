@@ -80,6 +80,7 @@ def variants(phase="backward"):
         ("joint_q4096_both_scheduler", _JOINT_Q4096_NATIVE | dict(bwd_scheduler=True, use_experimental_scheduler=True)),
         ("joint_q4096_native_dq_output", _JOINT_Q4096_NATIVE | dict(bwd_dq_output_seq_minor=True)),
         ("joint_q4096_native_dq_and_ids", _JOINT_Q4096_NATIVE | _NATIVE_DQ_AND_KV_IDS),
+        ("joint_q4096_native_dq_compact_ids", _JOINT_Q4096_NATIVE | _NATIVE_DQ_AND_KV_IDS | dict(bwd_compact_segment_ids=True)),
     ]
   if phase == "forward":
     return [
