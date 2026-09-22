@@ -173,7 +173,8 @@ def test_native_segment_ids_across_full_and_partial_tiles(partial_only):
 
 
 @pytest.mark.parametrize("mixed_interior", [False, True])
-def test_native_uniform_inner_kv_ids(mixed_interior):
+@pytest.mark.parametrize("block_kv", [128, 256])
+def test_native_uniform_inner_kv_ids(mixed_interior, block_kv):
   arrays, _ = _inputs(512, 512, 72, 72)
   kv_ids = np.repeat(np.array([-3, 0, 7, -3], np.int32), 128)
   if mixed_interior:
@@ -184,7 +185,8 @@ def test_native_uniform_inner_kv_ids(mixed_interior):
       jnp.asarray(np.resize(np.array([-3, 0, 7, 0], np.int32), 512)),
       jnp.asarray(kv_ids),
   )
-  _check(_config(72), arrays, ids, np.ones((512, 512), bool))
+  _check(_config(72, block_kv=block_kv), arrays, ids,
+         np.ones((512, 512), bool))
 
 
 @pytest.mark.parametrize("mode", [

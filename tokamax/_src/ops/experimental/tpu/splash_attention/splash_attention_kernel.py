@@ -469,46 +469,34 @@ def flash_attention_kernel(
         else value
     ).astype(ref.dtype)
 
-  def kvmajor_body(kv_compute_index, has_partial_mask):
+  def kvmajor_body(kv_compute_index, has_partial_mask, uniform_kv=False):
     # Keep P as [KV, Q] so V @ P accumulates directly into [D, Q].
+    # This avoids padding D in the minor axis of the output scratch buffer.
     window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-    should_mask = not config.segment_mask_on_partial_only or has_partial_mask
+    logits = lax.dot_general(
+        k_ref[:, window], q_ref[...], TN_DIM_NUMBERS,
+        preferred_element_type=jnp.float32,
+    )
+    logits *= jnp.float32(config.softmax_scale * LOG2E)
+    if not config.segment_mask_on_partial_only or has_partial_mask:
+      q_ids = q_segment_ids_ref[:1, :]
+      kv_ids = (kv_segment_ids_ref[:1, :1] if uniform_kv
+                else kv_segment_ids_ref[:1, window].T)
+      logits = jnp.where(kv_ids == q_ids, logits, mask_value)
+    probabilities = jnp.exp2(logits - max_logit_estimate)
+    current_l = jnp.sum(probabilities, axis=0, keepdims=True)
+    l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
+    # Keep the original FP32 PV operand and its contraction precision.
+    values = v_ref[:, window]
+    output_t = lax.dot_general(
+        values, probabilities, NN_DIM_NUMBERS,
+        preferred_element_type=jnp.float32,
+    )
+    o_scratch_ref[...] += output_t
 
-    def consume(kv_ids):
-      logits = lax.dot_general(
-          k_ref[:, window], q_ref[...], TN_DIM_NUMBERS,
-          preferred_element_type=jnp.float32,
-      )
-      logits *= jnp.float32(config.softmax_scale * LOG2E)
-      if should_mask:
-        logits = jnp.where(
-            kv_ids == q_segment_ids_ref[:1, :], logits, mask_value
-        )
-      probabilities = jnp.exp2(logits - max_logit_estimate)
-      current_l = jnp.sum(probabilities, axis=0, keepdims=True)
-      l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
-      output_t = lax.dot_general(
-          v_ref[:, window], probabilities, NN_DIM_NUMBERS,
-          preferred_element_type=jnp.float32,
-      )
-      o_scratch_ref[...] += output_t
-
-    if should_mask:
-      kv_ids = kv_segment_ids_ref[:1, window]
-      first_kv_id = kv_ids[:1, :1]
-      # Validate every ID, including non-monotone interior boundaries.
-      # Both branches write scratch directly: no score/mask matrix phi.
-      lax.cond(
-          jnp.all(kv_ids == first_kv_id),
-          lambda: consume(first_kv_id),
-          lambda: consume(kv_ids.T),
-      )
-    else:
-      consume(None)
-
-  def body(kv_compute_index, _, has_partial_mask=False):
+  def body(kv_compute_index, _, has_partial_mask=False, uniform_kv=False):
     if native_layout:
-      kvmajor_body(kv_compute_index, has_partial_mask)
+      kvmajor_body(kv_compute_index, has_partial_mask, uniform_kv)
       return
     slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
     m_prev, l_prev = load_state(m_scratch_ref), load_state(l_scratch_ref)
@@ -620,9 +608,22 @@ def flash_attention_kernel(
   @pl.when(jnp.logical_not(should_not_mask))
   def _():
     with jax.named_scope("splash_fwd_kv_loop_partial"):
-      lax.fori_loop(
-          0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
-      )
+      def run_partial(uniform_kv):
+        lax.fori_loop(
+            0, num_iters,
+            partial(body, has_partial_mask=True, uniform_kv=uniform_kv),
+            None, unroll=True,
+        )
+
+      if native_layout:
+        kv_ids = kv_segment_ids_ref[:1, :]
+        # Dispatch once per DMA window, not once per inner compute tile.
+        lax.cond(
+            jnp.all(kv_ids == kv_ids[:1, :1]),
+            lambda: run_partial(True), lambda: run_partial(False),
+        )
+      else:
+        run_partial(False)
 
   @pl.when(should_write)
   def end():
