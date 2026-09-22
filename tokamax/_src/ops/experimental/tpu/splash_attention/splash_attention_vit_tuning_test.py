@@ -328,6 +328,85 @@ def test_native_dq_output_preserves_public_vjp(seed, block_q, memory_kv, reducti
     np.testing.assert_array_equal(value, control)
 
 
+@pytest.mark.parametrize("seed", [27, 28])
+@pytest.mark.parametrize("mode", ["ordinary", "qtile", "qtile_pipeline", "qmajor", "staged_kv"])
+@pytest.mark.parametrize("compact_ids", [False, True])
+@pytest.mark.parametrize("partial_only", [False, True])
+def test_native_kv_segment_ids_preserve_public_vjp(seed, mode, compact_ids, partial_only):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_pr13_benchmark as bench
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_schedule_sweep as sweep
+
+  q, k, v, do = [jax.random.normal(key, (1, 1024, 72), jnp.bfloat16)
+                 for key in jax.random.split(jax.random.key(seed), 4)]
+  # Include IDs outside int8 range and allowed zero-ID tails. No narrowing
+  # or reserved padding-ID convention is permitted by this layout change.
+  ids = jnp.asarray(np.repeat(np.array([127, -130, 1024, 0], np.int32), [512, 496, 8, 8]))
+  segments = base.SegmentIds(ids, ids)
+  options = _TUNING | sweep._DQ_DK_FIRST | dict(
+      bwd_dq_output_seq_minor=True, bwd_compact_segment_ids=compact_ids,
+      segment_mask_on_partial_only=partial_only,
+  )
+  if mode.startswith("qtile"):
+    options |= dict(bwd_block_q_compute=128, bwd_qtile_pipeline=mode == "qtile_pipeline")
+  elif mode == "qmajor":
+    options |= dict(bwd_qmajor_probabilities=True)
+  elif mode == "staged_kv":
+    options |= dict(bwd_staged_kv_pipeline=True, bwd_dq_first=True,
+                    bwd_dq_transposed_output=False,
+                    bwd_single_segment_mask_body=True)
+  cfg = splash.SplashConfig(
+      block_q=256, block_kv=512, block_kv_compute=128,
+      block_q_dkv=256, block_kv_dkv=512, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR, k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR, softmax_scale=72**-0.5,
+      use_base2_exp=True, max_logit_const=0.0, interpret=True, **options,
+  )
+
+  def run(config):
+    kernel = bench._make_kernel(segments, config)
+    return jax.jit(lambda q, k, v, do: sweep.joint_values(
+        kernel, q, k, v, segments, do))(q, k, v, do)
+
+  expected = run(cfg)
+  actual = run(dataclasses.replace(cfg, bwd_kv_segment_ids_seq_minor=True))
+  for value, control in zip(actual, expected):
+    assert value.shape == control.shape and value.dtype == control.dtype
+    assert np.isfinite(np.asarray(value)).all()
+    np.testing.assert_array_equal(value, control)
+
+
+@pytest.mark.parametrize("mask_kind", ["numpy", "causal"])
+@pytest.mark.parametrize("seed", [27, 28])
+def test_native_kv_segment_ids_with_structural_mask(mask_kind, seed):
+  from tokamax.experimental.utils.tuning.tpu import splash_attention_vit_schedule_sweep as sweep
+
+  q, k, v, do = [jax.random.normal(key, (2, 256, 72), jnp.bfloat16)
+                 for key in jax.random.split(jax.random.key(seed), 4)]
+  ids = jnp.asarray(np.repeat(np.array([-130, 0], np.int32), [192, 64]))
+  segments = base.SegmentIds(ids, ids)
+  mask = (mask_lib.NumpyMask(np.tril(np.ones((256, 256), dtype=bool)))
+          if mask_kind == "numpy" else mask_lib.CausalMask((256, 256)))
+  cfg = splash.SplashConfig(
+      block_q=128, block_kv=256, block_kv_compute=128,
+      block_q_dkv=128, block_kv_dkv=256, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR, k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR, softmax_scale=72**-0.5,
+      use_base2_exp=True, interpret=True,
+      **(_TUNING | dict(segment_mask_on_partial_only=False)),
+  )
+
+  def run(config):
+    kernel = splash.make_splash_mha_single_device(mask, config=config)
+    return jax.jit(lambda q, k, v, do: sweep.joint_values(
+        kernel, q, k, v, segments, do))(q, k, v, do)
+
+  for value, control in zip(
+      run(dataclasses.replace(cfg, bwd_kv_segment_ids_seq_minor=True)), run(cfg),
+  ):
+    assert np.isfinite(np.asarray(value)).all()
+    np.testing.assert_array_equal(value, control)
+
+
 @pytest.mark.parametrize("kwargs", [
     {},
     {"bwd_dq_scratch_seq_minor": True, "use_fused_bwd_kernel": False},

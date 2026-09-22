@@ -199,9 +199,12 @@ class SplashConfig:
   bwd_do_seq_minor: bool = False
   bwd_dp_before_qk: bool = False
   bwd_reuse_bf16_probabilities: bool = False
-  # Keep backward segment IDs scalar per token in VMEM. Partial-mask tiles
-  # broadcast them only when constructing the elementwise segment mask.
+  # Use singleton broadcast axes for backward ID inputs. The KV-major
+  # orientation may still incur lane padding; see the native layout below.
   bwd_compact_segment_ids: bool = False
+  # Put the KV token axis in lanes rather than padding each int32 token to
+  # NUM_LANES columns. This changes only backward mask input layout.
+  bwd_kv_segment_ids_seq_minor: bool = False
   # Store FP32 dK/dV accumulators with sequence as the minor dimension. This
   # avoids padding a non-MXU-facing head dimension in VMEM.
   bwd_dkv_scratch_seq_minor: bool = False
@@ -357,6 +360,11 @@ def _attention_scope(config: SplashConfig, name: str, *, coarse: bool = False):
 to_i32 = lambda x: x.astype(jnp.int32)
 
 
+def _kv_segment_column(ref, window, *, seq_minor: bool = False):
+  """Load one int32 ID per KV token as a logical [KV, 1] column."""
+  return ref[:1, window].T if seq_minor else ref[window, :1]
+
+
 def _apply_mask_and_soft_cap(
     qk: jax.Array,
     mask_value: float,
@@ -372,6 +380,7 @@ def _apply_mask_and_soft_cap(
     k_in_lanes=True,
     mask_function=None,
     has_partial_mask: bool = False,
+    kv_segment_ids_seq_minor: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
   assert mask_ref is None or q_sequence_ref is None
   assert (q_sequence_ref is None) == (mask_function is None)
@@ -428,9 +437,13 @@ def _apply_mask_and_soft_cap(
       q_ids = jnp.tile(q_segment_ids_ref[:], (1, repeats))  # [bq, bkv]
     else:
       assert bq == q_segment_ids_ref.shape[-1]
-      if kv_segment_ids_ref.shape[-1] == 1:
+      if kv_segment_ids_seq_minor or kv_segment_ids_ref.shape[-1] == 1:
         kv_ids = jnp.broadcast_to(
-            kv_segment_ids_ref[k_slice, :1], (k_slice.size, bq)
+            _kv_segment_column(
+                kv_segment_ids_ref, k_slice,
+                seq_minor=kv_segment_ids_seq_minor,
+            ),
+            (k_slice.size, bq),
         )
       else:
         repeats, rem = divmod(bq, NUM_LANES)
@@ -1817,6 +1830,7 @@ def _flash_attention_dkv_kernel(
             k_offset=kv_index * bkv + i * bkv_compute,
             bq=bq, k_in_lanes=False, mask_function=None,
             has_partial_mask=True,
+            kv_segment_ids_seq_minor=config.bwd_kv_segment_ids_seq_minor,
         )
         p = jnp.exp2(logits - logsumexp_ref[:1, :])
       with _attention_scope(config, "splash_bwd_dp_mxu"):
@@ -1896,7 +1910,10 @@ def _flash_attention_dkv_kernel(
       with _attention_scope(config, "splash_bwd_mask_softmax"):
         if not config.segment_mask_on_partial_only or has_partial_mask:
           q_ids = q_segment_ids_ref[:1, q_window]
-          kv_ids = kv_segment_ids_ref[kv_window, :1]
+          kv_ids = _kv_segment_column(
+              kv_segment_ids_ref, kv_window,
+              seq_minor=config.bwd_kv_segment_ids_seq_minor,
+          )
           logits = jnp.where(kv_ids == q_ids, logits, mask_value)
         p = jnp.exp2(logits - logsumexp_ref[:1, q_window])
       with _attention_scope(config, "splash_bwd_dp_mxu"):
@@ -2037,7 +2054,10 @@ def _flash_attention_dkv_kernel(
     with _attention_scope(config, "splash_bwd_mask_softmax"):
       if not config.segment_mask_on_partial_only or has_partial_mask:
         q_ids = q_segment_ids_ref[:1, :].T
-        kv_ids = kv_segment_ids_ref[window, :1].T
+        kv_ids = _kv_segment_column(
+            kv_segment_ids_ref, window,
+            seq_minor=config.bwd_kv_segment_ids_seq_minor,
+        ).T
         logits = jnp.where(q_ids == kv_ids, logits, mask_value)
       p = jnp.exp2(logits - logsumexp_ref[:1, :].T)
       p_bf16 = p.astype(do.dtype)
@@ -2176,6 +2196,7 @@ def _flash_attention_dkv_kernel(
             k_in_lanes=False,
             mask_function=mask_function,
             has_partial_mask=has_partial_mask,
+            kv_segment_ids_seq_minor=config.bwd_kv_segment_ids_seq_minor,
         )
         exp = jnp.exp2 if config.use_base2_exp else jnp.exp
         p = exp(qk - logsumexp)
@@ -2640,6 +2661,11 @@ def _splash_attention_bwd_dkv(
       kv_segment_ids = jax.lax.broadcast_in_dim(
           segment_ids.kv, (kv_seq_len, NUM_LANES), (0,)
       )
+    if config.bwd_kv_segment_ids_seq_minor:
+      kv_segment_spec = pl.BlockSpec(
+          (1, bkv), unravel(lambda h, i, j: (0, j))
+      )
+      kv_segment_ids = segment_ids.kv[None, :]
   else:
     q_segment_spec = kv_segment_spec = None
     q_segment_ids = kv_segment_ids = None

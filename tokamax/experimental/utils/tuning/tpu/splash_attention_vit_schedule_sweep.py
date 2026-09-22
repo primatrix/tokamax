@@ -42,6 +42,10 @@ _DQ_DK_FIRST = _EXACT_LAYOUT | dict(
     bwd_dq_transposed_output=True, bwd_dq_first=False,
 )
 
+_NATIVE_DQ_AND_KV_IDS = _DQ_DK_FIRST | dict(
+    bwd_dq_output_seq_minor=True, bwd_kv_segment_ids_seq_minor=True,
+)
+
 _FWD_KVMAJOR = dict(
     fwd_kvmajor_probabilities=True,
     compact_softmax_scratch=True, fwd_output_scratch_seq_minor=True,
@@ -75,6 +79,7 @@ def variants(phase="backward"):
         ("joint_q4096_fwd_scheduler", _JOINT_Q4096_NATIVE | dict(use_experimental_scheduler=True)),
         ("joint_q4096_both_scheduler", _JOINT_Q4096_NATIVE | dict(bwd_scheduler=True, use_experimental_scheduler=True)),
         ("joint_q4096_native_dq_output", _JOINT_Q4096_NATIVE | dict(bwd_dq_output_seq_minor=True)),
+        ("joint_q4096_native_dq_and_ids", _JOINT_Q4096_NATIVE | _NATIVE_DQ_AND_KV_IDS),
     ]
   if phase == "forward":
     return [
@@ -191,6 +196,12 @@ def variants(phase="backward"):
       ("dq_dk_first_q2048", _DQ_DK_FIRST | dict(block_q_dkv=2048)),
       ("dq_dk_first_q8192_c512", _DQ_DK_FIRST | dict(block_q_dkv=8192, block_kv_dkv_compute=512)),
       ("dq_native_output", _DQ_DK_FIRST | dict(bwd_dq_output_seq_minor=True)),
+      ("dq_native_output_q8192", _DQ_DK_FIRST | dict(bwd_dq_output_seq_minor=True, block_q_dkv=8192)),
+      ("dq_and_kv_ids_native", _NATIVE_DQ_AND_KV_IDS),
+      ("dq_and_kv_ids_native_q8192", _NATIVE_DQ_AND_KV_IDS | dict(block_q_dkv=8192)),
+      ("dq_and_kv_ids_native_q8192_c512", _NATIVE_DQ_AND_KV_IDS | dict(block_q_dkv=8192, block_kv_dkv_compute=512)),
+      ("dq_and_kv_ids_native_q16384_c256", _NATIVE_DQ_AND_KV_IDS | dict(block_q_dkv=16384, block_kv_dkv_compute=256)),
+      ("dq_and_kv_ids_native_q16384_c512", _NATIVE_DQ_AND_KV_IDS | dict(block_q_dkv=16384, block_kv_dkv_compute=512)),
       ("dq_native_output_q8192_c512", _DQ_DK_FIRST | dict(bwd_dq_output_seq_minor=True, block_q_dkv=8192, block_kv_dkv_compute=512)),
       ("dq_native_output_q16384_c256", _DQ_DK_FIRST | dict(bwd_dq_output_seq_minor=True, block_q_dkv=16384, block_kv_dkv_compute=256)),
       ("dq_native_output_q16384_c128", _DQ_DK_FIRST | dict(bwd_dq_output_seq_minor=True, block_q_dkv=16384, block_kv_dkv_compute=128)),
