@@ -2274,3 +2274,27 @@ counter units, a core frequency, or per-kernel utilization. An exact-name
 public documentation search did not establish those semantics. Do not call
 the `_0/_1/_2` suffixes three separate engines or convert these totals to
 an overlap percentage without calibration and authoritative meaning.
+
+## Replay-count calibration of counter capture
+
+The runner now accepts `--profile-repeat-counts` for independent, indexed
+captures of one already-compiled candidate. Each capture completes an
+extra warmup outside tracing, records requested/completed replay counts
+and host monotonic/Unix boundaries, and preserves metadata on a failed
+replay. Zero replays provide an idle-window control. Repeated counts use
+distinct paths. With this option absent, the old single-capture directory
+and default replay count remain unchanged. Kernel arithmetic, timed
+measurements, and accuracy comparisons are not modified.
+
+Six host-side tests pass, checking warmup placement, exact replay counts,
+zero/repeated-count handling, legacy paths, ordered time boundaries,
+invalid-input rejection before side effects, and failed-capture metadata.
+Host timestamps bound profiler API calls, not hardware sampling windows;
+counter semantics and utilization remain unproven pending actual traces.
+
+A real CPU/interpret integration smoke (sequence 512, one merged head,
+seed 30) captures 0/1/3 replays for PR13 and retained native/compact dQ.
+All six capture records are complete; both candidates report bitwise
+PR13 gradients. The calibration analyzer's linear-fit helper also passes
+synthetic slope/intercept, repeated-count, constant-value, and insufficient-
+distinct-count checks. These checks validate orchestration, not TPU counters.

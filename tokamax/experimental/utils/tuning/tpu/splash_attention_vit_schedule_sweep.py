@@ -359,6 +359,47 @@ def _config(args):
   )
 
 
+def capture_profiles(candidate, candidate_args, *, out, name, phase,
+                     repeats=3, repeat_counts=None):
+  """Capture independently warmed replays without changing timed measurements.
+
+  Host boundaries describe calls into the profiler, not hardware-counter
+  sampling boundaries. A zero-replay capture is an idle-window control.
+  """
+  counts = [repeats] if repeat_counts is None else list(repeat_counts)
+  if not counts or any(count < 0 for count in counts):
+    raise ValueError("profile replay counts must be nonempty and nonnegative")
+  metadata_path = out / "profiling/capture-metadata.jsonl"
+  for index, count in enumerate(counts):
+    profile_dir = out / "profiling/xprof" / name
+    if repeat_counts is not None:
+      # The index distinguishes repeated counts and avoids trace overwrites.
+      profile_dir /= f"capture_{index:02d}_replays_{count}"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    bench._ready(candidate(*candidate_args))  # Complete warmup outside trace.
+    capture = dict(
+        variant=name, phase=phase, capture_index=index, requested_replays=count,
+        completed_replays=0, status="failed",
+        profile_dir=str(profile_dir.relative_to(out)),
+        host_requested_unix_ns=time.time_ns(),
+        host_requested_monotonic_ns=time.perf_counter_ns(),
+    )
+    try:
+      with jax.profiler.trace(str(profile_dir)):
+        capture["host_entered_monotonic_ns"] = time.perf_counter_ns()
+        for step in range(count):
+          with jax.profiler.StepTraceAnnotation("vit_splash_" + phase, step_num=step):
+            bench._ready(candidate(*candidate_args))
+          capture["completed_replays"] += 1
+        capture["host_loop_finished_monotonic_ns"] = time.perf_counter_ns()
+      capture["status"] = "captured"
+    finally:
+      capture["host_returned_monotonic_ns"] = time.perf_counter_ns()
+      capture["host_returned_unix_ns"] = time.time_ns()
+      with metadata_path.open("a") as stream:
+        stream.write(json.dumps(capture, sort_keys=True) + "\n")
+
+
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--phase", choices=("forward", "backward", "joint"), default="backward")
@@ -372,6 +413,8 @@ def main():
   parser.add_argument("--output-dir", required=True)
   parser.add_argument("--profile-variants", nargs="*", default=[])
   parser.add_argument("--profile-repeats", type=int, default=3)
+  parser.add_argument("--profile-repeat-counts", type=int, nargs="+",
+                      help="Independent replay-count captures; zero measures an idle window")
   parser.add_argument("--oracle-heads", type=int, nargs="*", default=[],
                       help="Untimed independent FP32 oracle on these full-length merged heads")
   parser.add_argument("--oracle-block-q", type=int, default=512)
@@ -382,6 +425,10 @@ def main():
     raise ValueError("sequence must be a power of two >= 256")
   if any(head < 0 or head >= args.heads for head in args.oracle_heads):
     raise ValueError("oracle-heads must index the merged head dimension")
+  if args.profile_repeats < 0 or (
+      args.profile_repeat_counts is not None and any(n < 0 for n in args.profile_repeat_counts)
+  ):
+    raise ValueError("profile replay counts must be nonnegative")
   available = dict(variants(args.phase))
   selected = args.variants or list(available)
   if set(selected) - available.keys():
@@ -522,12 +569,10 @@ def main():
         ))
         row["status"] = "measured"
         if name in args.profile_variants:
-          profile_dir = out / "profiling/xprof" / name
-          profile_dir.mkdir(parents=True, exist_ok=True)
-          with jax.profiler.trace(str(profile_dir)):
-            for step in range(args.profile_repeats):
-              with jax.profiler.StepTraceAnnotation("vit_splash_" + args.phase, step_num=step):
-                bench._ready(candidate(*candidate_args))
+          capture_profiles(
+              candidate, candidate_args, out=out, name=name, phase=args.phase,
+              repeats=args.profile_repeats, repeat_counts=args.profile_repeat_counts,
+          )
         metric = dict(variant=name, phase=args.phase, latency_ms=row[args.phase]["median_ms"],
                       seq_len=args.sequence, merged_heads=args.heads, head_dim=args.head_dim,
                       dtype="bfloat16", seed=args.seed, bitwise_equal=exact)
