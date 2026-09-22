@@ -703,7 +703,16 @@ def _splash_attention_forward(
   )
   if native_layout:
     config = dataclasses.replace(
-        config, compact_softmax_scratch=True, compact_stats_output=True
+        config, compact_softmax_scratch=True, compact_stats_output=True,
+        # The mask describes outer DMA blocks, not this inner compute tile.
+        # A wider inner tile amortizes the per-query state update.
+        block_kv_compute=(
+            512
+            if config.block_kv_compute == 256
+            and config.block_q >= 2048
+            and config.block_kv % 512 == 0
+            else config.block_kv_compute
+        ),
     )
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   head_dim_v = v.shape[-1]
@@ -1678,23 +1687,15 @@ def _flash_attention_dkv_kernel(
         unroll=config.bwd_kv_unroll,
     )
 
-  if native_layout and bq == 4096 and bkv_compute == 2048:
-    # Keep one body at this compute size. Full blocks also apply the exact
-    # segment mask, trading vector work for a smaller instruction footprint.
-    @pl.when(should_run)
-    def _():
-      with jax.named_scope("splash_bwd_kv_loop_shared"):
-        run_inner_loop(True)
-  else:
-    @pl.when(jnp.logical_and(should_not_mask, should_run))
-    def _():
-      with jax.named_scope("splash_bwd_kv_loop_full"):
-        run_inner_loop(False)
+  @pl.when(jnp.logical_and(should_not_mask, should_run))
+  def _():
+    with jax.named_scope("splash_bwd_kv_loop_full"):
+      run_inner_loop(False)
 
-    @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
-    def _():
-      with jax.named_scope("splash_bwd_kv_loop_partial"):
-        run_inner_loop(True)
+  @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
+  def _():
+    with jax.named_scope("splash_bwd_kv_loop_partial"):
+      run_inner_loop(True)
 
   if dq_scratch_ref is not None:
     if dq_alias is not None:
@@ -1751,12 +1752,6 @@ def _splash_attention_bwd_dkv(
       and bkv > bkv_compute
       and do.dtype == q.dtype
   )
-  # This changes only the inner computation, not the outer mask/DMA tiles.
-  if (native_layout and bq == 4096 and bkv_compute == 1024
-      and bkv % 4096 == 0 and config.bwd_vmem_limit_bytes is not None
-      and config.bwd_vmem_limit_bytes >= 63 * 1024**2
-      and not config.bwd_kv_unroll):
-    bkv_compute = 2048
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   kv_seq_len, head_dim_v = v.shape[-2:]
   num_kv_heads = 1 if is_mqa else k.shape[0]
