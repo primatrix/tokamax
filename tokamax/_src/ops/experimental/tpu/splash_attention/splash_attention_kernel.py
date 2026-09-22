@@ -478,16 +478,11 @@ def flash_attention_kernel(
         preferred_element_type=jnp.float32,
     )
     logits *= jnp.float32(config.softmax_scale * LOG2E)
-    probabilities = jnp.exp2(logits - max_logit_estimate)
     if not config.segment_mask_on_partial_only or has_partial_mask:
       q_ids = q_segment_ids_ref[:1, :]
       kv_ids = kv_segment_ids_ref[:1, window].T
-      masked_probability = jnp.exp2(
-          jnp.float32(mask_value) - max_logit_estimate
-      )
-      probabilities = jnp.where(
-          kv_ids == q_ids, probabilities, masked_probability
-      )
+      logits = jnp.where(kv_ids == q_ids, logits, mask_value)
+    probabilities = jnp.exp2(logits - max_logit_estimate)
     current_l = jnp.sum(probabilities, axis=0, keepdims=True)
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
     # Keep the original FP32 PV operand and its contraction precision.
