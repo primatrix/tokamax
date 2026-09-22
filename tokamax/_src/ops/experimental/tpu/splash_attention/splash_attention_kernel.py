@@ -483,12 +483,14 @@ def flash_attention_kernel(
       kv_ids = kv_segment_ids_ref[:1, window].T
       logits = jnp.where(kv_ids == q_ids, logits, mask_value)
     probabilities = jnp.exp2(logits - max_logit_estimate)
+    # Expose a packed PV operand to shorten FP32 probability live ranges.
+    # Keep the normalization reduction in FP32; only PV consumes this copy.
+    probabilities_for_pv = probabilities.astype(v_ref.dtype)
     current_l = jnp.sum(probabilities, axis=0, keepdims=True)
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
-    # The reference PV consumes FP32 P; do not introduce a BF16 cast here.
     values = v_ref[:, window]
     output_t = lax.dot_general(
-        values, probabilities, NN_DIM_NUMBERS,
+        values, probabilities_for_pv, NN_DIM_NUMBERS,
         preferred_element_type=jnp.float32,
     )
     o_scratch_ref[...] += output_t
@@ -703,16 +705,7 @@ def _splash_attention_forward(
   )
   if native_layout:
     config = dataclasses.replace(
-        config, compact_softmax_scratch=True, compact_stats_output=True,
-        # The mask describes outer DMA blocks, not this inner compute tile.
-        # A wider inner tile amortizes the per-query state update.
-        block_kv_compute=(
-            512
-            if config.block_kv_compute == 256
-            and config.block_q >= 2048
-            and config.block_kv % 512 == 0
-            else config.block_kv_compute
-        ),
+        config, compact_softmax_scratch=True, compact_stats_output=True
     )
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   head_dim_v = v.shape[-1]
