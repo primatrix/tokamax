@@ -361,7 +361,6 @@ def flash_attention_kernel(
     bounds_start_ref,
     bounds_end_ref,
     block_mask_ref,
-    prefix_full_ref,
     # Inputs
     q_ref,
     k_ref,
@@ -393,7 +392,7 @@ def flash_attention_kernel(
     config: SplashConfig,
     native_layout: bool = False,
 ):
-  del mask_next_ref
+  del mask_next_ref, active_rows_ref
   float32 = jnp.float32
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
   attn_logits_soft_cap = config.attn_logits_soft_cap
@@ -608,29 +607,9 @@ def flash_attention_kernel(
   @pl.when(jnp.logical_not(should_not_mask))
   def _():
     with jax.named_scope("splash_fwd_kv_loop_partial"):
-      def masked_loop():
-        lax.fori_loop(
-            0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
-        )
-
-      if prefix_full_ref is not None:
-        q_index = (
-            active_rows_ref[grid_idx].astype(jnp.int32)
-            if active_rows_ref is not None else grid_idx // kv_steps
-        )
-
-        def prefix_loop():
-          # A single outer decision leaves the entire inner schedule static.
-          with jax.named_scope("splash_fwd_prefix_full"):
-            for kv_index in range(num_iters):
-              kvmajor_body(kv_index, kv_index == num_iters - 1)
-
-        lax.cond(
-            prefix_full_ref[q_index * kv_steps + j] != 0,
-            prefix_loop, masked_loop,
-        )
-      else:
-        masked_loop()
+      lax.fori_loop(
+          0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
+      )
 
   @pl.when(should_write)
   def end():
@@ -1059,23 +1038,6 @@ def _splash_attention_forward(
     grid = (num_q_heads, kv_steps * (q_seq_len // bq))
     is_empty_attention_block = False
 
-  prefix_full = None
-  if (
-      native_layout and config.segment_mask_on_partial_only
-      and 1 < bkv // bkv_compute <= 16
-      and (q_seq_len // bq) * kv_steps <= 4096
-  ):
-    # A proof shared across heads, not an assumption about sorted IDs. The
-    # final compute window always retains the original exact element mask.
-    q_ids = segment_ids.q.reshape(-1, bq)
-    prefix_ids = segment_ids.kv.reshape(-1, bkv)[:, :bkv - bkv_compute]
-    q_uniform = jnp.all(q_ids == q_ids[:, :1], axis=1)
-    prefix_uniform = jnp.all(prefix_ids == prefix_ids[:, :1], axis=1)
-    prefix_full = (
-        q_uniform[:, None] & prefix_uniform[None, :]
-        & (q_ids[:, :1] == prefix_ids[:, 0][None, :])
-    ).astype(jnp.int32).reshape(-1)
-
   with jax.named_scope(kernel_name):
     all_out = pl.pallas_call(
         partial(
@@ -1094,7 +1056,7 @@ def _splash_attention_forward(
             native_layout=native_layout,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=7,
+            num_scalar_prefetch=6,
             in_specs=in_specs,
             out_specs=out_specs,
             grid=grid,
@@ -1140,7 +1102,6 @@ def _splash_attention_forward(
         bounds_start,
         bounds_end,
         mask_info.block_mask,
-        prefix_full,
         q if q_layout == QKVLayout.HEAD_DIM_MINOR else q.mT,
         k if k_layout == QKVLayout.HEAD_DIM_MINOR else k.mT,
         v if v_layout == QKVLayout.HEAD_DIM_MINOR else v.mT,
