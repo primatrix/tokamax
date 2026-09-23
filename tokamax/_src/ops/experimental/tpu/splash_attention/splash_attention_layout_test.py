@@ -187,6 +187,21 @@ def test_native_uniform_inner_kv_ids(mixed_interior):
   _check(_config(72), arrays, ids, np.ones((512, 512), bool))
 
 
+@pytest.mark.parametrize("mixed_q", [False, True])
+@pytest.mark.parametrize("mixed_kv", [False, True])
+def test_native_inner_full_metadata(mixed_q, mixed_kv):
+  arrays, _ = _inputs(512, 512, 72, 72)
+  q_ids = np.repeat(np.array([-3, 0, 7, -3], np.int32), 128)
+  kv_ids = q_ids.copy()
+  if mixed_q:
+    q_ids[63], q_ids[319] = 7, -3
+  if mixed_kv:
+    kv_ids[63], kv_ids[319] = 7, -3
+  ids = base.SegmentIds(jnp.asarray(q_ids), jnp.asarray(kv_ids))
+  _check(_config(72, segment_mask_on_partial_only=True),
+         arrays, ids, np.ones((512, 512), bool))
+
+
 @pytest.mark.parametrize("mode", [
     "online", "nonzero_shift", "soft_cap", "causal", "no_segments",
     "mqa", "gqa", "head_minor", "sinks", "single_compute_tile",

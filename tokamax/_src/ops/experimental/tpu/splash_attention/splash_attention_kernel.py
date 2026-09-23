@@ -361,6 +361,7 @@ def flash_attention_kernel(
     bounds_start_ref,
     bounds_end_ref,
     block_mask_ref,
+    inner_full_ref,
     # Inputs
     q_ref,
     k_ref,
@@ -383,6 +384,7 @@ def flash_attention_kernel(
     *,
     mask_value: float,
     kv_steps: int,
+    kv_inner_blocks: int,
     bq: int,
     bkv: int,
     bkv_compute: int,
@@ -392,7 +394,7 @@ def flash_attention_kernel(
     config: SplashConfig,
     native_layout: bool = False,
 ):
-  del mask_next_ref, active_rows_ref
+  del mask_next_ref
   float32 = jnp.float32
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
   attn_logits_soft_cap = config.attn_logits_soft_cap
@@ -495,7 +497,20 @@ def flash_attention_kernel(
 
   def body(kv_compute_index, _, has_partial_mask=False):
     if native_layout:
-      kvmajor_body(kv_compute_index, has_partial_mask)
+      if has_partial_mask and inner_full_ref is not None:
+        q_index = (
+            active_rows_ref[grid_idx].astype(jnp.int32)
+            if active_rows_ref is not None else grid_idx // kv_steps
+        )
+        kv_index = j * (bkv // bkv_compute) + kv_compute_index
+        inner_full = inner_full_ref[q_index * kv_inner_blocks + kv_index]
+        lax.cond(
+            inner_full != 0,
+            lambda: kvmajor_body(kv_compute_index, False),
+            lambda: kvmajor_body(kv_compute_index, True),
+        )
+      else:
+        kvmajor_body(kv_compute_index, has_partial_mask)
       return
     slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
     m_prev, l_prev = load_state(m_scratch_ref), load_state(l_scratch_ref)
@@ -1038,12 +1053,29 @@ def _splash_attention_forward(
     grid = (num_q_heads, kv_steps * (q_seq_len // bq))
     is_empty_attention_block = False
 
+  inner_full = None
+  if (
+      native_layout and config.segment_mask_on_partial_only
+      and (q_seq_len // bq) * (kv_seq_len // bkv_compute) <= 4096
+  ):
+    # Prove homogeneous/equal segments once, shared by all heads. Preserve
+    # the original exact element mask for every unproven inner tile.
+    q_ids = segment_ids.q.reshape(-1, bq)
+    kv_ids = segment_ids.kv.reshape(-1, bkv_compute)
+    q_uniform = jnp.all(q_ids == q_ids[:, :1], axis=1)
+    kv_uniform = jnp.all(kv_ids == kv_ids[:, :1], axis=1)
+    inner_full = (
+        q_uniform[:, None] & kv_uniform[None, :]
+        & (q_ids[:, :1] == kv_ids[:, 0][None, :])
+    ).astype(jnp.int32).reshape(-1)
+
   with jax.named_scope(kernel_name):
     all_out = pl.pallas_call(
         partial(
             flash_attention_kernel,
             mask_value=mask_value,
             kv_steps=kv_steps,
+            kv_inner_blocks=kv_seq_len // bkv_compute,
             bq=bq,
             bkv=bkv,
             bkv_compute=bkv_compute,
@@ -1056,7 +1088,7 @@ def _splash_attention_forward(
             native_layout=native_layout,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=6,
+            num_scalar_prefetch=7,
             in_specs=in_specs,
             out_specs=out_specs,
             grid=grid,
@@ -1102,6 +1134,7 @@ def _splash_attention_forward(
         bounds_start,
         bounds_end,
         mask_info.block_mask,
+        inner_full,
         q if q_layout == QKVLayout.HEAD_DIM_MINOR else q.mT,
         k if k_layout == QKVLayout.HEAD_DIM_MINOR else k.mT,
         v if v_layout == QKVLayout.HEAD_DIM_MINOR else v.mT,
