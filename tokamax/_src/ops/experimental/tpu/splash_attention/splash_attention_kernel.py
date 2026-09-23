@@ -473,25 +473,34 @@ def flash_attention_kernel(
     # Keep P as [KV, Q] so V @ P accumulates directly into [D, Q].
     # This avoids padding D in the minor axis of the output scratch buffer.
     window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-    logits = lax.dot_general(
-        k_ref[:, window], q_ref[...], TN_DIM_NUMBERS,
-        preferred_element_type=jnp.float32,
+    # Only boundary tiles use smaller score blocks; the complete-mask path
+    # and every query's KV reduction/accumulation order remain unchanged.
+    compute_q = (
+        512 if has_partial_mask and bq >= 1024 and bq % 512 == 0 else bq
     )
-    logits *= jnp.float32(config.softmax_scale * LOG2E)
-    if not config.segment_mask_on_partial_only or has_partial_mask:
-      q_ids = q_segment_ids_ref[:1, :]
-      kv_ids = kv_segment_ids_ref[:1, window].T
-      logits = jnp.where(kv_ids == q_ids, logits, mask_value)
-    probabilities = jnp.exp2(logits - max_logit_estimate)
-    current_l = jnp.sum(probabilities, axis=0, keepdims=True)
-    l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
-    # Keep the original FP32 PV operand and its contraction precision.
-    values = v_ref[:, window]
-    output_t = lax.dot_general(
-        values, probabilities, NN_DIM_NUMBERS,
-        preferred_element_type=jnp.float32,
-    )
-    o_scratch_ref[...] += output_t
+    for query_start in range(0, bq, compute_q):
+      query = pl.ds(query_start, compute_q)
+      logits = lax.dot_general(
+          k_ref[:, window], q_ref[:, query], TN_DIM_NUMBERS,
+          preferred_element_type=jnp.float32,
+      )
+      logits *= jnp.float32(config.softmax_scale * LOG2E)
+      if not config.segment_mask_on_partial_only or has_partial_mask:
+        q_ids = q_segment_ids_ref[:1, query]
+        kv_ids = kv_segment_ids_ref[:1, window].T
+        logits = jnp.where(kv_ids == q_ids, logits, mask_value)
+      probabilities = jnp.exp2(logits - max_logit_estimate)
+      current_l = jnp.sum(probabilities, axis=0, keepdims=True)
+      l_scratch_ref[:, query] += jnp.broadcast_to(
+          current_l, (l_scratch_ref.shape[0], compute_q)
+      )
+      # Keep the original FP32 PV operand and its contraction precision.
+      values = v_ref[:, window]
+      output_t = lax.dot_general(
+          values, probabilities, NN_DIM_NUMBERS,
+          preferred_element_type=jnp.float32,
+      )
+      o_scratch_ref[:, query] += output_t
 
   def body(kv_compute_index, _, has_partial_mask=False):
     if native_layout:
