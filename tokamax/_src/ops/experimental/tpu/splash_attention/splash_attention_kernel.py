@@ -495,7 +495,7 @@ def flash_attention_kernel(
         )
         p_scratch_ref[:, query_window] = probabilities.astype(v_ref.dtype)
 
-      lax.fori_loop(0, bq // 1024, produce, None, unroll=False)
+      lax.fori_loop(0, bq // 1024, produce, None, unroll=True)
       output_t = lax.dot_general(
           v_ref[:, window], p_scratch_ref[...], NN_DIM_NUMBERS,
           preferred_element_type=jnp.float32,
