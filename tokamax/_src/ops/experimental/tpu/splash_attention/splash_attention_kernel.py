@@ -473,19 +473,40 @@ def flash_attention_kernel(
     # Keep P as [KV, Q] so V @ P accumulates directly into [D, Q].
     # This avoids padding D in the minor axis of the output scratch buffer.
     window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-    logits = lax.dot_general(
-        k_ref[:, window], q_ref[...], TN_DIM_NUMBERS,
-        preferred_element_type=jnp.float32,
-    )
-    logits *= jnp.float32(config.softmax_scale * LOG2E)
-    if not config.segment_mask_on_partial_only or has_partial_mask:
-      q_ids = q_segment_ids_ref[:1, :]
-      kv_ids = kv_segment_ids_ref[:1, window].T
-      logits = jnp.where(kv_ids == q_ids, logits, mask_value)
-    probabilities = jnp.exp2(logits - max_logit_estimate)
-    current_l = jnp.sum(probabilities, axis=0, keepdims=True)
+
+    def make_probabilities(producer_window):
+      logits = lax.dot_general(
+          k_ref[:, producer_window], q_ref[...], TN_DIM_NUMBERS,
+          preferred_element_type=jnp.float32,
+      )
+      logits *= jnp.float32(config.softmax_scale * LOG2E)
+      if not config.segment_mask_on_partial_only or has_partial_mask:
+        q_ids = q_segment_ids_ref[:1, :]
+        kv_ids = kv_segment_ids_ref[:1, producer_window].T
+        logits = jnp.where(kv_ids == q_ids, logits, mask_value)
+      return jnp.exp2(logits - max_logit_estimate)
+
+    if bkv_compute >= 512 and bkv_compute % 512 == 0:
+      # Produce smaller FP32 probability tiles, finishing their FP32 sums
+      # before retaining only the BF16 PV operands. Keep the original PV
+      # contraction window and FP32 output accumulation intact.
+      producer_kv = bkv_compute // 2
+      operands = []
+      normalizers = []
+      for producer_index in range(2):
+        producer_window = pl.ds(
+            kv_compute_index * bkv_compute + producer_index * producer_kv,
+            producer_kv,
+        )
+        tile = make_probabilities(producer_window)
+        normalizers.append(jnp.sum(tile, axis=0, keepdims=True))
+        operands.append(tile.astype(v_ref.dtype))
+      current_l = normalizers[0] + normalizers[1]
+      probabilities = jnp.concatenate(operands, axis=0)
+    else:
+      probabilities = make_probabilities(window)
+      current_l = jnp.sum(probabilities, axis=0, keepdims=True)
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
-    # Keep the original FP32 PV operand and its contraction precision.
     values = v_ref[:, window]
     output_t = lax.dot_general(
         values, probabilities, NN_DIM_NUMBERS,
