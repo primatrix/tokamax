@@ -469,7 +469,7 @@ def flash_attention_kernel(
         else value
     ).astype(ref.dtype)
 
-  def kvmajor_body(kv_compute_index, has_partial_mask, uniform_kv=False):
+  def kvmajor_body(kv_compute_index, has_partial_mask):
     # Keep P as [KV, Q] so V @ P accumulates directly into [D, Q].
     # This avoids padding D in the minor axis of the output scratch buffer.
     window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
@@ -480,8 +480,7 @@ def flash_attention_kernel(
     logits *= jnp.float32(config.softmax_scale * LOG2E)
     if not config.segment_mask_on_partial_only or has_partial_mask:
       q_ids = q_segment_ids_ref[:1, :]
-      kv_ids = (kv_segment_ids_ref[:1, :1] if uniform_kv
-                else kv_segment_ids_ref[:1, window].T)
+      kv_ids = kv_segment_ids_ref[:1, window].T
       logits = jnp.where(kv_ids == q_ids, logits, mask_value)
     probabilities = jnp.exp2(logits - max_logit_estimate)
     current_l = jnp.sum(probabilities, axis=0, keepdims=True)
@@ -494,9 +493,9 @@ def flash_attention_kernel(
     )
     o_scratch_ref[...] += output_t
 
-  def body(kv_compute_index, _, has_partial_mask=False, uniform_kv=False):
+  def body(kv_compute_index, _, has_partial_mask=False):
     if native_layout:
-      kvmajor_body(kv_compute_index, has_partial_mask, uniform_kv)
+      kvmajor_body(kv_compute_index, has_partial_mask)
       return
     slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
     m_prev, l_prev = load_state(m_scratch_ref), load_state(l_scratch_ref)
@@ -608,22 +607,9 @@ def flash_attention_kernel(
   @pl.when(jnp.logical_not(should_not_mask))
   def _():
     with jax.named_scope("splash_fwd_kv_loop_partial"):
-      def run_partial(uniform_kv):
-        lax.fori_loop(
-            0, num_iters,
-            partial(body, has_partial_mask=True, uniform_kv=uniform_kv),
-            None, unroll=True,
-        )
-
-      if native_layout:
-        kv_ids = kv_segment_ids_ref[:1, :]
-        # Dispatch once per DMA window, not once per inner compute tile.
-        lax.cond(
-            jnp.all(kv_ids == kv_ids[:1, :1]),
-            lambda: run_partial(True), lambda: run_partial(False),
-        )
-      else:
-        run_partial(False)
+      lax.fori_loop(
+          0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
+      )
 
   @pl.when(should_write)
   def end():
