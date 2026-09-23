@@ -380,7 +380,6 @@ def flash_attention_kernel(
     m_scratch_ref,
     l_scratch_ref,
     o_scratch_ref,
-    p_scratch_ref,
     *,
     mask_value: float,
     kv_steps: int,
@@ -474,34 +473,6 @@ def flash_attention_kernel(
     # Keep P as [KV, Q] so V @ P accumulates directly into [D, Q].
     # This avoids padding D in the minor axis of the output scratch buffer.
     window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-    if p_scratch_ref is not None:
-      # Bound FP32 P liveness to one query microtile. The denominator still
-      # reduces the complete KV window in FP32; only PV operands are staged.
-      def produce(query_index, _):
-        query_window = pl.ds(query_index * 1024, 1024)
-        logits = lax.dot_general(
-            k_ref[:, window], q_ref[:, query_window], TN_DIM_NUMBERS,
-            preferred_element_type=jnp.float32,
-        )
-        logits *= jnp.float32(config.softmax_scale * LOG2E)
-        if not config.segment_mask_on_partial_only or has_partial_mask:
-          q_ids = q_segment_ids_ref[:1, query_window]
-          kv_ids = kv_segment_ids_ref[:1, window].T
-          logits = jnp.where(kv_ids == q_ids, logits, mask_value)
-        probabilities = jnp.exp2(logits - max_logit_estimate)
-        current_l = jnp.sum(probabilities, axis=0, keepdims=True)
-        l_scratch_ref[:, query_window] += jnp.broadcast_to(
-            current_l, (l_scratch_ref.shape[0], 1024)
-        )
-        p_scratch_ref[:, query_window] = probabilities.astype(v_ref.dtype)
-
-      lax.fori_loop(0, bq // 1024, produce, None, unroll=True)
-      output_t = lax.dot_general(
-          v_ref[:, window], p_scratch_ref[...], NN_DIM_NUMBERS,
-          preferred_element_type=jnp.float32,
-      )
-      o_scratch_ref[...] += output_t
-      return
     logits = lax.dot_general(
         k_ref[:, window], q_ref[...], TN_DIM_NUMBERS,
         preferred_element_type=jnp.float32,
@@ -1108,11 +1079,6 @@ def _splash_attention_forward(
                     else (bq, head_dim_v),
                     jnp.float32,
                 ),  # o_scratch
-                (
-                    pltpu.VMEM((bkv_compute, bq), v.dtype)
-                    if native_layout and bq >= 2048 and bq % 1024 == 0
-                    else None
-                ),  # p_scratch
             ],
         ),
         compiler_params=pltpu.CompilerParams(
