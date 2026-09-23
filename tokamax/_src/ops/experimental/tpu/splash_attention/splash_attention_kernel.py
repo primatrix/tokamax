@@ -476,7 +476,7 @@ def flash_attention_kernel(
     # Only boundary tiles use smaller score blocks; the complete-mask path
     # and every query's KV reduction/accumulation order remain unchanged.
     compute_q = (
-        512 if has_partial_mask and bq >= 1024 and bq % 512 == 0 else bq
+        2048 if has_partial_mask and bq >= 4096 and bq % 2048 == 0 else bq
     )
     for query_start in range(0, bq, compute_q):
       query = pl.ds(query_start, compute_q)
