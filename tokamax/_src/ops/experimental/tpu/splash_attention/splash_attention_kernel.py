@@ -487,11 +487,14 @@ def flash_attention_kernel(
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
     # The reference PV consumes FP32 P; do not introduce a BF16 cast here.
     values = v_ref[:, window]
+    # Pad only the non-reducing PV dimension; keep stored values and gradients
+    # at their original width while improving narrow-head MXU mapping.
+    values = jnp.pad(values, ((0, max(0, NUM_LANES - values.shape[0])), (0, 0)))
     output_t = lax.dot_general(
         values, probabilities, NN_DIM_NUMBERS,
         preferred_element_type=jnp.float32,
     )
-    o_scratch_ref[...] += output_t
+    o_scratch_ref[...] += output_t[:v_ref.shape[0], :]
 
   def body(kv_compute_index, _, has_partial_mask=False):
     if native_layout:
