@@ -41,6 +41,7 @@ MaskInfo = mask_info_lib.MaskInfo
 partial = functools.partial
 NUM_LANES = 128
 NUM_SUBLANES = 8
+SUPPORTS_GROUPED_SEGMENT_IDS = True
 # We predefine some useful dimension numbers for dot_general
 NN_DIM_NUMBERS = (((1,), (0,)), ((), ()))  # standard matmul
 NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))  # RHS transposed
@@ -111,6 +112,32 @@ def from_head_minor(vals: tuple[Any, ...], layout: QKVLayout):
   if layout == QKVLayout.HEAD_DIM_MINOR:
     return vals
   return (*vals[:-2], vals[-1], vals[-2])
+
+
+def _group_segment_spec(ids, num_heads, tile_size, seq_minor, width, sequence_axis, unravel):
+  """Load one ID array for each contiguous group of attention heads."""
+  groups, length = ids.shape
+  block_shape = (width, tile_size) if seq_minor else (tile_size, width)
+  array_shape = (groups, width, length) if seq_minor else (groups, length, width)
+  expanded = ids[:, None, :] if seq_minor else ids[:, :, None]
+
+  def index_map(h, i, j):
+    tile = (i, j)[sequence_axis]
+    group = _div(h, num_heads // groups)
+    return (group, 0, tile) if seq_minor else (group, tile, 0)
+
+  return (
+      pl.BlockSpec((None, *block_shape), unravel(index_map)),
+      jnp.broadcast_to(expanded, array_shape),
+  )
+
+
+def _block_mask_value(ref, grid_idx, head, num_heads):
+  """Read a shared mask or a mask for a contiguous group of heads."""
+  if ref.ndim == 2:
+    group = head // (num_heads // ref.shape[0])
+    return ref[group, grid_idx].astype(jnp.int32)
+  return ref[grid_idx].astype(jnp.int32)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -406,8 +433,14 @@ def flash_attention_kernel(
   grid_idx = pl.program_id(1)
   h = pl.program_id(0)
 
+  should_run = True
   if block_mask_ref is not None:
-    should_not_mask = block_mask_ref[grid_idx].astype(jnp.int32) != 1
+    kind = _block_mask_value(block_mask_ref, grid_idx, h, pl.num_programs(0))
+    should_not_mask = kind != 1
+    if block_mask_ref.ndim == 2:
+      # A union tile can be inactive for this head group. Initialization and
+      # output stores still follow the shared grid's row boundaries.
+      should_run = kind != 0
     should_initialize = bounds_start_ref[grid_idx].astype(jnp.bool_)
     should_write = bounds_end_ref[grid_idx].astype(jnp.bool_)
     j = active_cols_ref[grid_idx].astype(jnp.int32)
@@ -479,7 +512,11 @@ def flash_attention_kernel(
     )
     logits *= jnp.float32(config.softmax_scale * LOG2E)
     if not config.segment_mask_on_partial_only or has_partial_mask:
-      q_ids = q_segment_ids_ref[:, :1].T
+      q_ids = (
+          q_segment_ids_ref[:1, :]
+          if q_segment_ids_ref.shape[0] == 1
+          else q_segment_ids_ref[:, :1].T
+      )
       kv_ids = kv_segment_ids_ref[:1, window].T
       logits = jnp.where(kv_ids == q_ids, logits, mask_value)
     probabilities = jnp.exp2(logits - max_logit_estimate)
@@ -602,11 +639,11 @@ def flash_attention_kernel(
       k_ref.shape[0 if config.k_layout == HEAD_DIM_MINOR else 1] // bkv_compute
   )
 
-  @pl.when(should_not_mask)
+  @pl.when(jnp.logical_and(should_not_mask, should_run))
   def _():
     lax.fori_loop(0, num_iters, body, None, unroll=True)
 
-  @pl.when(jnp.logical_not(should_not_mask))
+  @pl.when(jnp.logical_and(jnp.logical_not(should_not_mask), should_run))
   def _():
     lax.fori_loop(
         0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
@@ -758,16 +795,32 @@ def _splash_attention_forward(
   if segment_ids is not None:
     assert isinstance(segment_ids.q, jax.Array)  # for pytype
     assert isinstance(segment_ids.kv, jax.Array)  # for pytype
-    if segment_ids.q.shape != (q_seq_len,):
-      raise ValueError(
-          "Invalid shape for q segment_ids: "
-          f"{segment_ids.q.shape}. Expected: {(q_seq_len,)}"
-      )
-    if segment_ids.kv.shape != (kv_seq_len,):
-      raise ValueError(
-          "Invalid shape for kv segment_ids: "
-          f"{segment_ids.kv.shape}. Expected: {(kv_seq_len,)}"
-      )
+    for name, ids, length, heads in (
+        ("q", segment_ids.q, q_seq_len, num_q_heads),
+        ("kv", segment_ids.kv, kv_seq_len, num_kv_heads),
+    ):
+      if not (
+          ids.shape == (length,)
+          or (ids.ndim == 2 and ids.shape[1] == length
+              and ids.shape[0] > 0 and heads % ids.shape[0] == 0)
+      ):
+        raise ValueError(
+            f"Invalid shape for {name} segment_ids: {ids.shape}. Expected "
+            f"({length},) or (groups, {length}) with groups dividing {heads}."
+        )
+    if segment_ids.q.ndim != segment_ids.kv.ndim or (
+        segment_ids.q.ndim == 2
+        and segment_ids.q.shape[0] != segment_ids.kv.shape[0]
+    ):
+      raise ValueError("Q and KV segment IDs must use the same head groups.")
+    if segment_ids.q.ndim == 2 and not config.use_fused_bwd_kernel:
+      raise ValueError("Grouped segment IDs require the fused backward kernel.")
+  if mask_info.block_mask is not None and mask_info.block_mask.ndim == 2:
+    groups = mask_info.block_mask.shape[0]
+    if not groups or num_q_heads % groups:
+      raise ValueError("Block-mask groups must divide the query head count.")
+    if not config.use_fused_bwd_kernel:
+      raise ValueError("Grouped block masks require the fused backward kernel.")
   if config.max_logit_const is not None and max_logit_value is not None:
     raise ValueError(
         f"Only one of {config.max_logit_const=} and"
@@ -842,7 +895,17 @@ def _splash_attention_forward(
           v_index_map,
       ),
   ]
-  if segment_ids is not None:
+  if segment_ids is not None and segment_ids.q.ndim == 2:
+    q_spec, q_segment_ids = _group_segment_spec(
+        segment_ids.q, num_q_heads, bq, native_layout,
+        1 if native_layout else NUM_LANES, 0, unravel,
+    )
+    kv_spec, kv_segment_ids = _group_segment_spec(
+        segment_ids.kv, num_q_heads, bkv, True,
+        1 if native_layout else NUM_SUBLANES, 1, unravel,
+    )
+    in_specs += [q_spec, kv_spec]
+  elif segment_ids is not None:
     in_specs += [
         pl.BlockSpec((bq, NUM_LANES), q_segment_ids_index_map),
         pl.BlockSpec((NUM_SUBLANES, bkv), kv_segment_ids_index_map),
@@ -1457,6 +1520,7 @@ def _flash_attention_dkv_kernel(
     assert bounds_start_ref is not None
     assert bounds_end_ref is not None
     grid_idx = pl.program_id(1)
+    q_head = pl.program_id(0)
     kv_index = active_rows_ref[grid_idx].astype(jnp.int32)
     should_initialize = bounds_start_ref[grid_idx].astype(jnp.bool_)
     should_write = bounds_end_ref[grid_idx].astype(jnp.bool_)
@@ -1479,8 +1543,12 @@ def _flash_attention_dkv_kernel(
       )
 
   if block_mask_ref is not None:
-    should_not_mask = block_mask_ref[grid_idx].astype(jnp.int32) != 1
-    should_run = block_mask_ref[grid_idx].astype(jnp.int32) != 0
+    head_axis = 0 if active_rows_ref is not None else 1
+    kind = _block_mask_value(
+        block_mask_ref, grid_idx, q_head, pl.num_programs(head_axis)
+    )
+    should_not_mask = kind != 1
+    should_run = kind != 0
   else:
     should_not_mask = False
     should_run = True
@@ -1871,7 +1939,16 @@ def _splash_attention_bwd_dkv(
   mask_spec = pl.BlockSpec((None, bkv, bq), mask_index_map)
 
   q_segment_ids_index_map = unravel(lambda h, i, j: (0, i))
-  if segment_ids is not None:
+  if segment_ids is not None and segment_ids.q.ndim == 2:
+    q_segment_spec, q_segment_ids = _group_segment_spec(
+        segment_ids.q, num_q_heads, bq, True,
+        1 if native_layout else NUM_SUBLANES, 0, unravel,
+    )
+    kv_segment_spec, kv_segment_ids = _group_segment_spec(
+        segment_ids.kv, num_q_heads, bkv, native_layout,
+        1 if native_layout else NUM_LANES, 1, unravel,
+    )
+  elif segment_ids is not None:
     kv_segment_ids_index_map = unravel(lambda h, i, j: (j, 0))
     if native_layout:
       # MaskInfo already fixes the DMA tiles; only physical buffer layouts
@@ -2074,8 +2151,9 @@ def _splash_attention_bwd_dkv(
       False,  # q
       False,  # k
       False,  # v
-      True,  # q_segment_ids
-      True,  # kv_segment_ids
+      # Group-indexed ID loads cannot always be dematerialized by input fusion.
+      segment_ids is None or segment_ids.q.ndim == 1,  # q_segment_ids
+      segment_ids is None or segment_ids.kv.ndim == 1,  # kv_segment_ids
       False,  # logsumexp
       False,  # do
       False,  # di
@@ -2389,6 +2467,14 @@ def _splash_attention(
 
 @jax.tree_util.register_pytree_node_class
 class SplashAttentionKernel:
+  """Splash with shared or grouped runtime segment IDs.
+
+  IDs shaped [groups, sequence] share one ID array across each contiguous
+  group of heads. The group count must divide both Q and KV head counts.
+  A [groups, grid] block mask can describe their union grid: zero skips work
+  for that group while preserving grid-boundary initialization and stores.
+  Grouped IDs and masks require the fused backward kernel.
+  """
 
   def __init__(
       self,
