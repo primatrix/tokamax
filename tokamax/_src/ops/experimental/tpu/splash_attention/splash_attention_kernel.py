@@ -483,6 +483,8 @@ def flash_attention_kernel(
       kv_ids = kv_segment_ids_ref[:1, window].T
       logits = jnp.where(kv_ids == q_ids, logits, mask_value)
     probabilities = jnp.exp2(logits - max_logit_estimate)
+    current_l = jnp.sum(probabilities, axis=0, keepdims=True)
+    l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
     # The reference PV consumes FP32 P; do not introduce a BF16 cast here.
     values = v_ref[:, window]
     if head_dim_v == 72:
@@ -499,8 +501,6 @@ def flash_attention_kernel(
           preferred_element_type=jnp.float32,
       )
     o_scratch_ref[...] += output_t
-    current_l = jnp.sum(probabilities, axis=0, keepdims=True)
-    l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
 
   def body(kv_compute_index, _, has_partial_mask=False):
     if native_layout:
@@ -1607,21 +1607,12 @@ def _flash_attention_dkv_kernel(
           if config.q_layout == HEAD_DIM_MINOR
           else NT_DIM_NUMBERS
       )
-      if native_layout and q.shape[0] == 72:
-        padded_q = jnp.pad(q, ((0, 128 - q.shape[0]), (0, 0)))
-        dk = lax.dot_general(
-            ds.astype(do.dtype),
-            padded_q,
-            NT_DIM_NUMBERS,
-            preferred_element_type=jnp.float32,
-        )[:, :q.shape[0]]
-      else:
-        dk = lax.dot_general(
-            ds.astype(do.dtype),
-            q,
-            dk_dims,
-            preferred_element_type=jnp.float32,
-        )
+      dk = lax.dot_general(
+          ds.astype(do.dtype),
+          q,
+          dk_dims,
+          preferred_element_type=jnp.float32,
+      )
       if config.softmax_scale is not None and config.bwd_scale_after_dot:
         dk *= jnp.float32(config.softmax_scale)
       scratch_ref = dk_scratch_ref
