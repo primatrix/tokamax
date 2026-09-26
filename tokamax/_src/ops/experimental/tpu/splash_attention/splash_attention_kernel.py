@@ -1607,12 +1607,21 @@ def _flash_attention_dkv_kernel(
           if config.q_layout == HEAD_DIM_MINOR
           else NT_DIM_NUMBERS
       )
-      dk = lax.dot_general(
-          ds.astype(do.dtype),
-          q,
-          dk_dims,
-          preferred_element_type=jnp.float32,
-      )
+      if native_layout and q.shape[0] == 72:
+        padded_q = jnp.pad(q, ((0, 128 - q.shape[0]), (0, 0)))
+        dk = lax.dot_general(
+            ds.astype(do.dtype),
+            padded_q,
+            NT_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )[:, :q.shape[0]]
+      else:
+        dk = lax.dot_general(
+            ds.astype(do.dtype),
+            q,
+            dk_dims,
+            preferred_element_type=jnp.float32,
+        )
       if config.softmax_scale is not None and config.bwd_scale_after_dot:
         dk *= jnp.float32(config.softmax_scale)
       scratch_ref = dk_scratch_ref
