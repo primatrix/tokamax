@@ -1577,11 +1577,20 @@ def _flash_attention_dkv_kernel(
     p_bf16 = p.astype(do.dtype)
 
     def compute_dv():
-      dv = lax.dot_general(
-          p_bf16, do,
-          NT_DIM_NUMBERS if native_layout else NN_DIM_NUMBERS,
-          preferred_element_type=jnp.float32,
-      )
+      if native_layout and do.shape[0] == 72:
+        padded_do = jnp.pad(do, ((0, 128 - do.shape[0]), (0, 0)))
+        dv = lax.dot_general(
+            p_bf16,
+            padded_do,
+            NT_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )[:, :do.shape[0]]
+      else:
+        dv = lax.dot_general(
+            p_bf16, do,
+            NT_DIM_NUMBERS if native_layout else NN_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
       scratch_ref = dv_scratch_ref
       if native_layout:
         dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[:, slice_k].T
@@ -1607,12 +1616,21 @@ def _flash_attention_dkv_kernel(
           if config.q_layout == HEAD_DIM_MINOR
           else NT_DIM_NUMBERS
       )
-      dk = lax.dot_general(
-          ds.astype(do.dtype),
-          q,
-          dk_dims,
-          preferred_element_type=jnp.float32,
-      )
+      if native_layout and q.shape[0] == 72:
+        padded_q = jnp.pad(q, ((0, 128 - q.shape[0]), (0, 0)))
+        dk = lax.dot_general(
+            ds.astype(do.dtype),
+            padded_q,
+            NT_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )[:, :q.shape[0]]
+      else:
+        dk = lax.dot_general(
+            ds.astype(do.dtype),
+            q,
+            dk_dims,
+            preferred_element_type=jnp.float32,
+        )
       if config.softmax_scale is not None and config.bwd_scale_after_dot:
         dk *= jnp.float32(config.softmax_scale)
       scratch_ref = dk_scratch_ref
@@ -1627,11 +1645,21 @@ def _flash_attention_dkv_kernel(
       compute_dk()
     if dq_scratch_ref is not None or dq_ref is not None:
       if native_layout:
-        dq_dims = TN_DIM_NUMBERS
-        dq_transposed = lax.dot_general(
-            k, ds.astype(k.dtype), dq_dims,
-            preferred_element_type=jnp.float32,
-        )
+        if k.shape[1] == 72:
+          padded_k = jnp.pad(k, ((0, 0), (0, 128 - k.shape[1])))
+          dq_transposed = lax.dot_general(
+              padded_k,
+              ds.astype(k.dtype),
+              TN_DIM_NUMBERS,
+              preferred_element_type=jnp.float32,
+          )[:k.shape[1], :]
+        else:
+          dq_transposed = lax.dot_general(
+              k,
+              ds.astype(k.dtype),
+              TN_DIM_NUMBERS,
+              preferred_element_type=jnp.float32,
+          )
         # Sequence-minor scratch cancels this logical-output transpose.
         dq = dq_transposed.T
       else:
