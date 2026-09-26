@@ -1443,7 +1443,6 @@ def _flash_attention_dkv_kernel(
     q_heads_per_kv_head: int,
     config: SplashConfig,
     native_layout: bool = False,
-    pack_dkv: bool = False,
 ):
   del mask_next_ref, active_cols_ref
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
@@ -1582,7 +1581,7 @@ def _flash_attention_dkv_kernel(
         dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[slice_k, :]
         scratch_ref[slice_k, :] = dv
 
-    if not config.bwd_dv_last and not pack_dkv:
+    if not config.bwd_dv_last:
       compute_dv()
     dp = compute_dp()
     ds = (dp - di) * p
@@ -1592,31 +1591,6 @@ def _flash_attention_dkv_kernel(
       ds = ds * (1 - d * d)
     if config.softmax_scale is not None and not config.bwd_scale_after_dot:
       ds *= jnp.float32(config.softmax_scale)
-
-    def compute_packed_dkv():
-      # TPU7x has 256 MXU columns. Put the two useful 72-column products in
-      # separate 128-column halves so one contraction replaces two tail-heavy
-      # contractions. The off-diagonal products occupy otherwise padded lanes.
-      width_q, width_v = q.shape[0], do.shape[0]
-      operands = jnp.concatenate((ds.astype(do.dtype), p_bf16), axis=0)
-      rhs = jnp.concatenate((
-          jnp.pad(q, ((0, 128 - width_q), (0, 0))),
-          jnp.pad(do, ((0, 128 - width_v), (0, 0))),
-      ), axis=0)
-      combined = lax.dot_general(
-          operands, rhs, NT_DIM_NUMBERS,
-          preferred_element_type=jnp.float32,
-      )
-      dk = combined[:bkv_compute, :width_q]
-      dv = combined[bkv_compute:, 128:128 + width_v]
-      if config.softmax_scale is not None and config.bwd_scale_after_dot:
-        dk *= jnp.float32(config.softmax_scale)
-      dk_scratch_ref[:, slice_k] = (
-          dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[:, slice_k].T
-      ).T
-      dv_scratch_ref[:, slice_k] = (
-          dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[:, slice_k].T
-      ).T
 
     def compute_dk():
       dk_dims = (
@@ -1640,9 +1614,7 @@ def _flash_attention_dkv_kernel(
         dk = dk.astype(dk_scratch_ref.dtype) + scratch_ref[slice_k, :]
         scratch_ref[slice_k, :] = dk
 
-    if pack_dkv:
-      compute_packed_dkv()
-    elif not config.bwd_dq_first:
+    if not config.bwd_dq_first:
       compute_dk()
     if dq_scratch_ref is not None or dq_ref is not None:
       if native_layout:
@@ -1674,9 +1646,9 @@ def _flash_attention_dkv_kernel(
         else:
           dq_ref[...] = dq.astype(dq_ref.dtype)
 
-    if config.bwd_dq_first and not pack_dkv:
+    if config.bwd_dq_first:
       compute_dk()
-    if config.bwd_dv_last and not pack_dkv:
+    if config.bwd_dv_last:
       compute_dv()
 
   if dq_scratch_ref is not None:
@@ -1762,14 +1734,6 @@ def _splash_attention_bwd_dkv(
   kv_seq_len, head_dim_v = v.shape[-2:]
   num_kv_heads = 1 if is_mqa else k.shape[0]
   dynamic_grid = mask_info.active_rows is not None
-  pack_dkv = (
-      native_layout
-      and head_dim_qk <= 128
-      and head_dim_v <= 128
-      and not config.bwd_dq_first
-      and not config.bwd_dv_last
-      and (config.interpret or pltpu.get_tpu_info().mxu_column_size == 256)
-  )
 
   bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)
   if bq > q_seq_len:
@@ -2056,7 +2020,6 @@ def _splash_attention_bwd_dkv(
       mask_function=mask_function,
       q_heads_per_kv_head=q_heads_per_kv_head,
       native_layout=native_layout,
-      pack_dkv=pack_dkv,
   )
 
   kernel_name = get_kernel_name(
