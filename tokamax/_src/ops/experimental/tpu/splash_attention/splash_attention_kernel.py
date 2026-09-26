@@ -488,21 +488,16 @@ def flash_attention_kernel(
     # The reference PV consumes FP32 P; do not introduce a BF16 cast here.
     values = v_ref[:, window]
     if head_dim_v == 72:
-      # Keep the aligned 64-column body separate from the 8-column tail.
-      # Both products retain K as their only reduction axis.
-      output_main = lax.dot_general(
-          values[:64, :],
+      # Expose the non-contracting head dimension as lane-sized free axes.
+      # This is a reshape-only pack: K remains the sole reduction axis and
+      # the FP32 probability/contraction path is unchanged.
+      packed_values = values.reshape((9, NUM_SUBLANES, bkv_compute))
+      output_t = lax.dot_general(
+          packed_values,
           probabilities,
-          NN_DIM_NUMBERS,
+          (((2,), (0,)), ((), ())),
           preferred_element_type=jnp.float32,
-      )
-      output_tail = lax.dot_general(
-          values[64:, :],
-          probabilities,
-          NN_DIM_NUMBERS,
-          preferred_element_type=jnp.float32,
-      )
-      output_t = jnp.concatenate((output_main, output_tail), axis=0)
+      ).reshape((head_dim_v, bq))
     else:
       output_t = lax.dot_general(
           values, probabilities, NN_DIM_NUMBERS,
