@@ -1938,18 +1938,19 @@ def _splash_attention_bwd_dkv(
   logsumexp_index_map = unravel(lambda h, i, j: (h, 0, i))
 
   assert logsumexp.shape == di.shape == (num_q_heads, q_seq_len)
-  # TODO: Remove the sublane expansion once Mosaic has all retilings
-  logsumexp_shape = (num_q_heads, NUM_SUBLANES, q_seq_len)
+  # Native layout only reads row zero. Avoid materializing and double-buffering
+  # eight identical sublane rows in HBM/VMEM.
+  stats_sublanes = 1 if native_layout else NUM_SUBLANES
+  logsumexp_shape = (num_q_heads, stats_sublanes, q_seq_len)
   logsumexp = jnp.broadcast_to(jnp.expand_dims(logsumexp, -2), logsumexp_shape)
   logsumexp_spec = pl.BlockSpec(
-      (None, NUM_SUBLANES, bq), logsumexp_index_map
+      (None, stats_sublanes, bq), logsumexp_index_map
   )
   assert logsumexp.ndim == len(logsumexp_spec.block_shape)
 
-  # TODO: Remove the sublane expansion once Mosaic has all retilings
   di = jnp.broadcast_to(jnp.expand_dims(di, -2), logsumexp_shape)
   di_spec = pl.BlockSpec(
-      (None, NUM_SUBLANES, bq), logsumexp_index_map
+      (None, stats_sublanes, bq), logsumexp_index_map
   )
   assert di.ndim == len(di_spec.block_shape)
 
