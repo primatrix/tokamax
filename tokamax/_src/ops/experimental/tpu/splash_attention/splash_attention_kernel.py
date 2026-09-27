@@ -1550,10 +1550,6 @@ def _flash_attention_dkv_kernel(
           preferred_element_type=jnp.float32,
       )
 
-    # dP is independent of QK/softmax. Materialize it before QK so the TPU
-    # scheduler can overlap the two dot streams instead of discovering dP
-    # only after the probability and dV chain.
-    dp = compute_dp()
     qk_dims = (
         NT_DIM_NUMBERS
         if config.q_layout == HEAD_DIM_MINOR
@@ -1609,6 +1605,7 @@ def _flash_attention_dkv_kernel(
 
     if not config.bwd_dv_last:
       compute_dv()
+    dp = compute_dp()
     ds = (dp - di) * p
     if attn_logits_soft_cap is not None:
       normalized = qk_uncapped / attn_logits_soft_cap
