@@ -613,12 +613,7 @@ def flash_attention_kernel(
         if config.fwd_cast_probabilities_to_bf16
         else s_curr
     )
-    o_curr = lax.dot_general(
-        probabilities_for_dot,
-        v,
-        sv_dims,
-        preferred_element_type=jnp.float32,
-    )
+    o_curr = lax.dot_general(probabilities_for_dot, v, sv_dims)
 
     if max_logit_estimate is None:
       alpha_o = jnp.tile(alpha, (1, head_dim_v_repeats))
