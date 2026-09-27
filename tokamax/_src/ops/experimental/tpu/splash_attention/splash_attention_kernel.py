@@ -400,6 +400,7 @@ def flash_attention_kernel(
     fuse_reciprocal: bool,  # config.fuse_reciprocal or not save_residuals
     config: SplashConfig,
     native_layout: bool = False,
+    per_head_segment_ids: bool = False,
 ):
   del mask_next_ref, active_rows_ref
   float32 = jnp.float32
@@ -488,8 +489,13 @@ def flash_attention_kernel(
     )
     logits *= jnp.float32(config.softmax_scale * LOG2E)
     if not config.segment_mask_on_partial_only or has_partial_mask:
-      q_ids = q_segment_ids_ref[:1, :]
-      kv_ids = kv_segment_ids_ref[:1, window].T
+      if per_head_segment_ids:
+        head_in_group = lax.rem(h, NUM_SUBLANES)
+        q_ids = q_segment_ids_ref[0, pl.ds(head_in_group, 1), :]
+        kv_ids = kv_segment_ids_ref[0, pl.ds(head_in_group, 1), window].T
+      else:
+        q_ids = q_segment_ids_ref[:1, :]
+        kv_ids = kv_segment_ids_ref[:1, window].T
       logits = jnp.where(kv_ids == q_ids, logits, mask_value)
     probabilities = jnp.exp2(logits - max_logit_estimate)
     current_l = jnp.sum(probabilities, axis=0, keepdims=True)
@@ -879,22 +885,27 @@ def _splash_attention_forward(
   if segment_ids is not None:
     if native_layout:
       native_q_ids_index_map = unravel(
-          lambda h, i, j: (h * NUM_SUBLANES, i) if per_head_segment_ids else (0, i)
+          lambda h, i, j: (_div(h, NUM_SUBLANES), 0, i) if per_head_segment_ids else (0, i)
       )
       native_kv_ids_index_map = unravel(
-          lambda h, i, j: (h * NUM_SUBLANES, j) if per_head_segment_ids else (0, j)
+          lambda h, i, j: (_div(h, NUM_SUBLANES), 0, j) if per_head_segment_ids else (0, j)
       )
-      segment_head_block = NUM_SUBLANES if per_head_segment_ids else 1
-      in_specs += [
-          pl.BlockSpec((segment_head_block, bq), native_q_ids_index_map),
-          pl.BlockSpec((segment_head_block, bkv), native_kv_ids_index_map),
-      ]
-      q_segment_ids = (
-          jnp.repeat(segment_ids.q, NUM_SUBLANES, axis=0) if per_head_segment_ids else segment_ids.q[None, :]
-      )
-      kv_segment_ids = (
-          jnp.repeat(segment_ids.kv, NUM_SUBLANES, axis=0) if per_head_segment_ids else segment_ids.kv[None, :]
-      )
+      if per_head_segment_ids:
+        if num_q_heads % NUM_SUBLANES:
+          raise ValueError("Per-head segment IDs require a head count divisible by 8")
+        in_specs += [
+            pl.BlockSpec((1, NUM_SUBLANES, bq), native_q_ids_index_map),
+            pl.BlockSpec((1, NUM_SUBLANES, bkv), native_kv_ids_index_map),
+        ]
+        q_segment_ids = segment_ids.q.reshape(num_q_heads // NUM_SUBLANES, NUM_SUBLANES, q_seq_len)
+        kv_segment_ids = segment_ids.kv.reshape(num_kv_heads // NUM_SUBLANES, NUM_SUBLANES, kv_seq_len)
+      else:
+        in_specs += [
+            pl.BlockSpec((1, bq), native_q_ids_index_map),
+            pl.BlockSpec((1, bkv), native_kv_ids_index_map),
+        ]
+        q_segment_ids = segment_ids.q[None, :]
+        kv_segment_ids = segment_ids.kv[None, :]
     else:
       in_specs += [
           pl.BlockSpec((bq, NUM_LANES), q_segment_ids_index_map),
@@ -1098,6 +1109,7 @@ def _splash_attention_forward(
             config=config,
             mask_function=mask_function,
             native_layout=native_layout,
+            per_head_segment_ids=per_head_segment_ids,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=6,
