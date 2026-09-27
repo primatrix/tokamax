@@ -167,6 +167,7 @@ class SplashConfig:
   omit_unused_max_logits: bool = False
   compact_stats_output: bool = False
   compact_softmax_scratch: bool = False
+  fwd_cast_probabilities_to_bf16: bool = False
   bwd_parallel_heads: bool = False
   bwd_scheduler: bool | None = None
   # Caller contract: every full tile in MaskInfo must also be fully allowed
@@ -494,19 +495,23 @@ def flash_attention_kernel(
     probabilities = jnp.exp2(logits - max_logit_estimate)
     current_l = jnp.sum(probabilities, axis=0, keepdims=True)
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
-    # The reference PV consumes FP32 P; do not introduce a BF16 cast here.
+    probabilities_for_dot = (
+        probabilities.astype(jnp.bfloat16)
+        if config.fwd_cast_probabilities_to_bf16
+        else probabilities
+    )
     values = v_ref[:, window]
     if head_dim_v == 72:
       padded_values = jnp.pad(values, ((0, 128 - head_dim_v), (0, 0)))
       output_t = lax.dot_general(
           padded_values,
-          probabilities,
+          probabilities_for_dot,
           NN_DIM_NUMBERS,
           preferred_element_type=jnp.float32,
       )[:head_dim_v, :]
     else:
       output_t = lax.dot_general(
-          values, probabilities, NN_DIM_NUMBERS,
+          values, probabilities_for_dot, NN_DIM_NUMBERS,
           preferred_element_type=jnp.float32,
       )
     o_scratch_ref[...] += output_t
@@ -603,7 +608,12 @@ def flash_attention_kernel(
       v = v_ref[slice_k, :]
     else:
       v = v_ref[:, slice_k]
-    o_curr = lax.dot_general(s_curr, v, sv_dims)
+    probabilities_for_dot = (
+        s_curr.astype(jnp.bfloat16)
+        if config.fwd_cast_probabilities_to_bf16
+        else s_curr
+    )
+    o_curr = lax.dot_general(probabilities_for_dot, v, sv_dims)
 
     if max_logit_estimate is None:
       alpha_o = jnp.tile(alpha, (1, head_dim_v_repeats))
