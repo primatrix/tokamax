@@ -879,17 +879,22 @@ def _splash_attention_forward(
   if segment_ids is not None:
     if native_layout:
       native_q_ids_index_map = unravel(
-          lambda h, i, j: (h, i) if per_head_segment_ids else (0, i)
+          lambda h, i, j: (h * NUM_SUBLANES, i) if per_head_segment_ids else (0, i)
       )
       native_kv_ids_index_map = unravel(
-          lambda h, i, j: (h, j) if per_head_segment_ids else (0, j)
+          lambda h, i, j: (h * NUM_SUBLANES, j) if per_head_segment_ids else (0, j)
       )
+      segment_head_block = NUM_SUBLANES if per_head_segment_ids else 1
       in_specs += [
-          pl.BlockSpec((1, bq), native_q_ids_index_map),
-          pl.BlockSpec((1, bkv), native_kv_ids_index_map),
+          pl.BlockSpec((segment_head_block, bq), native_q_ids_index_map),
+          pl.BlockSpec((segment_head_block, bkv), native_kv_ids_index_map),
       ]
-      q_segment_ids = segment_ids.q if per_head_segment_ids else segment_ids.q[None, :]
-      kv_segment_ids = segment_ids.kv if per_head_segment_ids else segment_ids.kv[None, :]
+      q_segment_ids = (
+          jnp.repeat(segment_ids.q, NUM_SUBLANES, axis=0) if per_head_segment_ids else segment_ids.q[None, :]
+      )
+      kv_segment_ids = (
+          jnp.repeat(segment_ids.kv, NUM_SUBLANES, axis=0) if per_head_segment_ids else segment_ids.kv[None, :]
+      )
     else:
       in_specs += [
           pl.BlockSpec((bq, NUM_LANES), q_segment_ids_index_map),
