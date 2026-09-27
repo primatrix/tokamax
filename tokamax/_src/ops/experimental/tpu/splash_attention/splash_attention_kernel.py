@@ -488,7 +488,7 @@ def flash_attention_kernel(
     )
     logits *= jnp.float32(config.softmax_scale * LOG2E)
     if not config.segment_mask_on_partial_only or has_partial_mask:
-      q_ids = q_segment_ids_ref[:1, :]
+      q_ids = q_segment_ids_ref[:, :1].T
       kv_ids = kv_segment_ids_ref[:1, window].T
       logits = jnp.where(kv_ids == q_ids, logits, mask_value)
     probabilities = jnp.exp2(logits - max_logit_estimate)
@@ -877,38 +877,24 @@ def _splash_attention_forward(
       ),
   ]
   if segment_ids is not None:
-    if native_layout:
-      native_q_ids_index_map = unravel(
-          lambda h, i, j: (h, i) if per_head_segment_ids else (0, i)
-      )
-      native_kv_ids_index_map = unravel(
-          lambda h, i, j: (h, j) if per_head_segment_ids else (0, j)
-      )
-      in_specs += [
-          pl.BlockSpec((1, bq), native_q_ids_index_map),
-          pl.BlockSpec((1, bkv), native_kv_ids_index_map),
-      ]
-      q_segment_ids = segment_ids.q if per_head_segment_ids else segment_ids.q[None, :]
-      kv_segment_ids = segment_ids.kv if per_head_segment_ids else segment_ids.kv[None, :]
+    in_specs += [
+        pl.BlockSpec((bq, NUM_LANES), q_segment_ids_index_map),
+        pl.BlockSpec((NUM_SUBLANES, bkv), kv_segment_ids_index_map),
+    ]
+    if per_head_segment_ids:
+      q_segment_ids = jax.lax.broadcast_in_dim(
+          segment_ids.q, (num_q_heads, q_seq_len, NUM_LANES), (0, 1)
+      ).reshape(num_q_heads * q_seq_len, NUM_LANES)
+      kv_segment_ids = jax.lax.broadcast_in_dim(
+          segment_ids.kv, (NUM_SUBLANES, num_kv_heads, kv_seq_len), (1, 2)
+      ).reshape(NUM_SUBLANES, num_kv_heads * kv_seq_len)
     else:
-      in_specs += [
-          pl.BlockSpec((bq, NUM_LANES), q_segment_ids_index_map),
-          pl.BlockSpec((NUM_SUBLANES, bkv), kv_segment_ids_index_map),
-      ]
-      if per_head_segment_ids:
-        q_segment_ids = jax.lax.broadcast_in_dim(
-            segment_ids.q, (num_q_heads, q_seq_len, NUM_LANES), (0, 1)
-        ).reshape(num_q_heads * q_seq_len, NUM_LANES)
-        kv_segment_ids = jax.lax.broadcast_in_dim(
-            segment_ids.kv, (NUM_SUBLANES, num_kv_heads, kv_seq_len), (1, 2)
-        ).reshape(NUM_SUBLANES, num_kv_heads * kv_seq_len)
-      else:
-        q_segment_ids = jax.lax.broadcast_in_dim(
-            segment_ids.q, (q_seq_len, NUM_LANES), (0,)
-        )
-        kv_segment_ids = jax.lax.broadcast_in_dim(
-            segment_ids.kv, (NUM_SUBLANES, kv_seq_len), (1,)
-        )
+      q_segment_ids = jax.lax.broadcast_in_dim(
+          segment_ids.q, (q_seq_len, NUM_LANES), (0,)
+      )
+      kv_segment_ids = jax.lax.broadcast_in_dim(
+          segment_ids.kv, (NUM_SUBLANES, kv_seq_len), (1,)
+      )
   else:
     in_specs += [None, None]
     q_segment_ids = kv_segment_ids = None
