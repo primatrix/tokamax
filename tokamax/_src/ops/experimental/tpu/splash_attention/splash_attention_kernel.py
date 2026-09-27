@@ -772,31 +772,21 @@ def _splash_attention_forward(
   kv_seq_len = k.shape[-2]
   kv_steps = kv_seq_len // bkv
   q_heads_per_kv_head = num_q_heads // num_kv_heads
-  per_head_segment_ids = segment_ids is not None and segment_ids.q.ndim == 2
   dynamic_grid = mask_info.active_rows is not None
 
   if segment_ids is not None:
     assert isinstance(segment_ids.q, jax.Array)  # for pytype
     assert isinstance(segment_ids.kv, jax.Array)  # for pytype
-    per_head_segment_ids = segment_ids.q.ndim == 2
-    expected_q_shapes = ((q_seq_len,), (num_q_heads, q_seq_len))
-    expected_kv_shapes = ((kv_seq_len,), (num_kv_heads, kv_seq_len))
-    if segment_ids.q.shape not in expected_q_shapes:
+    if segment_ids.q.shape != (q_seq_len,):
       raise ValueError(
           "Invalid shape for q segment_ids: "
-          f"{segment_ids.q.shape}. Expected one of: {expected_q_shapes}"
+          f"{segment_ids.q.shape}. Expected: {(q_seq_len,)}"
       )
-    if segment_ids.kv.shape not in expected_kv_shapes:
+    if segment_ids.kv.shape != (kv_seq_len,):
       raise ValueError(
           "Invalid shape for kv segment_ids: "
-          f"{segment_ids.kv.shape}. Expected one of: {expected_kv_shapes}"
+          f"{segment_ids.kv.shape}. Expected: {(kv_seq_len,)}"
       )
-    if per_head_segment_ids != (segment_ids.kv.ndim == 2):
-      raise ValueError("q and kv segment_ids must both be shared or both be per-head")
-    if per_head_segment_ids and num_q_heads != num_kv_heads:
-      raise ValueError("Per-head segment_ids currently require equal Q and KV head counts")
-  else:
-    per_head_segment_ids = False
   if config.max_logit_const is not None and max_logit_value is not None:
     raise ValueError(
         f"Only one of {config.max_logit_const=} and"
@@ -849,13 +839,8 @@ def _splash_attention_forward(
     next_m = to_i32(mask_next_ref[grid_idx])
     return next_m, 0, 0
 
-  q_segment_ids_index_map = unravel(
-      lambda h, i, j: (h * q_seq_len + i, 0) if per_head_segment_ids else (i, 0)
-  )
-  kv_segment_ids_index_map = unravel(
-      lambda h, i, j: (0, h * kv_seq_len + j) if per_head_segment_ids else (0, j)
-  )
-  q_sequence_index_map = unravel(lambda h, i, j: (i, 0))
+  q_segment_ids_index_map = unravel(lambda h, i, j: (i, 0))
+  kv_segment_ids_index_map = unravel(lambda h, i, j: (0, j))
 
   # Convert the logical shape from head-minor to sequence-minor.
   in_specs = [
@@ -881,20 +866,12 @@ def _splash_attention_forward(
         pl.BlockSpec((bq, NUM_LANES), q_segment_ids_index_map),
         pl.BlockSpec((NUM_SUBLANES, bkv), kv_segment_ids_index_map),
     ]
-    if per_head_segment_ids:
-      q_segment_ids = jax.lax.broadcast_in_dim(
-          segment_ids.q, (num_q_heads, q_seq_len, NUM_LANES), (0, 1)
-      ).reshape(num_q_heads * q_seq_len, NUM_LANES)
-      kv_segment_ids = jax.lax.broadcast_in_dim(
-          segment_ids.kv, (NUM_SUBLANES, num_kv_heads, kv_seq_len), (1, 2)
-      ).reshape(NUM_SUBLANES, num_kv_heads * kv_seq_len)
-    else:
-      q_segment_ids = jax.lax.broadcast_in_dim(
-          segment_ids.q, (q_seq_len, NUM_LANES), (0,)
-      )
-      kv_segment_ids = jax.lax.broadcast_in_dim(
-          segment_ids.kv, (NUM_SUBLANES, kv_seq_len), (1,)
-      )
+    q_segment_ids = jax.lax.broadcast_in_dim(
+        segment_ids.q, (q_seq_len, NUM_LANES), (0,)
+    )
+    kv_segment_ids = jax.lax.broadcast_in_dim(
+        segment_ids.kv, (NUM_SUBLANES, kv_seq_len), (1,)
+    )
   else:
     in_specs += [None, None]
     q_segment_ids = kv_segment_ids = None
@@ -926,7 +903,7 @@ def _splash_attention_forward(
     q_sequence = jax.lax.broadcast_in_dim(
         mask_info.q_sequence, (q_seq_len, NUM_LANES), (0,)
     )
-    in_specs.append(pl.BlockSpec((bq, NUM_LANES), q_sequence_index_map))
+    in_specs.append(pl.BlockSpec((bq, NUM_LANES), q_segment_ids_index_map))
   else:
     q_sequence = None
     in_specs.append(None)
@@ -1815,7 +1792,6 @@ def _splash_attention_bwd_dkv(
   kv_steps = kv_seq_len // bkv
   q_steps = q_seq_len // bq
   q_heads_per_kv_head = num_q_heads // num_kv_heads
-  per_head_segment_ids = segment_ids is not None and segment_ids.q.ndim == 2
   if dynamic_grid:
 
     def unravel(f):
@@ -1923,24 +1899,18 @@ def _splash_attention_bwd_dkv(
   )
   mask_spec = pl.BlockSpec((None, bkv, bq), mask_index_map)
 
-  q_segment_ids_index_map = unravel(
-      lambda h, i, j: (0, h * q_seq_len + i) if per_head_segment_ids else (0, i)
-  )
-  q_sequence_index_map = unravel(lambda h, i, j: (0, i))
+  q_segment_ids_index_map = unravel(lambda h, i, j: (0, i))
   if segment_ids is not None:
-    kv_segment_ids_index_map = unravel(
-        lambda h, i, j: (h * kv_seq_len + j, 0) if per_head_segment_ids else (j, 0)
-    )
+    kv_segment_ids_index_map = unravel(lambda h, i, j: (j, 0))
     if native_layout:
       # MaskInfo already fixes the DMA tiles; only physical buffer layouts
       # change here, not the visited blocks or segment equality semantics.
       q_segment_spec = pl.BlockSpec((1, bq), q_segment_ids_index_map)
       kv_segment_spec = pl.BlockSpec(
-          (1, bkv),
-          unravel(lambda h, i, j: (0, h * kv_seq_len + j) if per_head_segment_ids else (0, j)),
+          (1, bkv), unravel(lambda h, i, j: (0, j))
       )
-      q_segment_ids = segment_ids.q.reshape(1, -1) if per_head_segment_ids else segment_ids.q[None, :]
-      kv_segment_ids = segment_ids.kv.reshape(1, -1) if per_head_segment_ids else segment_ids.kv[None, :]
+      q_segment_ids = segment_ids.q[None, :]
+      kv_segment_ids = segment_ids.kv[None, :]
     else:
       q_segment_spec = pl.BlockSpec(
           (NUM_SUBLANES, bq), q_segment_ids_index_map
@@ -1948,20 +1918,12 @@ def _splash_attention_bwd_dkv(
       kv_segment_spec = pl.BlockSpec(
           (bkv, NUM_LANES), kv_segment_ids_index_map
       )
-      if per_head_segment_ids:
-        q_segment_ids = jax.lax.broadcast_in_dim(
-            segment_ids.q, (NUM_SUBLANES, num_q_heads, q_seq_len), (1, 2)
-        ).reshape(NUM_SUBLANES, num_q_heads * q_seq_len)
-        kv_segment_ids = jax.lax.broadcast_in_dim(
-            segment_ids.kv, (num_kv_heads, kv_seq_len, NUM_LANES), (0, 1)
-        ).reshape(num_kv_heads * kv_seq_len, NUM_LANES)
-      else:
-        q_segment_ids = jax.lax.broadcast_in_dim(
-            segment_ids.q, (NUM_SUBLANES, q_seq_len), (1,)
-        )
-        kv_segment_ids = jax.lax.broadcast_in_dim(
-            segment_ids.kv, (kv_seq_len, NUM_LANES), (0,)
-        )
+      q_segment_ids = jax.lax.broadcast_in_dim(
+          segment_ids.q, (NUM_SUBLANES, q_seq_len), (1,)
+      )
+      kv_segment_ids = jax.lax.broadcast_in_dim(
+          segment_ids.kv, (kv_seq_len, NUM_LANES), (0,)
+      )
   else:
     q_segment_spec = kv_segment_spec = None
     q_segment_ids = kv_segment_ids = None
@@ -2007,7 +1969,7 @@ def _splash_attention_bwd_dkv(
     in_specs.append(None)
 
   if mask_info.q_sequence is not None:
-    in_specs.append(pl.BlockSpec((NUM_SUBLANES, bq), q_sequence_index_map))
+    in_specs.append(pl.BlockSpec((NUM_SUBLANES, bq), q_segment_ids_index_map))
     q_sequence = jax.lax.broadcast_in_dim(
         mask_info.q_sequence, (NUM_SUBLANES, q_seq_len), (1,)
     )
