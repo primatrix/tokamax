@@ -251,7 +251,6 @@ def _use_native_layout(
       and config.combine_log2_scale
       and config.softmax_scale is not None
       and config.attn_logits_soft_cap is None
-      and segment_ids is not None
       and mask_info.partial_mask_blocks is None
       and mask_function is None
   )
@@ -487,7 +486,9 @@ def flash_attention_kernel(
         preferred_element_type=jnp.float32,
     )
     logits *= jnp.float32(config.softmax_scale * LOG2E)
-    if not config.segment_mask_on_partial_only or has_partial_mask:
+    if q_segment_ids_ref is not None and (
+        not config.segment_mask_on_partial_only or has_partial_mask
+    ):
       q_ids = q_segment_ids_ref[:, :1].T
       kv_ids = kv_segment_ids_ref[:1, window].T
       logits = jnp.where(kv_ids == q_ids, logits, mask_value)
