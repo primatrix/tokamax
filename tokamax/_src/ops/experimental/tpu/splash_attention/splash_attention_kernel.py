@@ -159,7 +159,7 @@ class SplashConfig:
   # Arithmetic reordering may change floating-point rounding.
   combine_log2_scale: bool = False
   fwd_kv_unroll: int | bool = True
-  bwd_kv_unroll: bool = True
+  bwd_kv_unroll: int | bool = True
   bwd_dq_first: bool = False
   bwd_dv_last: bool = False
   bwd_cast_before_transpose: bool = False
@@ -192,6 +192,13 @@ class SplashConfig:
       raise ValueError(
           "fwd_kv_unroll must be a bool or a positive integer, got "
           f"{self.fwd_kv_unroll!r}."
+      )
+    if not isinstance(self.bwd_kv_unroll, (bool, int)) or (
+        not isinstance(self.bwd_kv_unroll, bool) and self.bwd_kv_unroll < 1
+    ):
+      raise ValueError(
+          "bwd_kv_unroll must be a bool or a positive integer, got "
+          f"{self.bwd_kv_unroll!r}."
       )
 
     if self.dq_reduction_steps is not None and self.dq_reduction_steps != 3:
