@@ -1571,6 +1571,9 @@ def _flash_attention_dkv_kernel(
     dk_scratch_ref[...] = jnp.zeros_like(dk_scratch_ref)
     dv_scratch_ref[...] = jnp.zeros_like(dv_scratch_ref)
 
+  resident_logsumexp = logsumexp_ref[:1, :] if native_layout else None
+  resident_di = di_ref[:1, :] if native_layout else None
+
   def body(i, _, has_partial_mask=False):
     slice_k = pl.ds(i * bkv_compute, bkv_compute)
     q = q_ref[...]
@@ -1586,9 +1589,9 @@ def _flash_attention_dkv_kernel(
 
     k = _load_kv(k_ref, config.k_layout)
     v = _load_kv(v_ref, config.v_layout)
-    logsumexp = logsumexp_ref[:1, :]
+    logsumexp = resident_logsumexp if native_layout else logsumexp_ref[:1, :]
     do = do_ref[...]
-    di = di_ref[:1, :]
+    di = resident_di if native_layout else di_ref[:1, :]
     if native_layout:
       dp_dims = NN_DIM_NUMBERS
     else:
