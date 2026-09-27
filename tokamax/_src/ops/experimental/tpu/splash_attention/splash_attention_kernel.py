@@ -158,6 +158,7 @@ class SplashConfig:
   dq_reduction_steps: int | None = None
   # Arithmetic reordering may change floating-point rounding.
   combine_log2_scale: bool = False
+  fwd_kv_unroll: int | bool = True
   bwd_kv_unroll: bool = True
   bwd_dq_first: bool = False
   bwd_dv_last: bool = False
@@ -184,6 +185,14 @@ class SplashConfig:
       object.__setattr__(self, "block_kv_compute", self.block_kv)
     if self.block_kv_dkv_compute is None:
       object.__setattr__(self, "block_kv_dkv_compute", self.block_kv_dkv)
+
+    if not isinstance(self.fwd_kv_unroll, (bool, int)) or (
+        not isinstance(self.fwd_kv_unroll, bool) and self.fwd_kv_unroll < 1
+    ):
+      raise ValueError(
+          "fwd_kv_unroll must be a bool or a positive integer, got "
+          f"{self.fwd_kv_unroll!r}."
+      )
 
     if self.dq_reduction_steps is not None and self.dq_reduction_steps != 3:
       raise ValueError(
@@ -610,12 +619,16 @@ def flash_attention_kernel(
 
   @pl.when(should_not_mask)
   def _():
-    lax.fori_loop(0, num_iters, body, None, unroll=True)
+    lax.fori_loop(0, num_iters, body, None, unroll=config.fwd_kv_unroll)
 
   @pl.when(jnp.logical_not(should_not_mask))
   def _():
     lax.fori_loop(
-        0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
+        0,
+        num_iters,
+        partial(body, has_partial_mask=True),
+        None,
+        unroll=config.fwd_kv_unroll,
     )
 
   @pl.when(should_write)
