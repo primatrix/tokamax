@@ -2251,9 +2251,8 @@ def _splash_attention_bwd_dkv(
         # 3) for q_seq_len, we are reducing over it to compute dkv
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=(
-                ("parallel", "arbitrary")
+                ("parallel",) + ("arbitrary",) * (len(grid) - 1)
                 if config.bwd_parallel_heads
-                and dynamic_grid
                 and q_heads_per_kv_head == 1
                 else ("arbitrary",) * len(grid)
             ),
