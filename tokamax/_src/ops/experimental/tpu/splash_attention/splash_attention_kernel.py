@@ -449,7 +449,8 @@ def flash_attention_kernel(
       k = k_ref[slice_k, :]
     else:
       k = k_ref[:, slice_k]
-    qk = lax.dot_general(q, k, qk_dims, preferred_element_type=float32)
+    with jax.named_scope("F1"):
+      qk = lax.dot_general(q, k, qk_dims, preferred_element_type=float32)
     if config.softmax_scale is not None:
       if config.use_base2_exp and config.combine_log2_scale:
         qk *= jnp.float32(config.softmax_scale * LOG2E)
@@ -1413,9 +1414,10 @@ def _flash_attention_dkv_kernel(
     qk_dims = (
         NT_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
     )
-    qk_uncapped = lax.dot_general(
-        k, scaled_q, qk_dims, preferred_element_type=jnp.float32
-    )
+    with jax.named_scope("B1"):
+      qk_uncapped = lax.dot_general(
+          k, scaled_q, qk_dims, preferred_element_type=jnp.float32
+      )
     if config.softmax_scale is not None:
       if config.use_base2_exp and config.combine_log2_scale:
         qk_uncapped *= jnp.float32(config.softmax_scale * LOG2E)
