@@ -497,7 +497,7 @@ def flash_attention_kernel(
     # The reference PV consumes FP32 P; do not introduce a BF16 cast here.
     values = v_ref[:, window]
     if head_dim_v == 72:
-      padded_values = jnp.pad(values, ((0, 128 - head_dim_v), (0, 0)))
+      padded_values = jnp.pad(values, ((0, 96 - head_dim_v), (0, 0)))
       output_t = lax.dot_general(
           padded_values,
           probabilities,
@@ -1641,7 +1641,7 @@ def _flash_attention_dkv_kernel(
     if dq_scratch_ref is not None or dq_ref is not None:
       if native_layout:
         if k.shape[1] == 72:
-          padded_k = jnp.pad(k, ((0, 0), (0, 128 - k.shape[1])))
+          padded_k = jnp.pad(k, ((0, 0), (0, 96 - k.shape[1])))
           dq_transposed = lax.dot_general(
               padded_k,
               ds.astype(k.dtype),
