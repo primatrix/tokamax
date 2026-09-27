@@ -164,6 +164,9 @@ class SplashConfig:
   bwd_dv_last: bool = False
   bwd_cast_before_transpose: bool = False
   bwd_scale_after_dot: bool = False
+  # Reuse the BF16 probability tile already materialized for dV when forming
+  # dS. The subtract and all gradient dots still accumulate in FP32.
+  bwd_bf16_prob_for_ds: bool = False
   omit_unused_max_logits: bool = False
   compact_stats_output: bool = False
   compact_softmax_scratch: bool = False
@@ -1394,7 +1397,7 @@ def _flash_attention_dq_kernel(
         dp_dims,
         preferred_element_type=jnp.float32,
     )
-    ds = (dp - di) * p
+    ds = (dp - di) * (p_bf16 if config.bwd_bf16_prob_for_ds else p)
     if attn_logits_soft_cap is not None:
       normalized = qk_uncapped / attn_logits_soft_cap
       d = jnp.tanh(normalized)

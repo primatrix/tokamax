@@ -33,6 +33,7 @@ _TUNING = {
     "bwd_dq_first": True,
     "bwd_cast_before_transpose": True,
     "bwd_scale_after_dot": True,
+    "bwd_bf16_prob_for_ds": True,
     "compact_stats_output": True,
     "omit_unused_max_logits": True,
     "segment_mask_on_partial_only": True,
