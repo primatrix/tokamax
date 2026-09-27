@@ -2013,11 +2013,11 @@ def _splash_attention_bwd_dkv(
       )
       if per_head_segment_ids:
         q_segment_ids = jax.lax.broadcast_in_dim(
-            segment_ids.q, (NUM_SUBLANES, segment_groups, q_seq_len), (1, 2)
-        ).reshape(NUM_SUBLANES, segment_groups * q_seq_len)
+            segment_ids.q, (NUM_SUBLANES, num_q_heads, q_seq_len), (1, 2)
+        ).reshape(NUM_SUBLANES, num_q_heads * q_seq_len)
         kv_segment_ids = jax.lax.broadcast_in_dim(
-            segment_ids.kv, (segment_groups, kv_seq_len, NUM_LANES), (0, 1)
-        ).reshape(segment_groups * kv_seq_len, NUM_LANES)
+            segment_ids.kv, (num_kv_heads, kv_seq_len, NUM_LANES), (0, 1)
+        ).reshape(num_kv_heads * kv_seq_len, NUM_LANES)
       else:
         q_segment_ids = jax.lax.broadcast_in_dim(
             segment_ids.q, (NUM_SUBLANES, q_seq_len), (1,)
