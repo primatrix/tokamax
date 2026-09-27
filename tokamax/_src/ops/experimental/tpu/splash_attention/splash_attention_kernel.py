@@ -528,7 +528,7 @@ def flash_attention_kernel(
     values = v_ref[:, window]
     # Pad only the non-reducing PV dimension; keep stored values and gradients
     # at their original width while improving narrow-head MXU mapping.
-    pv_width = 96 if values.shape[0] == 72 else NUM_LANES
+    pv_width = 120 if values.shape[0] == 72 else NUM_LANES
     values = jnp.pad(values, ((0, max(0, pv_width - values.shape[0])), (0, 0)))
     output_t = lax.dot_general(
         values, probabilities, NN_DIM_NUMBERS,
