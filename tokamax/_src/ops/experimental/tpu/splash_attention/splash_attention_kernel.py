@@ -502,12 +502,14 @@ def flash_attention_kernel(
         else value
     ).astype(ref.dtype)
 
+  resident_q = q_ref[...] if native_layout else None
+
   def kvmajor_body(kv_compute_index, has_partial_mask):
     # Keep P as [KV, Q] so V @ P accumulates directly into [D, Q].
     # This avoids padding D in the minor axis of the output scratch buffer.
     window = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
     logits = lax.dot_general(
-        k_ref[:, window], q_ref[...], TN_DIM_NUMBERS,
+        k_ref[:, window], resident_q, TN_DIM_NUMBERS,
         preferred_element_type=jnp.float32,
     )
     logits *= jnp.float32(config.softmax_scale * LOG2E)
