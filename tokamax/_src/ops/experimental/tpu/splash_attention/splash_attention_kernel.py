@@ -251,6 +251,7 @@ def _use_native_layout(
       and config.combine_log2_scale
       and config.softmax_scale is not None
       and config.attn_logits_soft_cap is None
+      and segment_ids is not None
       and mask_info.partial_mask_blocks is None
       and mask_function is None
   )
