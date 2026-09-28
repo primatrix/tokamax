@@ -185,6 +185,7 @@ class SplashConfig:
   dq_reduction_steps: int | None = None
   # Arithmetic reordering may change floating-point rounding.
   combine_log2_scale: bool = False
+  fwd_kv_unroll: int | bool = True
   bwd_kv_unroll: bool = True
   bwd_dq_first: bool = False
   bwd_dv_last: bool = False
@@ -211,6 +212,14 @@ class SplashConfig:
       object.__setattr__(self, "block_kv_compute", self.block_kv)
     if self.block_kv_dkv_compute is None:
       object.__setattr__(self, "block_kv_dkv_compute", self.block_kv_dkv)
+
+    if not isinstance(self.fwd_kv_unroll, (bool, int)) or (
+        not isinstance(self.fwd_kv_unroll, bool) and self.fwd_kv_unroll < 1
+    ):
+      raise ValueError(
+          "fwd_kv_unroll must be a bool or a positive integer, got "
+          f"{self.fwd_kv_unroll!r}."
+      )
 
     if self.dq_reduction_steps is not None and self.dq_reduction_steps != 3:
       raise ValueError(
@@ -269,7 +278,6 @@ def _use_native_layout(
       and config.combine_log2_scale
       and config.softmax_scale is not None
       and config.attn_logits_soft_cap is None
-      and segment_ids is not None
       and mask_info.partial_mask_blocks is None
       and mask_function is None
   )
@@ -513,7 +521,9 @@ def flash_attention_kernel(
         preferred_element_type=jnp.float32,
     )
     logits *= jnp.float32(config.softmax_scale * LOG2E)
-    if not config.segment_mask_on_partial_only or has_partial_mask:
+    if q_segment_ids_ref is not None and (
+        not config.segment_mask_on_partial_only or has_partial_mask
+    ):
       q_ids = (
           q_segment_ids_ref[:1, :]
           if q_segment_ids_ref.shape[0] == 1
@@ -526,15 +536,20 @@ def flash_attention_kernel(
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
     # The reference PV consumes FP32 P; do not introduce a BF16 cast here.
     values = v_ref[:, window]
-    # Pad only the non-reducing PV dimension; keep stored values and gradients
-    # at their original width while improving narrow-head MXU mapping.
-    pv_width = 120 if values.shape[0] == 72 else NUM_LANES
-    values = jnp.pad(values, ((0, max(0, pv_width - values.shape[0])), (0, 0)))
-    output_t = lax.dot_general(
-        values, probabilities, NN_DIM_NUMBERS,
-        preferred_element_type=jnp.float32,
-    )
-    o_scratch_ref[...] += output_t[:v_ref.shape[0], :]
+    if head_dim_v == 72:
+      padded_values = jnp.pad(values, ((0, 128 - head_dim_v), (0, 0)))
+      output_t = lax.dot_general(
+          padded_values,
+          probabilities,
+          NN_DIM_NUMBERS,
+          preferred_element_type=jnp.float32,
+      )[:head_dim_v, :]
+    else:
+      output_t = lax.dot_general(
+          values, probabilities, NN_DIM_NUMBERS,
+          preferred_element_type=jnp.float32,
+      )
+    o_scratch_ref[...] += output_t
 
   def body(kv_compute_index, _, has_partial_mask=False):
     if native_layout:
@@ -644,12 +659,16 @@ def flash_attention_kernel(
 
   @pl.when(jnp.logical_and(should_not_mask, should_run))
   def _():
-    lax.fori_loop(0, num_iters, body, None, unroll=True)
+    lax.fori_loop(0, num_iters, body, None, unroll=config.fwd_kv_unroll)
 
   @pl.when(jnp.logical_and(jnp.logical_not(should_not_mask), should_run))
   def _():
     lax.fori_loop(
-        0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
+        0,
+        num_iters,
+        partial(body, has_partial_mask=True),
+        None,
+        unroll=config.fwd_kv_unroll,
     )
 
   @pl.when(should_write)
@@ -1695,11 +1714,21 @@ def _flash_attention_dkv_kernel(
       compute_dk()
     if dq_scratch_ref is not None or dq_ref is not None:
       if native_layout:
-        dq_dims = TN_DIM_NUMBERS
-        dq_transposed = lax.dot_general(
-            k, ds.astype(k.dtype), dq_dims,
-            preferred_element_type=jnp.float32,
-        )
+        if k.shape[1] == 72:
+          padded_k = jnp.pad(k, ((0, 0), (0, 128 - k.shape[1])))
+          dq_transposed = lax.dot_general(
+              padded_k,
+              ds.astype(k.dtype),
+              TN_DIM_NUMBERS,
+              preferred_element_type=jnp.float32,
+          )[:k.shape[1], :]
+        else:
+          dq_transposed = lax.dot_general(
+              k,
+              ds.astype(k.dtype),
+              TN_DIM_NUMBERS,
+              preferred_element_type=jnp.float32,
+          )
         # Sequence-minor scratch cancels this logical-output transpose.
         dq = dq_transposed.T
       else:
