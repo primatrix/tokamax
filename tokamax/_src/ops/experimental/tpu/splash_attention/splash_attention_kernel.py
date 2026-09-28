@@ -1614,6 +1614,11 @@ def _flash_attention_dkv_kernel(
       ds = ds * (1 - d * d)
     if config.softmax_scale is not None and not config.bwd_scale_after_dot:
       ds *= jnp.float32(config.softmax_scale)
+    # dK and dQ consume the same low-precision dS tile.  Materialize the cast
+    # once so the native-layout backward does not issue two identical vector
+    # conversions for every KV compute tile.
+    ds_dk = ds.astype(do.dtype)
+    ds_dq = ds_dk if do.dtype == k.dtype else ds.astype(k.dtype)
 
     def compute_dk():
       dk_dims = (
@@ -1622,7 +1627,7 @@ def _flash_attention_dkv_kernel(
           else NT_DIM_NUMBERS
       )
       dk = lax.dot_general(
-          ds.astype(do.dtype),
+          ds_dk,
           q,
           dk_dims,
           preferred_element_type=jnp.float32,
@@ -1645,14 +1650,14 @@ def _flash_attention_dkv_kernel(
           padded_k = jnp.pad(k, ((0, 0), (0, 128 - k.shape[1])))
           dq_transposed = lax.dot_general(
               padded_k,
-              ds.astype(k.dtype),
+              ds_dq,
               TN_DIM_NUMBERS,
               preferred_element_type=jnp.float32,
           )[:k.shape[1], :]
         else:
           dq_transposed = lax.dot_general(
               k,
-              ds.astype(k.dtype),
+              ds_dq,
               TN_DIM_NUMBERS,
               preferred_element_type=jnp.float32,
           )
@@ -1660,7 +1665,7 @@ def _flash_attention_dkv_kernel(
         dq = dq_transposed.T
       else:
         dq = lax.dot_general(
-            ds.astype(k.dtype).T
+            ds_dq.T
             if config.bwd_cast_before_transpose
             else ds.T.astype(k.dtype),
             k,
