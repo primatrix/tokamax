@@ -8,12 +8,17 @@ import numpy as np
 import pytest
 
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
+from tokamax._src.ops.experimental.tpu.splash_attention.splash_attention_layout_test import _config
 from tokamax._src.ops.experimental.tpu.splash_attention.splash_attention_layout_test import _oracle
 
 
-def _mask_info(ids, block_q, block_kv, backward=False):
-  allowed = ids[:, :, None] == ids[:, None, :]
-  tiles = allowed.reshape(len(ids), 512 // block_q, block_q, 512 // block_kv, block_kv)
+def _mask_info(ids, block_q, block_kv, backward=False, *, kv_ids=None):
+  kv_ids = ids if kv_ids is None else kv_ids
+  allowed = ids[:, :, None] == kv_ids[:, None, :]
+  tiles = allowed.reshape(
+      len(ids), ids.shape[1] // block_q, block_q,
+      kv_ids.shape[1] // block_kv, block_kv,
+  )
   active = tiles.any(axis=(2, 4))
   full = tiles.all(axis=(2, 4))
   if backward:
@@ -80,6 +85,53 @@ def test_grouped_segments_outputs_and_gradients(shift, width, heads_per_group, k
     assert np.isfinite(actual).all()
     assert np.linalg.norm(actual - wanted) / np.linalg.norm(wanted) < 0.01
   np.testing.assert_allclose(stats["logsumexp"], lse, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize("shift", [0.0, None])
+@pytest.mark.parametrize("fuse_reciprocal", [True, False])
+def test_empty_group_row_outputs_and_gradients(shift, fuse_reciprocal):
+  config = _config(72, max_logit_const=shift, fuse_reciprocal=fuse_reciprocal)
+  q_ids = np.ones((2, 256), np.int32)
+  q_ids[1, :128] = 2  # No matching KV segment in this group's first Q tile.
+  kv_ids = np.ones_like(q_ids)
+  kernel = splash.SplashAttentionKernel(
+      _mask_info(q_ids, 128, 256, kv_ids=kv_ids),
+      _mask_info(q_ids, 128, 256, True, kv_ids=kv_ids),
+      config=config, is_mqa=False, save_residuals=True,
+      mask_value=splash.base.DEFAULT_MASK_VALUE, mask_function=None,
+      fwd_mask_sparsity=1.0, dkv_mask_sparsity=1.0,
+  )
+  rng = np.random.default_rng(53)
+  q, k, v, do = [
+      jnp.asarray(rng.normal(size=(2, 256, 72)), jnp.bfloat16)
+      for _ in range(4)
+  ]
+  segments = splash.SegmentIds(jnp.asarray(q_ids), jnp.asarray(kv_ids))
+  (output, stats), vjp = jax.vjp(lambda q, k, v: kernel(q, k, v, segments), q, k, v)
+  gradients = vjp((do, jax.tree.map(jnp.zeros_like, stats)))
+  np.testing.assert_array_equal(output[1, :128], 0)
+  np.testing.assert_array_equal(gradients[0][1, :128], 0)
+  assert np.isneginf(np.asarray(stats["logsumexp"])[1, :128]).all()
+  for actual in (output, *gradients):
+    assert np.isfinite(np.asarray(actual)).all()
+  # Compare only nonempty Q rows to dense attention; empty rows contribute
+  # nothing to dK/dV, so the reference omits them entirely.
+  for group, start in ((0, 0), (1, 128)):
+    head = slice(group, group + 1)
+    expected, lse, *expected_grads = _oracle(
+        q[head, start:], k[head], v[head], do[head, start:], None,
+        np.ones((256 - start, 256), bool), config,
+    )
+    actuals = (
+        output[head, start:], gradients[0][head, start:],
+        gradients[1][head], gradients[2][head],
+    )
+    for actual, wanted in zip(actuals, (expected, *expected_grads)):
+      actual = np.asarray(actual, np.float64)
+      assert np.linalg.norm(actual - wanted) / np.linalg.norm(wanted) < 0.01
+    np.testing.assert_allclose(
+        stats["logsumexp"][head, start:], lse, rtol=2e-5, atol=2e-5,
+    )
 
 
 @pytest.mark.parametrize("invalid", ["head_count", "mixed_rank", "different_groups", "mask_groups"])

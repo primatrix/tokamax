@@ -643,7 +643,9 @@ def flash_attention_kernel(
       m_native = m_scratch_ref[...]
       output_native = o_scratch_ref[...]
       if fuse_reciprocal:
-        output_native *= 1.0 / l_native[:1, :]
+        # Empty group rows retain their initialized zero output.
+        denominator = jnp.where(l_native[:1, :] == 0, 1.0, l_native[:1, :])
+        output_native *= 1.0 / denominator
       output_native = output_native.astype(o_ref.dtype)
       o_ref[...] = output_native
       if logsumexp_ref is not None:
@@ -657,7 +659,8 @@ def flash_attention_kernel(
     l = l_scratch_ref[...]
     m = m_scratch_ref[...]
     if fuse_reciprocal:  # allows fusing reciprocal out of the kernel
-      l_inv = jnp.tile(1.0 / l, (1, head_dim_v_repeats))
+      denominator = jnp.where(l == 0, 1.0, l)
+      l_inv = jnp.tile(1.0 / denominator, (1, head_dim_v_repeats))
       l_inv = l_inv[..., : o_scratch_ref.shape[-1]]
       o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
     else:
@@ -1175,7 +1178,8 @@ def _splash_attention_forward(
 
       l = l_linear[:, 0, :] if config.compact_stats_output else l_linear[..., 0]
       logsumexp = max_logits + log(l)
-      out = (out / l[..., None]).astype(out.dtype)
+      denominator = jnp.where(l == 0, 1.0, l)
+      out = (out / denominator[..., None]).astype(out.dtype)
   else:
     # If we're not saving residuals, then we can't fuse the reciprocal
     # out of the kernel.
