@@ -1612,7 +1612,9 @@ def _flash_attention_dkv_kernel(
         kv_segment_ids_seq_minor=native_layout,
     )
     exp = jnp.exp2 if config.use_base2_exp else jnp.exp
-    p = exp(qk - logsumexp)
+    # A backward tile can mix empty and nonempty forward rows. Empty rows
+    # have logsumexp=-inf and must contribute zero probability and gradients.
+    p = exp(jnp.where(logsumexp == -jnp.inf, -jnp.inf, qk - logsumexp))
     p_bf16 = p.astype(do.dtype)
 
     dv = lax.dot_general(

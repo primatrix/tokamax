@@ -90,13 +90,17 @@ def test_grouped_segments_outputs_and_gradients(shift, width, heads_per_group, k
 @pytest.mark.parametrize("shift", [0.0, None])
 @pytest.mark.parametrize("fuse_reciprocal", [True, False])
 def test_empty_group_row_outputs_and_gradients(shift, fuse_reciprocal):
-  config = _config(72, max_logit_const=shift, fuse_reciprocal=fuse_reciprocal)
+  # A backward tile spans both empty and nonempty forward Q tiles.
+  config = _config(
+      72, block_q_dkv=256, max_logit_const=shift,
+      fuse_reciprocal=fuse_reciprocal,
+  )
   q_ids = np.ones((2, 256), np.int32)
   q_ids[1, :128] = 2  # No matching KV segment in this group's first Q tile.
   kv_ids = np.ones_like(q_ids)
   kernel = splash.SplashAttentionKernel(
       _mask_info(q_ids, 128, 256, kv_ids=kv_ids),
-      _mask_info(q_ids, 128, 256, True, kv_ids=kv_ids),
+      _mask_info(q_ids, 256, 256, True, kv_ids=kv_ids),
       config=config, is_mqa=False, save_residuals=True,
       mask_value=splash.base.DEFAULT_MASK_VALUE, mask_function=None,
       fwd_mask_sparsity=1.0, dkv_mask_sparsity=1.0,
