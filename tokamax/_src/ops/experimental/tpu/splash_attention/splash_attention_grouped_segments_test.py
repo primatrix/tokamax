@@ -1,6 +1,7 @@
 """Independent output/VJP coverage for grouped segment IDs and union grids."""
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -100,3 +101,96 @@ def test_invalid_grouped_segment_shapes_fail_early(invalid):
     kernel.fwd_mask_info = kernel.fwd_mask_info._replace(block_mask=jnp.ones((3, 16), jnp.int8))
   with pytest.raises(ValueError, match="groups|Grouped|Block-mask"):
     kernel(q, k, v, splash.SegmentIds(qids, kids))
+
+
+@pytest.mark.parametrize("groups", [2, 3])
+@pytest.mark.parametrize("grouped_backward_mask", [False, True])
+def test_grouped_mask_sequence_sharding_outputs_and_gradients(
+    groups, grouped_backward_mask
+):
+  if len(jax.devices()) < 2:
+    pytest.skip("Requires two devices; on CPU set JAX_NUM_CPU_DEVICES=2.")
+  partition = jax.sharding.PartitionSpec
+  mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("seq",))
+  config = splash.SplashConfig(
+      block_q=128, block_kv=256, block_kv_compute=128,
+      block_q_dkv=128, block_kv_dkv=256, block_kv_dkv_compute=128,
+      q_layout=splash.QKVLayout.SEQ_MINOR,
+      k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR,
+      softmax_scale=72**-0.5, max_logit_const=0.0,
+      combine_log2_scale=True, segment_mask_on_partial_only=True,
+      interpret=jax.default_backend() == "cpu",
+  )
+  # Concatenate two sequence shards' grids. Each shard has two local Q tiles
+  # and visits both KV tiles; head groups attend alternating KV halves.
+  rows = np.array([0, 0, 1, 1] * 2, np.int32)
+  cols = np.array([0, 1, 0, 1] * 2, np.int32)
+
+  def mask_info(backward=False):
+    kv_tiles = rows if backward else cols
+    kinds = np.where(np.arange(groups)[:, None] % 2 == kv_tiles, 2, 0)
+    if backward and not grouped_backward_mask:
+      # A shared partial mask checks runtime IDs for every group. Forward
+      # and backward metadata therefore deliberately have different ranks.
+      kinds = np.ones(len(rows), np.int8)
+    return splash.MaskInfo(
+        active_rows=jnp.asarray(rows), active_cols=jnp.asarray(cols),
+        mask_next=jnp.full((len(rows),), -1, jnp.int32),
+        num_active_blocks=jnp.array([4, 4], jnp.int32),
+        block_mask=jnp.asarray(kinds, jnp.int8),
+        partial_mask_blocks=None, q_sequence=None,
+    )
+
+  kernel = splash.SplashAttentionKernel(
+      mask_info(), mask_info(backward=True),
+      config=config, is_mqa=False, save_residuals=False,
+      mask_value=splash.base.DEFAULT_MASK_VALUE, mask_function=None,
+      fwd_mask_sparsity=1.0, dkv_mask_sparsity=1.0,
+  )
+  kernel_spec = kernel.manual_sharding_spec(
+      jax.sharding.NamedSharding(mesh, partition("seq"))
+  )
+  q_ids = np.zeros((groups, 512), np.int32)
+  kv_ids = (np.arange(512)[None, :] // 256 != np.arange(groups)[:, None] % 2)
+  segments = splash.SegmentIds(jnp.asarray(q_ids), jnp.asarray(kv_ids, jnp.int32))
+  rng = np.random.default_rng(93)
+  q, k, v, do = [
+      jnp.asarray(rng.normal(size=(groups, 512, width)), jnp.bfloat16)
+      for width in (72, 72, 96, 96)
+  ]
+
+  @functools.partial(
+      jax.shard_map, mesh=mesh,
+      in_specs=(
+          kernel_spec, partition(None, "seq"), partition(), partition(),
+          splash.SegmentIds(partition(None, "seq"), partition()),
+      ),
+      out_specs=partition(None, "seq"), check_vma=False,
+  )
+  def sharded(kernel, q, k, v, segments):
+    return kernel(q, k, v, segments)
+
+  output, vjp = jax.vjp(lambda q, k, v: sharded(kernel, q, k, v, segments), q, k, v)
+  gradients = vjp(do)
+  allowed = q_ids[:, :, None] == kv_ids[:, None, :]
+  expected, _, *expected_grads = _oracle(q, k, v, do, None, allowed, config)
+  for actual, wanted in zip((output, *gradients), (expected, *expected_grads)):
+    actual = np.asarray(actual, np.float64)
+    assert np.isfinite(actual).all()
+    assert np.linalg.norm(actual - wanted) / np.linalg.norm(wanted) < 0.01
+
+
+@pytest.mark.parametrize("backward", [False, True])
+def test_grouped_mask_sharding_rejects_indivisible_grid(backward):
+  if len(jax.devices()) < 2:
+    pytest.skip("Requires two devices; on CPU set JAX_NUM_CPU_DEVICES=2.")
+  _, _, _, kernel = _fixture()
+  attr = "dkv_mask_info" if backward else "fwd_mask_info"
+  info = getattr(kernel, attr)
+  setattr(kernel, attr, info._replace(block_mask=info.block_mask[:, :-1]))
+  mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("seq",))
+  with pytest.raises(ValueError, match="divide the mask blocks evenly"):
+    kernel.manual_sharding_spec(
+        jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("seq"))
+    )

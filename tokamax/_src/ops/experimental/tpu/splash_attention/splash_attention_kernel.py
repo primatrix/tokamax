@@ -2502,33 +2502,46 @@ class SplashAttentionKernel:
 
   def manual_sharding_spec(self, sharding: jax.sharding.NamedSharding):
     """Returns a value that can be used as a shard_map partition spec for the kernel."""
-    if self.fwd_mask_info.block_mask is not None:
-      block_mask_shape = self.fwd_mask_info.block_mask.shape
-      try:
-        sharding.shard_shape(block_mask_shape)
-      except ValueError as exc:
-        raise ValueError(
-            "The sharding must divide the mask blocks evenly between devices"
-        ) from exc
-
     if len(sharding.spec) != 1:
       raise ValueError("Only q sequence sharding is supported.")
 
     _resolve_spec = lambda x: sharding.spec if x is not None else None
-    mask_info_specs = MaskInfo(  # pytype: disable=wrong-arg-types
-        mask_next=_resolve_spec(self.fwd_mask_info.mask_next),
-        active_rows=_resolve_spec(self.fwd_mask_info.active_rows),
-        active_cols=_resolve_spec(self.fwd_mask_info.active_cols),
-        num_active_blocks=_resolve_spec(self.fwd_mask_info.num_active_blocks),
-        block_mask=_resolve_spec(self.fwd_mask_info.block_mask),
-        partial_mask_blocks=jax.sharding.PartitionSpec()  # replicated
-        if self.fwd_mask_info.partial_mask_blocks is not None
-        else None,
-        q_sequence=_resolve_spec(self.fwd_mask_info.q_sequence),
-    )
+
+    def mask_info_spec(mask_info):
+      block_mask_spec = None
+      if mask_info.block_mask is not None:
+        block_mask_spec = sharding.spec
+        if mask_info.block_mask.ndim == 2:
+          # Grouped masks are [groups, grid]: replicate groups and partition
+          # the grid just like the shared one-dimensional metadata arrays.
+          block_mask_spec = jax.sharding.PartitionSpec(None, *sharding.spec)
+        block_mask_sharding = jax.sharding.NamedSharding(
+            sharding.mesh, block_mask_spec
+        )
+        try:
+          block_mask_sharding.shard_shape(mask_info.block_mask.shape)
+        except ValueError as exc:
+          raise ValueError(
+              "The sharding must divide the mask blocks evenly between devices"
+          ) from exc
+
+      return MaskInfo(  # pytype: disable=wrong-arg-types
+          mask_next=_resolve_spec(mask_info.mask_next),
+          active_rows=_resolve_spec(mask_info.active_rows),
+          active_cols=_resolve_spec(mask_info.active_cols),
+          num_active_blocks=_resolve_spec(mask_info.num_active_blocks),
+          block_mask=block_mask_spec,
+          partial_mask_blocks=jax.sharding.PartitionSpec()  # replicated
+          if mask_info.partial_mask_blocks is not None
+          else None,
+          q_sequence=_resolve_spec(mask_info.q_sequence),
+      )
+
     return SplashAttentionKernel(
-        mask_info_specs,
-        mask_info_specs if self.dkv_mask_info is not None else None,
+        mask_info_spec(self.fwd_mask_info),
+        mask_info_spec(self.dkv_mask_info)
+        if self.dkv_mask_info is not None
+        else None,
         **self.kwargs,
     )
 
