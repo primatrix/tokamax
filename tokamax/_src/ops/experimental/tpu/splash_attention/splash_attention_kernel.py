@@ -187,13 +187,10 @@ class SplashConfig:
   combine_log2_scale: bool = False
   bwd_kv_unroll: bool = True
   bwd_dq_first: bool = False
-  bwd_dv_last: bool = False
   bwd_cast_before_transpose: bool = False
   bwd_scale_after_dot: bool = False
   omit_unused_max_logits: bool = False
   compact_stats_output: bool = False
-  compact_softmax_scratch: bool = False
-  bwd_parallel_heads: bool = False
   bwd_scheduler: bool | None = None
   # Caller contract: every full tile in MaskInfo must also be fully allowed
   # by the runtime segment IDs. Partial tiles retain exact segment checks.
@@ -328,9 +325,7 @@ def _apply_mask_and_soft_cap(
         q_sequence = jnp.broadcast_to(q_sequence, (k_slice.size, bq))
 
       assert q_sequence.shape == k_sequence.shape
-      computed_mask = mask_function(
-          q_sequence, k_sequence
-      )  # pytype: disable=wrong-arg-count
+      computed_mask = mask_function(q_sequence, k_sequence)  # pytype: disable=wrong-arg-count
       if computed_mask.dtype != jnp.dtype(jnp.bool_):
         raise ValueError(
             "Mask function must return a boolean-valued array, but got:"
@@ -483,18 +478,6 @@ def flash_attention_kernel(
           sink - jnp.full_like(l_scratch_ref, max_logit_estimate)
       )
 
-  def load_state(ref):
-    if config.compact_softmax_scratch:
-      return jnp.broadcast_to(ref[:1, :].T, (bq, NUM_LANES))
-    return ref[...]
-
-  def store_state(ref, value):
-    ref[...] = (
-        jnp.broadcast_to(value[:, :1].T, (NUM_SUBLANES, bq))
-        if config.compact_softmax_scratch
-        else value
-    )
-
   def store_output_stat(ref, value):
     ref[...] = (
         jnp.broadcast_to(value[:, :1].T, (NUM_SUBLANES, bq))
@@ -541,7 +524,7 @@ def flash_attention_kernel(
       kvmajor_body(kv_compute_index, has_partial_mask)
       return
     slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-    m_prev, l_prev = load_state(m_scratch_ref), load_state(l_scratch_ref)
+    m_prev, l_prev = m_scratch_ref[...], l_scratch_ref[...]
     assert m_prev.shape == (bq, NUM_LANES)
     assert l_prev.shape == (bq, NUM_LANES)
 
@@ -615,11 +598,10 @@ def flash_attention_kernel(
     if max_logit_estimate is None:
       alpha = exp(m_prev - m_next)
       l_next = l_curr + alpha * l_prev
-      store_state(m_scratch_ref, m_next)
-      store_state(l_scratch_ref, l_next)
+      m_scratch_ref[...], l_scratch_ref[...] = m_next, l_next
     else:
       alpha = None
-      store_state(l_scratch_ref, l_curr + l_prev)
+      l_scratch_ref[...] = l_curr + l_prev
 
     sv_dims = (
         NN_DIM_NUMBERS if config.v_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
@@ -672,8 +654,8 @@ def flash_attention_kernel(
       if max_logits_ref is not None:
         max_logits_ref[...] = m_native.astype(max_logits_ref.dtype)
       return
-    l = load_state(l_scratch_ref)
-    m = load_state(m_scratch_ref)
+    l = l_scratch_ref[...]
+    m = m_scratch_ref[...]
     if fuse_reciprocal:  # allows fusing reciprocal out of the kernel
       l_inv = jnp.tile(1.0 / l, (1, head_dim_v_repeats))
       l_inv = l_inv[..., : o_scratch_ref.shape[-1]]
@@ -743,9 +725,7 @@ def _splash_attention_forward(
       and max_logit_value is None
   )
   if native_layout:
-    config = dataclasses.replace(
-        config, compact_softmax_scratch=True, compact_stats_output=True
-    )
+    config = dataclasses.replace(config, compact_stats_output=True)
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   head_dim_v = v.shape[-1]
   bq, bkv = config.block_q, config.block_kv
@@ -816,14 +796,10 @@ def _splash_attention_forward(
         and segment_ids.q.shape[0] != segment_ids.kv.shape[0]
     ):
       raise ValueError("Q and KV segment IDs must use the same head groups.")
-    if segment_ids.q.ndim == 2 and not config.use_fused_bwd_kernel:
-      raise ValueError("Grouped segment IDs require the fused backward kernel.")
   if mask_info.block_mask is not None and mask_info.block_mask.ndim == 2:
     groups = mask_info.block_mask.shape[0]
     if not groups or num_q_heads % groups:
       raise ValueError("Block-mask groups must divide the query head count.")
-    if not config.use_fused_bwd_kernel:
-      raise ValueError("Grouped block masks require the fused backward kernel.")
   if config.max_logit_const is not None and max_logit_value is not None:
     raise ValueError(
         f"Only one of {config.max_logit_const=} and"
@@ -1112,13 +1088,13 @@ def _splash_attention_forward(
             scratch_shapes=[
                 pltpu.VMEM(
                     (NUM_SUBLANES, bq)
-                    if config.compact_softmax_scratch
+                    if native_layout
                     else (bq, NUM_LANES),
                     jnp.float32,
                 ),  # m_scratch
                 pltpu.VMEM(
                     (NUM_SUBLANES, bq)
-                    if config.compact_softmax_scratch
+                    if native_layout
                     else (bq, NUM_LANES),
                     jnp.float32,
                 ),  # l_scratch
@@ -1404,24 +1380,17 @@ def _flash_attention_dq_kernel(
     )
     qk_uncapped = lax.dot_general(q, k, qk_dims, preferred_element_type=float32)
     if config.softmax_scale is not None:
-      if config.use_base2_exp and config.combine_log2_scale:
-        qk_uncapped *= jnp.float32(config.softmax_scale * LOG2E)
-      else:
-        qk_uncapped *= jnp.float32(config.softmax_scale)
-        if config.use_base2_exp:
-          qk_uncapped *= jnp.float32(LOG2E)
+      qk_uncapped *= jnp.float32(config.softmax_scale)
+      if config.use_base2_exp:
+        qk_uncapped *= jnp.float32(LOG2E)
 
     qk = _apply_mask_and_soft_cap(
         qk_uncapped,
         mask_value,
         mask_ref,
         q_sequence_ref,
-        q_segment_ids_ref
-        if (not config.segment_mask_on_partial_only or has_partial_mask)
-        else None,
-        kv_segment_ids_ref
-        if (not config.segment_mask_on_partial_only or has_partial_mask)
-        else None,
+        q_segment_ids_ref,
+        kv_segment_ids_ref,
         attn_logits_soft_cap=attn_logits_soft_cap,
         k_slice=pl.ds(0, bkv),
         k_offset=kv_index * bkv,
@@ -1606,9 +1575,7 @@ def _flash_attention_dkv_kernel(
       )
 
     qk_dims = (
-        NT_DIM_NUMBERS
-        if config.q_layout == HEAD_DIM_MINOR
-        else NN_DIM_NUMBERS
+        NT_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
     )
     qk_uncapped = lax.dot_general(
         k, scaled_q, qk_dims, preferred_element_type=jnp.float32
@@ -1644,22 +1611,19 @@ def _flash_attention_dkv_kernel(
     p = exp(qk - logsumexp)
     p_bf16 = p.astype(do.dtype)
 
-    def compute_dv():
-      dv = lax.dot_general(
-          p_bf16, do,
-          NT_DIM_NUMBERS if native_layout else NN_DIM_NUMBERS,
-          preferred_element_type=jnp.float32,
-      )
-      scratch_ref = dv_scratch_ref
-      if native_layout:
-        dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[:, slice_k].T
-        scratch_ref[:, slice_k] = dv.T
-      else:
-        dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[slice_k, :]
-        scratch_ref[slice_k, :] = dv
+    dv = lax.dot_general(
+        p_bf16, do,
+        NT_DIM_NUMBERS if native_layout else NN_DIM_NUMBERS,
+        preferred_element_type=jnp.float32,
+    )
+    scratch_ref = dv_scratch_ref
+    if native_layout:
+      dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[:, slice_k].T
+      scratch_ref[:, slice_k] = dv.T
+    else:
+      dv = dv.astype(dv_scratch_ref.dtype) + scratch_ref[slice_k, :]
+      scratch_ref[slice_k, :] = dv
 
-    if not config.bwd_dv_last:
-      compute_dv()
     dp = compute_dp()
     ds = (dp - di) * p
     if attn_logits_soft_cap is not None:
@@ -1725,8 +1689,6 @@ def _flash_attention_dkv_kernel(
 
     if config.bwd_dq_first:
       compute_dk()
-    if config.bwd_dv_last:
-      compute_dv()
 
   if dq_scratch_ref is not None:
     dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
@@ -1882,16 +1844,13 @@ def _splash_attention_bwd_dkv(
   v_index_map = unravel(create_kv_index_map(config.v_layout))
 
   q_spec = pl.BlockSpec(
-      from_head_minor((None, bq, head_dim_qk), config.q_layout),
-      q_index_map,
+      from_head_minor((None, bq, head_dim_qk), config.q_layout), q_index_map
   )
 
   o_spec = pl.BlockSpec((None, bq, head_dim_v), o_index_map)
   k_spec = pl.BlockSpec(
       from_head_minor(
-          (bkv, head_dim_qk)
-          if is_mqa
-          else (None, bkv, head_dim_qk),
+          (bkv, head_dim_qk) if is_mqa else (None, bkv, head_dim_qk),
           config.k_layout,
       ),
       k_index_map,
@@ -1899,9 +1858,7 @@ def _splash_attention_bwd_dkv(
 
   v_spec = pl.BlockSpec(
       from_head_minor(
-          (bkv, head_dim_v)
-          if is_mqa
-          else (None, bkv, head_dim_v),
+          (bkv, head_dim_v) if is_mqa else (None, bkv, head_dim_v),
           config.v_layout,
       ),
       v_index_map,
@@ -1995,16 +1952,12 @@ def _splash_attention_bwd_dkv(
   # TODO: Remove the sublane expansion once Mosaic has all retilings
   logsumexp_shape = (num_q_heads, NUM_SUBLANES, q_seq_len)
   logsumexp = jnp.broadcast_to(jnp.expand_dims(logsumexp, -2), logsumexp_shape)
-  logsumexp_spec = pl.BlockSpec(
-      (None, NUM_SUBLANES, bq), logsumexp_index_map
-  )
+  logsumexp_spec = pl.BlockSpec((None, NUM_SUBLANES, bq), logsumexp_index_map)
   assert logsumexp.ndim == len(logsumexp_spec.block_shape)
 
   # TODO: Remove the sublane expansion once Mosaic has all retilings
   di = jnp.broadcast_to(jnp.expand_dims(di, -2), logsumexp_shape)
-  di_spec = pl.BlockSpec(
-      (None, NUM_SUBLANES, bq), logsumexp_index_map
-  )
+  di_spec = pl.BlockSpec((None, NUM_SUBLANES, bq), logsumexp_index_map)
   assert di.ndim == len(di_spec.block_shape)
 
   in_specs = [
@@ -2305,13 +2258,7 @@ def _splash_attention_bwd_dkv(
         #     megacore
         # 3) for q_seq_len, we are reducing over it to compute dkv
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=(
-                ("parallel", "arbitrary")
-                if config.bwd_parallel_heads
-                and dynamic_grid
-                and q_heads_per_kv_head == 1
-                else ("arbitrary",) * len(grid)
-            ),
+            dimension_semantics=("arbitrary",) * len(grid),
             flags={}
             if config.bwd_scheduler is None
             else {"XLA_TPU_FORCE_LP_LLO_SCHEDULER": config.bwd_scheduler},

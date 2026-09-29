@@ -48,13 +48,8 @@ def _relative_l2(actual, expected):
 
 
 @pytest.mark.parametrize("fuse_reciprocal", [False, True])
-@pytest.mark.parametrize(
-    "extra",
-    [{}, {"compact_softmax_scratch": True}, {"bwd_dv_last": True}],
-    ids=["combined", "compact_scratch", "dv_last"],
-)
 def test_tuning_preserves_segmented_outputs_and_all_gradients(
-    fuse_reciprocal, extra
+    fuse_reciprocal
 ):
   keys = jax.random.split(jax.random.key(42), 4)
   q, k, v, do = [
@@ -78,7 +73,7 @@ def test_tuning_preserves_segmented_outputs_and_all_gradients(
       fuse_reciprocal=fuse_reciprocal,
       interpret=True,
   )
-  tuned = dataclasses.replace(config, **(_TUNING | extra))
+  tuned = dataclasses.replace(config, **_TUNING)
 
   def run(cfg, *, save_residuals=False):
     kernel = splash.make_splash_mha_single_device(

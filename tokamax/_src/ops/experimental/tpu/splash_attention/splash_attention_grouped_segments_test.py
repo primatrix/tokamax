@@ -1,6 +1,5 @@
 """Independent output/VJP coverage for grouped segment IDs and union grids."""
 
-import dataclasses
 import functools
 
 import jax
@@ -83,7 +82,7 @@ def test_grouped_segments_outputs_and_gradients(shift, width, heads_per_group, k
   np.testing.assert_allclose(stats["logsumexp"], lse, rtol=2e-5, atol=2e-5)
 
 
-@pytest.mark.parametrize("invalid", ["head_count", "mixed_rank", "different_groups", "unfused", "mask_groups"])
+@pytest.mark.parametrize("invalid", ["head_count", "mixed_rank", "different_groups", "mask_groups"])
 def test_invalid_grouped_segment_shapes_fail_early(invalid):
   config, (q, k, v, _), ids, kernel = _fixture()
   qids = kids = jnp.asarray(ids)
@@ -93,10 +92,6 @@ def test_invalid_grouped_segment_shapes_fail_early(invalid):
     kids = kids[0]
   elif invalid == "different_groups":
     kids = kids[:1]
-  elif invalid == "unfused":
-    with pytest.raises(ValueError, match="Only the fused bwd kernel"):
-      dataclasses.replace(config, use_fused_bwd_kernel=False)
-    return
   else:
     kernel.fwd_mask_info = kernel.fwd_mask_info._replace(block_mask=jnp.ones((3, 16), jnp.int8))
   with pytest.raises(ValueError, match="groups|Grouped|Block-mask"):
