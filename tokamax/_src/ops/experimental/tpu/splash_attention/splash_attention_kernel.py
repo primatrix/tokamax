@@ -396,7 +396,9 @@ def _apply_mask_and_soft_cap(
   if masks:
     mask = functools.reduce(jnp.logical_and, masks)
     qk = cap_logits(qk)
-    qk = jnp.where(mask, qk, mask_value)
+    # A finite sentinel becomes a nonzero probability when an entire row (or
+    # an early KV tile) is masked. Masked entries must have exactly zero mass.
+    qk = jnp.where(mask, qk, -jnp.inf)
   else:
     qk = cap_logits(qk)
   return qk
@@ -490,7 +492,7 @@ def flash_attention_kernel(
         sink *= LOG2E
 
     if sinks_ref is None and max_logit_estimate is None:
-      m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
+      m_scratch_ref[...] = jnp.full_like(m_scratch_ref, -jnp.inf)
       l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
     elif sinks_ref is None and max_logit_estimate is not None:
       m_scratch_ref[...] = jnp.full_like(m_scratch_ref, max_logit_estimate)
@@ -530,7 +532,7 @@ def flash_attention_kernel(
           else q_segment_ids_ref[:, :1].T
       )
       kv_ids = kv_segment_ids_ref[:1, window].T
-      logits = jnp.where(kv_ids == q_ids, logits, mask_value)
+      logits = jnp.where(kv_ids == q_ids, logits, -jnp.inf)
     probabilities = jnp.exp2(logits - max_logit_estimate)
     current_l = jnp.sum(probabilities, axis=0, keepdims=True)
     l_scratch_ref[...] += jnp.broadcast_to(current_l, l_scratch_ref.shape)
@@ -614,7 +616,11 @@ def flash_attention_kernel(
 
     exp = jnp.exp2 if config.use_base2_exp else jnp.exp
     if max_logit_estimate is None:
-      s_curr = exp(qk - jnp.tile(m_next, (1, bkv_repeats)))
+      # An empty prefix has m_prev == m_next == -inf. Use a finite shift
+      # for this update so both its probabilities and previous mass stay zero.
+      # Retain m_next == -inf in the state until a nonempty tile arrives.
+      safe_m_next = jnp.where(m_next == -jnp.inf, 0.0, m_next)
+      s_curr = exp(qk - jnp.tile(safe_m_next, (1, bkv_repeats)))
     else:
       s_curr = exp(qk - max_logit_estimate)
     assert s_curr.shape == (bq, bkv_compute)
@@ -623,7 +629,7 @@ def flash_attention_kernel(
     assert l_curr.shape == (bq, NUM_LANES)
 
     if max_logit_estimate is None:
-      alpha = exp(m_prev - m_next)
+      alpha = exp(m_prev - safe_m_next)
       l_next = l_curr + alpha * l_prev
       m_scratch_ref[...], l_scratch_ref[...] = m_next, l_next
     else:
@@ -1103,10 +1109,13 @@ def _splash_attention_forward(
   if dynamic_grid:
     num_active_blocks = mask_info.num_active_blocks[0]
     grid = (num_q_heads, num_active_blocks)
-    is_empty_attention_block = num_active_blocks == 0
+    active = jnp.arange(mask_info.active_rows.size) < num_active_blocks
+    visited_q_blocks = jnp.zeros(q_seq_len // bq, dtype=jnp.bool_).at[
+        mask_info.active_rows
+    ].max(active, mode='drop')
+    empty_q_rows = jnp.repeat(~visited_q_blocks, bq)
   else:
     grid = (num_q_heads, kv_steps * (q_seq_len // bq))
-    is_empty_attention_block = False
 
   with jax.named_scope(kernel_name):
     all_out = pl.pallas_call(
@@ -1193,7 +1202,8 @@ def _splash_attention_forward(
     if not dynamic_grid:
       return x
 
-    return jnp.where(is_empty_attention_block, value, x)
+    empty = empty_q_rows[None, :, None] if x.ndim == 3 else empty_q_rows[None, :]
+    return jnp.where(empty, value, x)
 
   out = init_if_empty(out, 0.0)
 
@@ -1203,7 +1213,7 @@ def _splash_attention_forward(
           max_logits[:, 0, :]
           if config.compact_stats_output
           else max_logits[..., 0],
-          mask_value,
+          -jnp.inf,
       )
 
     if fuse_reciprocal:
@@ -1212,16 +1222,26 @@ def _splash_attention_forward(
           logsumexp[:, 0, :]
           if config.compact_stats_output
           else logsumexp[..., 0],
-          mask_value,
+          -jnp.inf,
       )
     else:
       assert l_linear is not None
       log = jnp.log2 if config.use_base2_exp else jnp.log
 
       l = l_linear[:, 0, :] if config.compact_stats_output else l_linear[..., 0]
+      l = init_if_empty(l, 0.0)
       logsumexp = max_logits + log(l)
       denominator = jnp.where(l == 0, 1.0, l)
       out = (out / denominator[..., None]).astype(out.dtype)
+    if sinks is not None:
+      # A skipped Q block still has its sink mass. In particular its sink
+      # gradient must not evaluate exp(sink - (-inf)) * zero_output.
+      sink_lse = sinks[0, :, None]
+      if config.use_base2_exp:
+        sink_lse = sink_lse * LOG2E
+      logsumexp = init_if_empty(logsumexp, sink_lse)
+      if max_logits is not None:
+        max_logits = init_if_empty(max_logits, sink_lse)
   else:
     # If we're not saving residuals, then we can't fuse the reciprocal
     # out of the kernel.
@@ -2327,6 +2347,15 @@ def _splash_attention_bwd_dkv(
       dv = dv.mT
     dk = dk.astype(k.dtype)
     dv = dv.astype(v.dtype)
+    if dynamic_grid:
+      # A sparse backward grid never writes KV blocks with no active queries.
+      active = jnp.arange(mask_info.active_rows.size) < grid_size
+      visited_kv_blocks = jnp.zeros(kv_steps, dtype=jnp.bool_).at[
+          mask_info.active_rows
+      ].max(active, mode='drop')
+      visited_kv_rows = jnp.repeat(visited_kv_blocks, bkv)[:, None]
+      dk = jnp.where(visited_kv_rows, dk, 0)
+      dv = jnp.where(visited_kv_rows, dv, 0)
   return dq, dk, dv
 
 
@@ -2447,6 +2476,17 @@ def _splash_attention(
     fwd_mask_sparsity: float,
     dkv_mask_sparsity: float,
 ) -> base.SplashCustomReturnType:
+  if fwd_mask_info.active_rows is not None and fwd_mask_info.active_rows.size == 0:
+    # A statically empty sparse mask has no grid entries to initialize output
+    # buffers (or to pass to find_bounds). Its Q/K/V derivatives are zero too.
+    out = jnp.zeros((*q.shape[:-1], v.shape[-1]), dtype=q.dtype)
+    if not save_residuals:
+      return out
+    lse = jnp.full(q.shape[:-1], -jnp.inf, dtype=jnp.float32)
+    if sinks is not None:
+      lse = jnp.broadcast_to(sinks.reshape(-1, 1), lse.shape).astype(jnp.float32)
+    stats = {'logsumexp': lse, 'max_logits': lse}
+    return out, jax.tree.map(jax.lax.stop_gradient, stats)
   return _splash_attention_custom(
       fwd_mask_info,
       dkv_mask_info,
@@ -2586,7 +2626,10 @@ def _make_splash_attention(
       mask,
       (config.block_q, config.block_kv),
   )
-  fwd_mask_sparsity = float(np.mean(fwd_mask_info.block_mask != 0))
+  fwd_mask_sparsity = (
+      float(np.mean(fwd_mask_info.block_mask != 0))
+      if np.size(fwd_mask_info.block_mask) else 0.0
+  )
   fwd_mask_info = tree_util.tree_map(jnp.array, fwd_mask_info)
 
   dkv_mask_info = None
@@ -2601,7 +2644,10 @@ def _make_splash_attention(
 
     assert (mask_function_fwd is None) == (mask_function_dkv is None)
 
-    dkv_mask_sparsity = float(np.mean(dkv_mask_info.block_mask != 0))
+    dkv_mask_sparsity = (
+        float(np.mean(dkv_mask_info.block_mask != 0))
+        if np.size(dkv_mask_info.block_mask) else 0.0
+    )
     dkv_mask_info = tree_util.tree_map(jnp.array, dkv_mask_info)
   else:
     dkv_mask_sparsity = 1.0
