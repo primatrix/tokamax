@@ -185,6 +185,9 @@ class SplashConfig:
   dq_reduction_steps: int | None = None
   # Arithmetic reordering may change floating-point rounding.
   combine_log2_scale: bool = False
+  # Opt-in approximation of the verified FA4 forward arithmetic boundaries.
+  # This is not a claim of GPU/TPU numerical or backward equivalence.
+  gpu_fa4_forward_numerics: bool = False
   bwd_kv_unroll: bool = True
   bwd_dq_first: bool = False
   bwd_cast_before_transpose: bool = False
@@ -204,6 +207,17 @@ class SplashConfig:
   softmax_scale: float | None = None
 
   def __post_init__(self):
+    if self.gpu_fa4_forward_numerics:
+      if not self.use_base2_exp or not self.combine_log2_scale:
+        raise ValueError("FA4 forward numerics requires base2 and combined scaling")
+      if (
+          self.softmax_scale is None
+          or not math.isfinite(self.softmax_scale)
+          or self.softmax_scale <= 0
+      ):
+        raise ValueError("FA4 forward numerics requires a positive finite softmax_scale")
+      if self.max_logit_const is not None or self.attn_logits_soft_cap is not None:
+        raise ValueError("FA4 forward numerics requires online max and no soft cap")
     if self.block_kv_compute is None:
       object.__setattr__(self, "block_kv_compute", self.block_kv)
     if self.block_kv_dkv_compute is None:
@@ -225,6 +239,19 @@ class SplashConfig:
         self.block_kv_dkv_compute,
     )
     return all(b is not None for b in backward_blocks)
+
+  def with_gpu_fa4_forward_numerics(self, *, softmax_scale: float):
+    """Select verified FA4 forward boundaries, preserving mask and tile sizes.
+
+    Supply the original unpadded head scale (e.g. 72**-0.5), not the storage
+    head width. Inputs must be BF16 MHA. GPU FMA, tiling, exp approximation,
+    and backward instruction identity still require device validation.
+    """
+    return dataclasses.replace(
+        self, gpu_fa4_forward_numerics=True, softmax_scale=softmax_scale,
+        use_base2_exp=True, combine_log2_scale=True, max_logit_const=None,
+        attn_logits_soft_cap=None,
+    )
 
   @classmethod
   def get_default(cls):
@@ -610,7 +637,15 @@ def flash_attention_kernel(
       v = v_ref[slice_k, :]
     else:
       v = v_ref[:, slice_k]
-    o_curr = lax.dot_general(s_curr, v, sv_dims)
+    # The denominator above must use unrounded FP32 exponent values. Only
+    # the probability operand of PV is rounded, as in the captured FA4 IR.
+    if config.gpu_fa4_forward_numerics:
+      o_curr = lax.dot_general(
+          s_curr.astype(v.dtype), v, sv_dims,
+          preferred_element_type=jnp.float32,
+      )
+    else:
+      o_curr = lax.dot_general(s_curr, v, sv_dims)
 
     if max_logit_estimate is None:
       alpha_o = jnp.tile(alpha, (1, head_dim_v_repeats))
@@ -720,6 +755,13 @@ def _splash_attention_forward(
     max_logit_value: jax.Array | None = None,
     save_max_logits: bool = True,
 ) -> base.SplashCustomReturnType:
+  if config.gpu_fa4_forward_numerics:
+    if any(x.dtype != jnp.bfloat16 for x in (q, k, v)):
+      raise ValueError("FA4 forward numerics currently supports BF16 Q/K/V only")
+    if is_mqa or q.shape[0] != k.shape[0]:
+      raise ValueError("FA4 forward numerics currently supports MHA only")
+    if sinks is not None or max_logit_value is not None:
+      raise ValueError("FA4 forward numerics does not support sinks or external shifts")
   native_layout = (
       _use_native_layout(
           config, q, k, v, segment_ids, mask_info, mask_function, is_mqa=is_mqa
