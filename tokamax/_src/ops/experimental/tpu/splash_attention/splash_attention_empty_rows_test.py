@@ -12,6 +12,30 @@ from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as masks
 
 
+@pytest.mark.parametrize('blocks', [127, 128, 129])
+def test_sparse_grid_index_dtype_boundary(blocks):
+  """Trace actual forward/backward with compact indices around int8 capacity."""
+  n = blocks * 128
+  cfg = dataclasses.replace(
+      splash.SplashConfig.get_default(),
+      block_q=128, block_kv=128, block_kv_compute=128,
+      block_q_dkv=128, block_kv_dkv=128, block_kv_dkv_compute=128,
+      dq_reduction_steps=3,
+  )
+  fn = splash.make_splash_mha_single_device(
+      masks.CausalMask((n, n)), config=cfg,
+  )
+  shape = jax.ShapeDtypeStruct((1, n, 128), jnp.bfloat16)
+
+  def forward_and_backward(q, k, v):
+    out, pullback = jax.vjp(fn, q, k, v)
+    return out, pullback(jnp.ones_like(out))
+
+  out, grads = jax.eval_shape(forward_and_backward, shape, shape, shape)
+  assert out.shape == shape.shape
+  assert all(g.shape == shape.shape for g in grads)
+
+
 @pytest.mark.parametrize('interpret', [True, False], ids=['interpret', 'native'])
 @pytest.mark.parametrize('layout', list(splash.QKVLayout))
 @pytest.mark.parametrize('mask_value', [base.DEFAULT_MASK_VALUE, -np.inf])

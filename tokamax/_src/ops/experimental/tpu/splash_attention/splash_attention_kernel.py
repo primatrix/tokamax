@@ -1069,7 +1069,7 @@ def _splash_attention_forward(
     grid = (num_q_heads, num_active_blocks)
     active = jnp.arange(mask_info.active_rows.size) < num_active_blocks
     visited_q_blocks = jnp.zeros(q_seq_len // bq, dtype=jnp.bool_).at[
-        mask_info.active_rows
+        mask_info.active_rows.astype(jnp.int32)
     ].max(active, mode='drop')
     empty_q_rows = jnp.repeat(~visited_q_blocks, bq)
   else:
@@ -2309,7 +2309,7 @@ def _splash_attention_bwd_dkv(
       # A sparse backward grid never writes KV blocks with no active queries.
       active = jnp.arange(mask_info.active_rows.size) < grid_size
       visited_kv_blocks = jnp.zeros(kv_steps, dtype=jnp.bool_).at[
-          mask_info.active_rows
+          mask_info.active_rows.astype(jnp.int32)
       ].max(active, mode='drop')
       visited_kv_rows = jnp.repeat(visited_kv_blocks, bkv)[:, None]
       dk = jnp.where(visited_kv_rows, dk, 0)
