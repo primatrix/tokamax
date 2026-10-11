@@ -188,6 +188,8 @@ class SplashConfig:
   # Opt-in approximation of the verified FA4 forward arithmetic boundaries.
   # This is not a claim of GPU/TPU numerical or backward equivalence.
   gpu_fa4_forward_numerics: bool = False
+  # Independent ablation: round forward PV operands, retaining FP32 softmax sums.
+  pv_bf16_rounding: bool = False
   bwd_kv_unroll: bool = True
   bwd_dq_first: bool = False
   bwd_cast_before_transpose: bool = False
@@ -207,6 +209,10 @@ class SplashConfig:
   softmax_scale: float | None = None
 
   def __post_init__(self):
+    if self.pv_bf16_rounding and (
+        self.max_logit_const is not None or self.attn_logits_soft_cap is not None
+    ):
+      raise ValueError("PV BF16 rounding requires online max and no soft cap")
     if self.gpu_fa4_forward_numerics:
       if not self.use_base2_exp or not self.combine_log2_scale:
         raise ValueError("FA4 forward numerics requires base2 and combined scaling")
@@ -645,7 +651,7 @@ def flash_attention_kernel(
       v = v_ref[:, slice_k]
     # The denominator above must use unrounded FP32 exponent values. Only
     # the probability operand of PV is rounded, as in the captured FA4 IR.
-    if config.gpu_fa4_forward_numerics:
+    if config.gpu_fa4_forward_numerics or config.pv_bf16_rounding:
       o_curr = lax.dot_general(
           s_curr.astype(v.dtype), v, sv_dims,
           preferred_element_type=jnp.float32,
@@ -761,7 +767,7 @@ def _splash_attention_forward(
     max_logit_value: jax.Array | None = None,
     save_max_logits: bool = True,
 ) -> base.SplashCustomReturnType:
-  if config.gpu_fa4_forward_numerics:
+  if config.gpu_fa4_forward_numerics or config.pv_bf16_rounding:
     if any(x.dtype != jnp.bfloat16 for x in (q, k, v)):
       raise ValueError("FA4 forward numerics currently supports BF16 Q/K/V only")
     if is_mqa or q.shape[0] != k.shape[0]:
