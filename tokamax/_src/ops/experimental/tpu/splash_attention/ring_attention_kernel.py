@@ -121,7 +121,7 @@ def _ring_attention_forward(
   o_shape = q.shape
   o_init = jnp.zeros(o_shape, dtype=jnp.float32)
   l_init = jnp.zeros((o_shape[0], o_shape[1]), jnp.float32)
-  m_init = jnp.full_like(l_init, mask_value, dtype=jnp.float32)
+  m_init = jnp.full_like(l_init, -jnp.inf, dtype=jnp.float32)
 
   def body(carry, i: int):
     m_prev, l_prev, o_prev, k_current, v_current, segment_ids_current = carry
@@ -149,11 +149,14 @@ def _ring_attention_forward(
     )
     lse_curr = stats["logsumexp"]
     m_curr = stats["max_logits"]
-    l_curr = jnp.exp(lse_curr - m_curr)
+    l_curr = jnp.exp(jnp.where(lse_curr == -jnp.inf, -jnp.inf, lse_curr - m_curr))
     o_curr = out_curr.astype(jnp.float32) * l_curr[..., None]
     m_next = jnp.maximum(m_prev, m_curr)
-    alpha = jnp.exp(m_prev - m_next)
-    beta = jnp.exp(m_curr - m_next)
+    # Empty shards carry zero mass and may have a -inf maximum. Avoid
+    # -inf - -inf until the first shard with valid keys has been visited.
+    safe_m_next = jnp.where(m_next == -jnp.inf, 0.0, m_next)
+    alpha = jnp.exp(m_prev - safe_m_next)
+    beta = jnp.exp(m_curr - safe_m_next)
     l_next = alpha * l_prev + beta * l_curr
     o_next = alpha[..., None] * o_prev + beta[..., None] * o_curr
     return (m_next, l_next, o_next, k_next, v_next, segment_ids_next), None
@@ -174,7 +177,7 @@ def _ring_attention_forward(
   out = (o_final * l_inv[..., None]).astype(q.dtype)
   # Final logsumexp for residuals
   lse = jnp.log(l_final) + m_final
-  lse = jnp.where(l_final == 0.0, mask_value, lse)
+  lse = jnp.where(l_final == 0.0, -jnp.inf, lse)
 
   return out, (lse, m_final)
 
