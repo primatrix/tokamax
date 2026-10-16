@@ -12,6 +12,24 @@ from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as masks
 
 
+def _dense_fp64_reference(q, k, v, do, allowed, scale):
+  """Independent host oracle; do not compile the reference with TPU layouts."""
+  q, k, v, do = [np.asarray(x, dtype=np.float32).astype(np.float64)
+                 for x in (q, k, v, do)]
+  logits = np.einsum('hqd,hkd->hqk', q, k) * scale
+  logits = np.where(allowed, logits, -np.inf)
+  valid = allowed.any(-1)[None, :, None]
+  maximum = np.where(valid, logits.max(-1, keepdims=True), 0.0)
+  mass = np.exp(logits - maximum)
+  denom = mass.sum(-1, keepdims=True)
+  probability = mass / np.where(valid, denom, 1.0)
+  out = probability @ v
+  dp = do @ v.transpose(0, 2, 1)
+  ds = probability * (dp - np.sum(probability * dp, axis=-1, keepdims=True)) * scale
+  return out, (ds @ k, ds.transpose(0, 2, 1) @ q,
+               probability.transpose(0, 2, 1) @ do)
+
+
 @pytest.mark.parametrize('blocks', [127, 128, 129])
 def test_sparse_grid_index_dtype_boundary(blocks):
   """Trace actual forward/backward with compact indices around int8 capacity."""
@@ -88,17 +106,7 @@ def test_empty_tiles_and_rows(interpret, layout, mask_value, case):
   out, lse, gradients = jax.jit(with_grad)(q, k, v, do)
   valid = allowed.any(-1)
 
-  def dense(q, k, v):
-    scores = jnp.einsum('hqd,hkd->hqk', q.astype(jnp.float32), k.astype(jnp.float32)) * width**-.5
-    scores = jnp.where(allowed, scores, -jnp.inf)
-    # Define zero output/derivative for rows without keys, without introducing
-    # NaNs into either the forward computation or its autodiff transpose.
-    safe_scores = jnp.where(valid[None, :, None], scores, 0.0)
-    p = jnp.where(allowed, jax.nn.softmax(safe_scores, axis=-1), 0.0)
-    return jnp.einsum('hqk,hkd->hqd', p, v.astype(jnp.float32))
-
-  expected, reference_pullback = jax.vjp(dense, q, k, v)
-  reference_gradients = reference_pullback(do.astype(jnp.float32))
+  expected, reference_gradients = _dense_fp64_reference(q, k, v, do, allowed, width**-.5)
   f32 = lambda x: np.asarray(x, dtype=np.float32)
   assert np.all(np.isfinite(f32(out)))
   np.testing.assert_array_equal(f32(out)[:, ~valid], 0)
@@ -138,7 +146,9 @@ def test_skipped_rows_keep_sink_mass_without_sink_gradient(interpret, all_empty)
 
 
 @pytest.mark.parametrize('mask_value', [base.DEFAULT_MASK_VALUE, -np.inf])
-def test_native_ring_empty_shards_and_rows(mask_value):
+@pytest.mark.parametrize('use_base2_exp', [False, True])
+@pytest.mark.parametrize('cross_shard', [False, True])
+def test_native_ring_empty_shards_and_rows(mask_value, use_base2_exp, cross_shard):
   if jax.default_backend() != 'tpu' or len(jax.devices()) < 2:
     pytest.skip('Native ring regression requires at least two TPU devices')
   from tokamax._src.ops.experimental.tpu.splash_attention import ring_attention_kernel as ring
@@ -148,11 +158,11 @@ def test_native_ring_empty_shards_and_rows(mask_value):
   mesh = jax.sharding.Mesh(np.asarray(devices), ('ring',))
   spec = jax.sharding.PartitionSpec(None, 'ring', None)
   segment_spec = base.SegmentIds(jax.sharding.PartitionSpec('ring'), jax.sharding.PartitionSpec('ring'))
-  cfg = dataclasses.replace(splash.SplashConfig.get_default(), use_base2_exp=False, softmax_scale=width**-.5)
+  cfg = dataclasses.replace(splash.SplashConfig.get_default(), use_base2_exp=use_base2_exp, softmax_scale=width**-.5)
   kernel = ring.make_ring_attention(
       masks.FullMask((n, n)), is_mqa=False, ring_axis='ring',
       config=cfg, q_seq_shards=size, kv_seq_shards=size, mask_value=mask_value)
-  ids = jnp.arange(n) // 128
+  ids = jnp.arange(n) % 2 if cross_shard else jnp.arange(n) // 128
   segments = base.SegmentIds(ids.at[-16:].set(99), ids)
   allowed = np.asarray(segments.q)[:, None] == np.asarray(segments.kv)[None, :]
   valid = allowed.any(-1)
@@ -168,17 +178,28 @@ def test_native_ring_empty_shards_and_rows(mask_value):
     out, pb = jax.vjp(forward, q, k, v)
     return out, pb(do)
   out, grads = jax.jit(both)(q, k, v, do)
-  def dense(q, k, v):
-    scores = jnp.einsum('hqd,hkd->hqk', q.astype(jnp.float32), k.astype(jnp.float32)) * width**-.5
-    scores = jnp.where(allowed, scores, -jnp.inf)
-    safe = jnp.where(valid[None, :, None], scores, 0.0)
-    p = jnp.where(allowed, jax.nn.softmax(safe, axis=-1), 0.0)
-    return jnp.einsum('hqk,hkd->hqd', p, v.astype(jnp.float32))
-  expected, pb = jax.vjp(dense, q, k, v)
-  ref_grads = pb(do.astype(jnp.float32))
+  expected, ref_grads = _dense_fp64_reference(q, k, v, do, allowed, width**-.5)
   f32 = lambda x: np.asarray(x, dtype=np.float32)
   np.testing.assert_array_equal(f32(out)[:, ~valid], 0)
   np.testing.assert_array_equal(f32(grads[0])[:, ~valid], 0)
   for actual, ref in zip((out, *grads), (expected, *ref_grads)):
     assert np.all(np.isfinite(f32(actual)))
     np.testing.assert_allclose(f32(actual), f32(ref), atol=2e-3, rtol=3e-2)
+
+
+@pytest.mark.parametrize('value', [0.0, -1.0, -10000.0, np.inf, np.nan])
+def test_custom_mask_value_is_rejected(value):
+  from tokamax._src.ops.experimental.tpu.splash_attention import ring_attention_kernel as ring
+  mask = masks.FullMask((128, 128))
+  with pytest.raises(ValueError, match='mask_value must be'):
+    splash.make_splash_mha_single_device(mask, mask_value=value)
+  with pytest.raises(ValueError, match='mask_value must be'):
+    ring.make_ring_attention(mask, is_mqa=False, ring_axis='ring', mask_value=value)
+
+
+def test_legacy_mask_value_normalizes_before_static_cache_key():
+  mask = masks.FullMask((128, 128))
+  with pytest.warns(DeprecationWarning, match='finite DEFAULT_MASK_VALUE'):
+    legacy = splash.make_splash_mha_single_device(mask, mask_value=base.DEFAULT_MASK_VALUE)
+  modern = splash.make_splash_mha_single_device(mask)
+  assert legacy.kwargs['mask_value'] == modern.kwargs['mask_value'] == -np.inf

@@ -21,6 +21,7 @@ import enum
 import functools
 import json
 import math
+import warnings
 from typing import Any, NamedTuple
 
 import jax
@@ -2553,17 +2554,35 @@ class SplashAttentionKernel:
     )
 
 
+def _canonical_mask_value(mask_value: float) -> float:
+  """Deprecated sentinel compatibility; masked positions always have zero mass."""
+  if mask_value == -np.inf:
+    return -np.inf
+  if mask_value == base.DEFAULT_MASK_VALUE:
+    warnings.warn(
+        "The finite DEFAULT_MASK_VALUE sentinel is deprecated; masked logits "
+        "are always -inf. Omit mask_value or pass -np.inf.",
+        DeprecationWarning, stacklevel=3,
+    )
+    return -np.inf
+  raise ValueError("mask_value must be -inf (or the deprecated DEFAULT_MASK_VALUE); "
+                   "custom finite sentinels are no longer supported")
+
+
 def _make_splash_attention(
     mask: np.ndarray | mask_lib.Mask,
     *,
     config: SplashConfig | None = None,
     is_mqa: bool,
     save_residuals: bool = False,
-    mask_value: float = base.DEFAULT_MASK_VALUE,
+    mask_value: float = -np.inf,
     downcast_smem_data: bool = True,
     partial_mask_blocks_dtype: jax.typing.DTypeLike = np.int8,
     q_seq_shards: int,
 ):
+
+  """Build exact-zero masking; custom finite mask_value is unsupported."""
+  mask_value = _canonical_mask_value(mask_value)
   if len(mask.shape) != 2:
     raise ValueError(f"Unexpected mask shape: {mask.shape}")
 
@@ -2631,10 +2650,13 @@ def _make_dynamic_splash_attention(
     config: SplashConfig | None = None,
     is_mqa: bool,
     save_residuals: bool = False,
-    mask_value: float = base.DEFAULT_MASK_VALUE,
+    mask_value: float = -np.inf,
     downcast_smem_data: bool = True,
     partial_mask_blocks_dtype: jax.typing.DTypeLike = np.int8,
 ):
+
+  """Build exact-zero masking; custom finite mask_value is unsupported."""
+  mask_value = _canonical_mask_value(mask_value)
   if (mesh is not None) != (mask_spec is not None):
     raise ValueError(
         "Either both or neither of mesh and mask_spec must be specified."
