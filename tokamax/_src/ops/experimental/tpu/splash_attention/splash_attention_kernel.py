@@ -1434,7 +1434,10 @@ def _flash_attention_dq_kernel(
         dp_dims,
         preferred_element_type=jnp.float32,
     )
-    ds = (dp - di) * p
+    # Mask before multiplying: dP may overflow on disallowed Q/K pairs even
+    # when the output and exact gradients are finite. Inf * 0 would be NaN.
+    # Non-finite values on nonzero-probability pairs must still propagate.
+    ds = jnp.where(p == 0, 0.0, dp - di) * p
     if attn_logits_soft_cap is not None:
       normalized = qk_uncapped / attn_logits_soft_cap
       d = jnp.tanh(normalized)
@@ -1652,7 +1655,10 @@ def _flash_attention_dkv_kernel(
       scratch_ref[slice_k, :] = dv
 
     dp = compute_dp()
-    ds = (dp - di) * p
+    # Mask before multiplying: dP may overflow on disallowed Q/K pairs even
+    # when the output and exact gradients are finite. Inf * 0 would be NaN.
+    # Non-finite values on nonzero-probability pairs must still propagate.
+    ds = jnp.where(p == 0, 0.0, dp - di) * p
     if attn_logits_soft_cap is not None:
       normalized = qk_uncapped / attn_logits_soft_cap
       d = jnp.tanh(normalized)
