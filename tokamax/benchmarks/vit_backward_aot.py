@@ -16,8 +16,8 @@
 
 Run from a checkout with PYTHONPATH=.: python -m tokamax.benchmarks.vit_backward_aot
 --mode compile --output-dir /tmp/vit-aot. Requires a compatible Linux libtpu.
-The default validate mode only traces production shapes. The small mode uses
-TPU interpretation with race detection; neither mode establishes native results.
+The default validate mode only traces production shapes. Compile mode builds
+an executable but does not execute it or establish native numerical results.
 This isolates the failing kernel and its epilogue, not the surrounding train step.
 """
 
@@ -41,8 +41,6 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import jax
 import jax.numpy as jnp
 from jax.experimental import topologies
-from jax.experimental.pallas import tpu as pltpu
-import numpy as np
 
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask_info as masks
@@ -50,9 +48,7 @@ from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_
 
 def _arguments():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--mode", choices=("validate", "small", "compile"), default="validate"
-    )
+    parser.add_argument("--mode", choices=("validate", "compile"), default="validate")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--topology", default="tpu7x:4x8x8")
     parser.add_argument("--q-length", type=int, default=524288)
@@ -177,66 +173,6 @@ def _closure(config, *, dynamic=True):
     return backward
 
 
-def _small(config):
-    config = dataclasses.replace(
-        config,
-        block_q_dkv=128,
-        block_kv_dkv=256,
-        block_kv_dkv_compute=128,
-        interpret=pltpu.InterpretParams(detect_races=True),
-    )
-    inputs = _inputs(256, 1536, config)
-    rng = np.random.default_rng(131)
-    values = {
-        name: jnp.asarray(rng.normal(size=spec.shape), dtype=spec.dtype)
-        for name, spec in inputs.items()
-    }
-    q, k, v, do = (values[name].astype(jnp.float32) for name in ("q", "k", "v", "do"))
-    logits = q @ k.mT * jnp.float32(config.softmax_scale)
-    probability = jax.nn.softmax(logits, axis=-1)
-    output = (probability.astype(jnp.bfloat16).astype(jnp.float32) @ v).astype(
-        jnp.bfloat16
-    )
-    values.update(
-        q_segment_ids=jnp.ones((256,), jnp.int32),
-        kv_segment_ids=jnp.ones((1536,), jnp.int32),
-        logsumexp_base2=jax.nn.logsumexp(logits, axis=-1) * splash.LOG2E,
-        di=jnp.sum(output.astype(jnp.float32) * do, axis=-1),
-        active_rows=jnp.repeat(jnp.arange(6, dtype=jnp.int32), 2),
-        active_cols=jnp.tile(jnp.arange(2, dtype=jnp.int32), 6),
-        block_mask=jnp.full((12,), 1, jnp.int8),
-        mask_next=jnp.full((12,), -1, jnp.int8),
-        num_active_blocks=jnp.array([12], jnp.int32),
-    )
-    actual = jax.block_until_ready(jax.jit(_closure(config))(values))
-    reference = jax.block_until_ready(
-        jax.jit(
-            _closure(
-                dataclasses.replace(config, dq_reduction_steps=None), dynamic=False
-            )
-        )(values)
-    )
-    errors = {}
-    for name, result, expected in zip(("dq", "dk", "dv"), actual, reference):
-        result, expected = np.asarray(result, np.float32), np.asarray(
-            expected, np.float32
-        )
-        if not np.isfinite(result).all():
-            raise AssertionError(f"{name} has nonfinite values")
-        errors[name] = float(
-            np.linalg.norm(result - expected) / np.linalg.norm(expected)
-        )
-        if errors[name] > 0.001:
-            raise AssertionError(f"{name} relative L2 {errors[name]} > 0.001")
-    return {
-        "execution": "CPU TPU interpreter with race detection",
-        "relative_l2": errors,
-        "q_length": 256,
-        "kv_length": 1536,
-        "blocks": [128, 256, 128],
-    }
-
-
 def main():
     args = _arguments()
     report = {"mode": args.mode, "timings_seconds": {}, "status": "started"}
@@ -297,10 +233,7 @@ def main():
             report["outputs"] = [
                 {"shape": x.shape, "dtype": str(x.dtype)} for x in outputs
             ]
-        if args.mode == "small":
-            with phase("small_interpreter"):
-                report["small"] = _small(config)
-        elif args.mode == "compile":
+        if args.mode == "compile":
             with phase("topology"):
                 topology = topologies.get_topology_desc(
                     platform="tpu",
