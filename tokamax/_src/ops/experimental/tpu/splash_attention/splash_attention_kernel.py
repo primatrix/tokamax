@@ -1519,6 +1519,7 @@ def _flash_attention_dkv_kernel(
 ):
   del mask_next_ref, active_cols_ref
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
+  dq_seq_minor = native_layout or config.vl_gpu_numerics_alignment
   attn_logits_soft_cap = config.attn_logits_soft_cap
   if attn_logits_soft_cap is not None and config.use_base2_exp:
     attn_logits_soft_cap *= LOG2E
@@ -1731,9 +1732,10 @@ def _flash_attention_dkv_kernel(
         dq *= jnp.float32(config.softmax_scale)
       if dq_scratch_ref is not None:
         # Compute block size != memory block size
-        scratch_update = dq.T if native_layout else dq
+        scratch_update = dq.T if dq_seq_minor else dq
         dq_scratch_ref[...] += scratch_update
       else:
+        dq = dq.T if dq_seq_minor else dq
         if dq_alias is not None:
           dq_ref[...] = dq_alias[...] + dq.astype(dq_ref.dtype)
         else:
@@ -2056,10 +2058,9 @@ def _splash_attention_bwd_dkv(
     dq_reduction_steps = None
 
   dq = dq_alias_spec = None
-  dq_layout = (
-      QKVLayout.SEQ_MINOR if native_layout
-      else QKVLayout.HEAD_DIM_MINOR
-  )
+  # Avoid padding the large aligned FP32 partial buffer along the head dim.
+  dq_seq_minor = native_layout or config.vl_gpu_numerics_alignment
+  dq_layout = QKVLayout.SEQ_MINOR if dq_seq_minor else QKVLayout.HEAD_DIM_MINOR
   dq_block_shape = (None, None, *from_head_minor((bq, head_dim_qk), dq_layout))
   dq_output_shape = from_head_minor(q.shape, dq_layout)
   if dq_reduction_steps == 3:
@@ -2097,11 +2098,7 @@ def _splash_attention_bwd_dkv(
     dq_scratch = None
   else:
     dq_scratch = pltpu.VMEM(
-        (
-            (head_dim_qk, bq)
-            if native_layout
-            else (bq, head_dim_qk)
-        ),
+        ((head_dim_qk, bq) if dq_seq_minor else (bq, head_dim_qk)),
         jnp.float32,
     )
 
@@ -2350,6 +2347,9 @@ def _splash_attention_bwd_dkv(
         metadata=metadata,
     )(*args, dq, dk, dv)
   with jax.named_scope("splash_bwd_epilogue"):
+    if config.vl_gpu_numerics_alignment and not native_layout:
+      # Restore the original logical reduction shape before the FP32 SUM.
+      dq_unreduced = dq_unreduced.mT
     dq = dq_unreduced.sum(axis=0)
     if config.vl_gpu_numerics_alignment:
       dq *= jnp.float32(config.softmax_scale)
