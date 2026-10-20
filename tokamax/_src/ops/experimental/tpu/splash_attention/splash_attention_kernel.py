@@ -1642,7 +1642,9 @@ def _flash_attention_dkv_kernel(
         k_in_lanes=False,
         mask_function=mask_function,
         has_partial_mask=has_partial_mask,
-        kv_segment_ids_seq_minor=native_layout,
+        kv_segment_ids_seq_minor=(
+            native_layout or config.vl_gpu_numerics_alignment
+        ),
     )
     exp = jnp.exp2 if config.use_base2_exp else jnp.exp
     # A backward tile can mix empty and nonempty forward rows. Empty rows
@@ -1958,8 +1960,15 @@ def _splash_attention_bwd_dkv(
         1 if native_layout else NUM_SUBLANES, 0, unravel,
     )
     kv_segment_spec, kv_segment_ids = _group_segment_spec(
-        segment_ids.kv, num_q_heads, bkv, native_layout,
-        1 if native_layout else NUM_LANES, 1, unravel,
+        segment_ids.kv,
+        num_q_heads,
+        bkv,
+        native_layout or config.vl_gpu_numerics_alignment,
+        1
+        if native_layout
+        else (NUM_SUBLANES if config.vl_gpu_numerics_alignment else NUM_LANES),
+        1,
+        unravel,
     )
   elif segment_ids is not None:
     kv_segment_ids_index_map = unravel(lambda h, i, j: (j, 0))
@@ -1973,18 +1982,26 @@ def _splash_attention_bwd_dkv(
       q_segment_ids = segment_ids.q[None, :]
       kv_segment_ids = segment_ids.kv[None, :]
     else:
-      q_segment_spec = pl.BlockSpec(
-          (NUM_SUBLANES, bq), q_segment_ids_index_map
-      )
-      kv_segment_spec = pl.BlockSpec(
-          (bkv, NUM_LANES), kv_segment_ids_index_map
-      )
+      q_segment_spec = pl.BlockSpec((NUM_SUBLANES, bq), q_segment_ids_index_map)
       q_segment_ids = jax.lax.broadcast_in_dim(
           segment_ids.q, (NUM_SUBLANES, q_seq_len), (1,)
       )
-      kv_segment_ids = jax.lax.broadcast_in_dim(
-          segment_ids.kv, (kv_seq_len, NUM_LANES), (0,)
-      )
+      if config.vl_gpu_numerics_alignment:
+        # KV IDs are identical across the replicated dimension. Store them
+        # sequence-minor to avoid a bkv-by-128 double-buffered DMA window.
+        kv_segment_spec = pl.BlockSpec(
+            (NUM_SUBLANES, bkv), unravel(lambda h, i, j: (0, j))
+        )
+        kv_segment_ids = jax.lax.broadcast_in_dim(
+            segment_ids.kv, (NUM_SUBLANES, kv_seq_len), (1,)
+        )
+      else:
+        kv_segment_spec = pl.BlockSpec(
+            (bkv, NUM_LANES), kv_segment_ids_index_map
+        )
+        kv_segment_ids = jax.lax.broadcast_in_dim(
+            segment_ids.kv, (kv_seq_len, NUM_LANES), (0,)
+        )
   else:
     q_segment_spec = kv_segment_spec = None
     q_segment_ids = kv_segment_ids = None

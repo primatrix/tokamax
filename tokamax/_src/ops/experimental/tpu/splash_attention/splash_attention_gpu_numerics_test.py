@@ -176,3 +176,57 @@ def test_aligned_sparse_grid_keeps_inactive_dq_partials_zero():
       jax.tree.leaves(results[0]), jax.tree.leaves(results[1])
   ):
     np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("grouped_ids", [False, True])
+def test_aligned_compact_segment_ids_preserve_masks_and_all_gradients(
+    grouped_ids,
+):
+  keys = jax.random.split(jax.random.key(51), 4)
+  q = jax.random.normal(keys[0], (2, 256, 72), jnp.bfloat16) * 0.25
+  k = jax.random.normal(keys[1], (2, 1024, 72), jnp.bfloat16) * 0.25
+  v = jax.random.normal(keys[2], k.shape, jnp.bfloat16)
+  do = jax.random.normal(keys[3], q.shape, jnp.bfloat16)
+  q_ids = np.repeat([1, 2], [128, 128]).astype(np.int32)
+  kv_ids = np.repeat([1, 2, 0], [384, 512, 128]).astype(np.int32)
+  if grouped_ids:
+    q_ids = np.stack([q_ids, q_ids])
+    kv_ids = np.stack([kv_ids, np.where(kv_ids > 0, 3 - kv_ids, 0)])
+  segment_ids = splash.base.SegmentIds(jnp.asarray(q_ids), jnp.asarray(kv_ids))
+  config = splash.SplashConfig(
+      block_q=128,
+      block_kv=256,
+      block_kv_compute=128,
+      block_q_dkv=128,
+      block_kv_dkv=256,
+      block_kv_dkv_compute=128,
+      softmax_scale=72**-0.5,
+      vl_gpu_numerics_alignment=True,
+      bwd_scale_after_dot=True,
+      dq_reduction_steps=3,
+      interpret=True,
+      q_layout=splash.QKVLayout.SEQ_MINOR,
+      k_layout=splash.QKVLayout.SEQ_MINOR,
+      v_layout=splash.QKVLayout.SEQ_MINOR,
+  )
+  kernel = splash.make_splash_mha_single_device(
+      mask_lib.FullMask((256, 1024)), config=config
+  )
+  actual, pullback = jax.vjp(
+      lambda a, b, c: kernel(a, b, c, segment_ids), q, k, v
+  )
+  gradients = pullback(do)
+  for head in range(2):
+    qi = q_ids[head] if grouped_ids else q_ids
+    ki = kv_ids[head] if grouped_ids else kv_ids
+    reference = splash.make_splash_mha_single_device(
+        mask_lib.NumpyMask(qi[:, None] == ki[None, :]), config=config
+    )
+    expected, reference_pullback = jax.vjp(
+        reference, q[head : head + 1], k[head : head + 1], v[head : head + 1]
+    )
+    np.testing.assert_array_equal(actual[head : head + 1], expected)
+    for gradient, target in zip(
+        gradients, reference_pullback(do[head : head + 1])
+    ):
+      np.testing.assert_array_equal(gradient[head : head + 1], target)
