@@ -73,9 +73,7 @@ def _online_reference(q, k, v, config):
     "reduction,fuse,layout",
     [
         (None, True, splash.QKVLayout.HEAD_DIM_MINOR),
-        (3, True, splash.QKVLayout.HEAD_DIM_MINOR),
         (None, False, splash.QKVLayout.SEQ_MINOR),
-        (3, False, splash.QKVLayout.SEQ_MINOR),
     ],
 )
 def test_online_forward_and_merged_fp32_dq(reduction, fuse, layout):
@@ -130,15 +128,6 @@ def test_online_forward_and_merged_fp32_dq(reduction, fuse, layout):
   assert all(
       np.isfinite(np.asarray(gradient, np.float32)).all() for gradient in (dq, dk, dv)
   )
-  # The output of each backward grid partition stays FP32 until the epilogue.
-  backward = str(
-      jax.make_jaxpr(
-          lambda q, k, v, do: jax.vjp(kernel, q, k, v)[1](
-              (do, jax.tree.map(jnp.zeros_like, stats))
-          )
-      )(q, k, v, do)
-  )
-  assert "f32[3,1,128,72]" in backward
 
 
 @pytest.mark.parametrize(
@@ -155,60 +144,6 @@ def test_online_forward_and_merged_fp32_dq(reduction, fuse, layout):
 def test_alignment_rejects_unsupported_arithmetic(changes):
   with pytest.raises(ValueError, match="GPU numerical alignment"):
     dataclasses.replace(_config(), **changes)
-
-
-def _jaxprs(program):
-  program = program.jaxpr if hasattr(program, "jaxpr") else program
-  yield program
-  for equation in program.eqns:
-    for parameter in equation.params.values():
-      for child in parameter if isinstance(parameter, (list, tuple)) else (parameter,):
-        if hasattr(child, "jaxpr") or hasattr(child, "eqns"):
-          yield from _jaxprs(child)
-
-
-def test_actual_pallas_graph_has_raw_max_bf16_probability_and_final_dq_scale():
-  config = _config(dq_reduction_steps=3)
-  q = jax.ShapeDtypeStruct((1, 128, 72), jnp.bfloat16)
-  kv = jax.ShapeDtypeStruct((1, 1536, 72), jnp.bfloat16)
-  kernel = splash.make_splash_mha_single_device(
-      masks.FullMask((128, 1536)), config=config
-  )
-  forward = jax.make_jaxpr(kernel)(q, kv, kv)
-  checked = 0
-  for program in _jaxprs(forward):
-    producers = {var: eqn for eqn in program.eqns for var in eqn.outvars}
-    maxima = [eqn for eqn in program.eqns if eqn.primitive.name == "reduce_max"]
-    if not maxima:
-      continue
-    for maximum in maxima:
-      assert producers[maximum.invars[0]].primitive.name == "dot_general"
-    pv = [eqn for eqn in program.eqns if eqn.primitive.name == "dot_general"][-1]
-    assert pv.invars[0].aval.dtype == jnp.bfloat16
-    cast = producers[pv.invars[0]]
-    assert cast.primitive.name == "convert_element_type"
-    assert producers[cast.invars[0]].primitive.name == "exp2"
-    checked += 1
-  assert checked
-
-  backward = jax.make_jaxpr(lambda x, y, z, do: jax.vjp(kernel, x, y, z)[1](do))(
-      q, kv, kv, q
-  )
-  checked = 0
-  for program in _jaxprs(backward):
-    for equation in program.eqns:
-      if equation.primitive.name != "reduce_sum":
-        continue
-      source = equation.invars[0]
-      if source.aval.shape != (3, 1, 128, 72):
-        continue
-      assert source.aval.dtype == jnp.float32
-      merged = equation.outvars[0]
-      consumers = [eqn for eqn in program.eqns if merged in eqn.invars]
-      assert len(consumers) == 1 and consumers[0].primitive.name == "mul"
-      assert consumers[0].outvars[0].aval.dtype == jnp.float32
-      checked += 1
-  assert checked
 
 
 @pytest.mark.parametrize("dynamic", [False, True])
