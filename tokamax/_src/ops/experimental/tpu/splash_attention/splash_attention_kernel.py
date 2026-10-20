@@ -185,6 +185,8 @@ class SplashConfig:
   dq_reduction_steps: int | None = None
   # Arithmetic reordering may change floating-point rounding.
   combine_log2_scale: bool = False
+  # Match the BF16 ViT arithmetic boundaries without changing other callers.
+  gpu_numerics_alignment: bool = False
   bwd_kv_unroll: bool = True
   bwd_dq_first: bool = False
   bwd_cast_before_transpose: bool = False
@@ -204,6 +206,15 @@ class SplashConfig:
   softmax_scale: float | None = None
 
   def __post_init__(self):
+    if self.gpu_numerics_alignment:
+      if not self.use_base2_exp or not self.combine_log2_scale:
+        raise ValueError("GPU numerical alignment requires combined base-2 scaling")
+      if self.softmax_scale is None or self.softmax_scale <= 0:
+        raise ValueError("GPU numerical alignment requires a positive softmax_scale")
+      if not self.bwd_scale_after_dot:
+        raise ValueError("GPU numerical alignment requires bwd_scale_after_dot")
+      if self.attn_logits_soft_cap is not None or self.max_logit_const is not None:
+        raise ValueError("GPU numerical alignment requires online uncapped softmax")
     if self.block_kv_compute is None:
       object.__setattr__(self, "block_kv_compute", self.block_kv)
     if self.block_kv_dkv_compute is None:
@@ -445,6 +456,10 @@ def flash_attention_kernel(
     should_initialize = j == 0
     should_write = j == kv_steps - 1
 
+  if config.gpu_numerics_alignment and (
+      sinks_ref is not None or max_logit_value_ref is not None
+  ):
+    raise ValueError("GPU numerical alignment does not support sinks or fixed shifts")
   max_logit_estimate = config.max_logit_const  # potentially None
   if max_logit_value_ref is not None:  # already ensures max_logit_const is None
     max_logit_estimate = max_logit_value_ref[0, h]
@@ -463,7 +478,8 @@ def flash_attention_kernel(
         sink *= LOG2E
 
     if sinks_ref is None and max_logit_estimate is None:
-      m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
+      initial_max = -jnp.inf if config.gpu_numerics_alignment else mask_value
+      m_scratch_ref[...] = jnp.full_like(m_scratch_ref, initial_max)
       l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
     elif sinks_ref is None and max_logit_estimate is not None:
       m_scratch_ref[...] = jnp.full_like(m_scratch_ref, max_logit_estimate)
@@ -540,7 +556,7 @@ def flash_attention_kernel(
     else:
       k = k_ref[:, slice_k]
     qk = lax.dot_general(q, k, qk_dims, preferred_element_type=float32)
-    if config.softmax_scale is not None:
+    if config.softmax_scale is not None and not config.gpu_numerics_alignment:
       if config.use_base2_exp and config.combine_log2_scale:
         qk *= jnp.float32(config.softmax_scale * LOG2E)
       else:
@@ -552,7 +568,7 @@ def flash_attention_kernel(
     apply_mask_and_soft_cap = functools.partial(
         _apply_mask_and_soft_cap,
         qk,
-        mask_value,
+        -jnp.inf if config.gpu_numerics_alignment else mask_value,
         mask_ref,
         q_sequence_ref,
         q_segment_ids_ref
@@ -587,7 +603,15 @@ def flash_attention_kernel(
 
     exp = jnp.exp2 if config.use_base2_exp else jnp.exp
     if max_logit_estimate is None:
-      s_curr = exp(qk - jnp.tile(m_next, (1, bkv_repeats)))
+      if config.gpu_numerics_alignment:
+        # Reduce raw QK first, then form the base-2 exponent from scaled operands.
+        scale = jnp.float32(config.softmax_scale * LOG2E)
+        # Empty rows need a finite max operand; their masked logits stay -inf.
+        # A finite mask sentinel can overflow after scaled-subtraction fusion.
+        exponent_max = jnp.where(m_next == -jnp.inf, 0.0, m_next)
+        s_curr = exp(qk * scale - jnp.tile(exponent_max * scale, (1, bkv_repeats)))
+      else:
+        s_curr = exp(qk - jnp.tile(m_next, (1, bkv_repeats)))
     else:
       s_curr = exp(qk - max_logit_estimate)
     assert s_curr.shape == (bq, bkv_compute)
@@ -596,7 +620,12 @@ def flash_attention_kernel(
     assert l_curr.shape == (bq, NUM_LANES)
 
     if max_logit_estimate is None:
-      alpha = exp(m_prev - m_next)
+      delta_max = m_prev - m_next
+      if config.gpu_numerics_alignment:
+        # Two empty prefixes keep their zero accumulators without inf-inf.
+        delta_max = jnp.where(m_prev == m_next, 0.0, delta_max)
+        delta_max *= jnp.float32(config.softmax_scale * LOG2E)
+      alpha = exp(delta_max)
       l_next = l_curr + alpha * l_prev
       m_scratch_ref[...], l_scratch_ref[...] = m_next, l_next
     else:
@@ -610,7 +639,12 @@ def flash_attention_kernel(
       v = v_ref[slice_k, :]
     else:
       v = v_ref[:, slice_k]
-    o_curr = lax.dot_general(s_curr, v, sv_dims)
+    if config.gpu_numerics_alignment:
+      o_curr = lax.dot_general(
+          s_curr.astype(v.dtype), v, sv_dims, preferred_element_type=jnp.float32
+      )
+    else:
+      o_curr = lax.dot_general(s_curr, v, sv_dims)
 
     if max_logit_estimate is None:
       alpha_o = jnp.tile(alpha, (1, head_dim_v_repeats))
@@ -658,6 +692,8 @@ def flash_attention_kernel(
       return
     l = l_scratch_ref[...]
     m = m_scratch_ref[...]
+    if config.gpu_numerics_alignment:
+      m *= jnp.float32(config.softmax_scale * LOG2E)
     if fuse_reciprocal:  # allows fusing reciprocal out of the kernel
       denominator = jnp.where(l == 0, 1.0, l)
       l_inv = jnp.tile(1.0 / denominator, (1, head_dim_v_repeats))
@@ -1681,7 +1717,11 @@ def _flash_attention_dkv_kernel(
             NN_DIM_NUMBERS,
             preferred_element_type=jnp.float32,
         )
-      if config.softmax_scale is not None and config.bwd_scale_after_dot:
+      if (
+          config.softmax_scale is not None
+          and config.bwd_scale_after_dot
+          and not config.gpu_numerics_alignment
+      ):
         dq *= jnp.float32(config.softmax_scale)
       if dq_scratch_ref is not None:
         # Compute block size != memory block size
@@ -2007,7 +2047,8 @@ def _splash_attention_bwd_dkv(
     )
     dq_spec = pl.BlockSpec(dq_block_shape, dq_index_map)
     dq_alias_spec = dq_spec
-    dq_shape = jax.ShapeDtypeStruct((3, *dq_output_shape), q.dtype)
+    dq_dtype = jnp.float32 if config.gpu_numerics_alignment else q.dtype
+    dq_shape = jax.ShapeDtypeStruct((3, *dq_output_shape), dq_dtype)
     dq = jnp.zeros_like(dq_shape)
   else:
     dq_index_map = unravel(
@@ -2015,7 +2056,11 @@ def _splash_attention_bwd_dkv(
     )
     dq_spec = pl.BlockSpec(dq_block_shape, dq_index_map)
     # Only accumulate in fp32 if there's a small number of reduction steps.
-    q_dtype = q.dtype if kv_steps <= 4 else jnp.float32
+    q_dtype = (
+        q.dtype
+        if kv_steps <= 4 and not config.gpu_numerics_alignment
+        else jnp.float32
+    )
     dq_shape = jax.ShapeDtypeStruct((kv_steps, *dq_output_shape), q_dtype)
 
   in_specs += [dq_alias_spec]
@@ -2278,6 +2323,8 @@ def _splash_attention_bwd_dkv(
     )(*args, dq, dk, dv)
   with jax.named_scope("splash_bwd_epilogue"):
     dq = dq_unreduced.sum(axis=0)
+    if config.gpu_numerics_alignment:
+      dq *= jnp.float32(config.softmax_scale)
     dq = dq.astype(q.dtype)
     if native_layout:
       dq = dq.mT
