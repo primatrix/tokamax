@@ -478,7 +478,8 @@ def flash_attention_kernel(
         sink *= LOG2E
 
     if sinks_ref is None and max_logit_estimate is None:
-      m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
+      initial_max = -jnp.inf if config.gpu_numerics_alignment else mask_value
+      m_scratch_ref[...] = jnp.full_like(m_scratch_ref, initial_max)
       l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
     elif sinks_ref is None and max_logit_estimate is not None:
       m_scratch_ref[...] = jnp.full_like(m_scratch_ref, max_logit_estimate)
@@ -567,7 +568,7 @@ def flash_attention_kernel(
     apply_mask_and_soft_cap = functools.partial(
         _apply_mask_and_soft_cap,
         qk,
-        mask_value,
+        -jnp.inf if config.gpu_numerics_alignment else mask_value,
         mask_ref,
         q_sequence_ref,
         q_segment_ids_ref
@@ -605,7 +606,10 @@ def flash_attention_kernel(
       if config.gpu_numerics_alignment:
         # Reduce raw QK first, then form the base-2 exponent from scaled operands.
         scale = jnp.float32(config.softmax_scale * LOG2E)
-        s_curr = exp(qk * scale - jnp.tile(m_next * scale, (1, bkv_repeats)))
+        # Empty rows need a finite max operand; their masked logits stay -inf.
+        # A finite mask sentinel can overflow after scaled-subtraction fusion.
+        exponent_max = jnp.where(m_next == -jnp.inf, 0.0, m_next)
+        s_curr = exp(qk * scale - jnp.tile(exponent_max * scale, (1, bkv_repeats)))
       else:
         s_curr = exp(qk - jnp.tile(m_next, (1, bkv_repeats)))
     else:
@@ -618,6 +622,8 @@ def flash_attention_kernel(
     if max_logit_estimate is None:
       delta_max = m_prev - m_next
       if config.gpu_numerics_alignment:
+        # Two empty prefixes keep their zero accumulators without inf-inf.
+        delta_max = jnp.where(m_prev == m_next, 0.0, delta_max)
         delta_max *= jnp.float32(config.softmax_scale * LOG2E)
       alpha = exp(delta_max)
       l_next = l_curr + alpha * l_prev

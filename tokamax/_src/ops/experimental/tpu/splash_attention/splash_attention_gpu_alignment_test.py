@@ -18,6 +18,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 import numpy as np
 import pytest
 
@@ -208,3 +209,65 @@ def test_actual_pallas_graph_has_raw_max_bf16_probability_and_final_dq_scale():
       assert consumers[0].outvars[0].aval.dtype == jnp.float32
       checked += 1
   assert checked
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("alignment", [False, True])
+@pytest.mark.parametrize(
+    "layout", [splash.QKVLayout.HEAD_DIM_MINOR, splash.QKVLayout.SEQ_MINOR]
+)
+def test_reused_dq_alias_matches_full_reduction(
+    dynamic, alignment, layout, record_property
+):
+  """Exercise six KV tiles with TPU DMA/alias simulation or a native TPU."""
+  native = jax.default_backend() == "tpu"
+  # interpret=True uses the generic HLO interpreter, whose separate input/output
+  # carries do not propagate aliased output writes back to subsequent input reads
+  # (see the IO-aliasing TODO in JAX 0.9.2 hlo_interpreter.py). TPU interpretation
+  # models shared buffers, pipelined DMA and synchronization, and checks races.
+  interpret = False if native else pltpu.InterpretParams(detect_races=True)
+  config = dataclasses.replace(
+      _config(),
+      gpu_numerics_alignment=alignment,
+      interpret=interpret,
+      q_layout=layout,
+      k_layout=layout,
+      v_layout=layout,
+  )
+  keys = jax.random.split(jax.random.key(131), 4)
+  q = jax.random.normal(keys[0], (1, 256, 72), jnp.bfloat16)
+  k = jax.random.normal(keys[1], (1, 1536, 72), jnp.bfloat16)
+  v = jax.random.normal(keys[2], k.shape, jnp.bfloat16)
+  do = jax.random.normal(keys[3], q.shape, jnp.bfloat16)
+  qids = np.where(np.arange(256) >= 224, 3, np.where(np.arange(256) < 96, 1, 2))
+  kids = np.where((np.arange(1536) < 480) | (np.arange(1536) >= 1024), 1, 2)
+  allowed = qids[:, None] == kids[None, :] if dynamic else np.ones((256, 1536), bool)
+  full = splash.make_splash_mha_single_device(masks.NumpyMask(allowed), config=config)
+  if dynamic:
+    reduced = splash.make_dynamic_splash_mha(jnp.asarray(allowed), config=config)
+  else:
+    reduced = splash.make_splash_mha_single_device(
+        masks.NumpyMask(allowed),
+        config=dataclasses.replace(config, dq_reduction_steps=3),
+    )
+  expected, expected_vjp = jax.vjp(full, q, k, v)
+  actual, actual_vjp = jax.vjp(reduced, q, k, v)
+  results = (actual, *actual_vjp(do))
+  references = (expected, *expected_vjp(do))
+  if dynamic and alignment:
+    np.testing.assert_array_equal(np.asarray(results[0][:, 224:], np.float32), 0)
+    np.testing.assert_array_equal(np.asarray(results[1][:, 224:], np.float32), 0)
+  record_property("execution_backend", jax.default_backend())
+  record_property(
+      "kernel_execution", "native_tpu" if native else "tpu_interpret_detect_races"
+  )
+  for name, result, reference in zip(("output", "dq", "dk", "dv"), results, references):
+    result, reference = np.asarray(result, np.float32), np.asarray(
+        reference, np.float32
+    )
+    assert np.isfinite(result).all()
+    relative_l2 = np.linalg.norm(result - reference) / np.linalg.norm(reference)
+    record_property(name + "_relative_l2", float(relative_l2))
+    # Default-off alias buffers retain the existing BF16 partial-write rounding.
+    # Alignment keeps those partials FP32; only the reduction tree then differs.
+    assert relative_l2 < (0.001 if alignment else 0.01), (name, relative_l2)
