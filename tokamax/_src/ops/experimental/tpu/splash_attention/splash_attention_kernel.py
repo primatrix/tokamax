@@ -2064,20 +2064,15 @@ def _splash_attention_bwd_dkv(
   dq_block_shape = (None, None, *from_head_minor((bq, head_dim_qk), dq_layout))
   dq_output_shape = from_head_minor(q.shape, dq_layout)
   if dq_reduction_steps == 3:
-    # The aligned path gives each KV tile an independent FP32 partial. This
-    # avoids cyclic alias feedback and keeps every contribution until the
-    # final SUM/scale, at the cost of kv_steps rather than three HBM slots.
-    partial_count = kv_steps if config.vl_gpu_numerics_alignment else 3
+    # Keep the existing three-slot accumulation; alignment changes its dtype
+    # and final scale, not the number of full-sequence HBM buffers.
     dq_index_map = unravel(
-        lambda h, i, j: from_head_minor(
-            (j if config.vl_gpu_numerics_alignment else j % 3, h, i, 0),
-            dq_layout,
-        )
+        lambda h, i, j: from_head_minor((j % 3, h, i, 0), dq_layout)
     )
     dq_spec = pl.BlockSpec(dq_block_shape, dq_index_map)
     dq_alias_spec = dq_spec
     dq_dtype = jnp.float32 if config.vl_gpu_numerics_alignment else q.dtype
-    dq_shape = jax.ShapeDtypeStruct((partial_count, *dq_output_shape), dq_dtype)
+    dq_shape = jax.ShapeDtypeStruct((3, *dq_output_shape), dq_dtype)
     dq = jnp.zeros_like(dq_shape)
   else:
     dq_index_map = unravel(

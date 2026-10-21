@@ -1,9 +1,14 @@
-"""CPU-interpreted checks for the opt-in GPU ViT arithmetic boundaries."""
+"""CPU TPU-interpreter checks for the opt-in GPU ViT arithmetic boundaries.
+
+The generic HLO interpreter does not propagate I/O aliases between grid points;
+TPU interpretation is required to check the three-slot dQ feedback.
+"""
 
 import dataclasses
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 import numpy as np
 import pytest
 
@@ -19,7 +24,7 @@ def test_aligned_attention_rounds_pv_and_scales_combined_float32_dq(
   keys = jax.random.split(jax.random.key(31), 4)
   q = jax.random.normal(keys[0], (1, 128, 72), jnp.bfloat16) * 0.25
   k, v = [
-      jax.random.normal(key, (1, 1024, 72), jnp.bfloat16) for key in keys[1:3]
+      jax.random.normal(key, (1, 2048, 72), jnp.bfloat16) for key in keys[1:3]
   ]
   k *= 0.25
   do = jax.random.normal(keys[3], q.shape, jnp.bfloat16)
@@ -33,19 +38,21 @@ def test_aligned_attention_rounds_pv_and_scales_combined_float32_dq(
       block_kv_dkv_compute=128,
       softmax_scale=scale,
       use_base2_exp=True,
-      interpret=True,
+      interpret=(
+          True if dq_reduction_steps is None else pltpu.InterpretParams()
+      ),
       vl_gpu_numerics_alignment=True,
       dq_reduction_steps=dq_reduction_steps,
       bwd_scale_after_dot=scale_after_dot,
   )
-  mask = mask_lib.FullMask((128, 1024))
+  mask = mask_lib.FullMask((128, 2048))
   kernel = splash.make_splash_mha_single_device(
       mask, config=config, save_residuals=True
   )
   (output, stats), pullback = jax.vjp(lambda a, b, c: kernel(a, b, c), q, k, v)
   dq, dk, dv = pullback((do, jax.tree.map(jnp.zeros_like, stats)))
 
-  # Replay the declared forward boundary with eight independent 128-key tiles.
+  # Replay the declared forward boundary with sixteen independent 128-key tiles.
   # Denominators consume FP32 P while PV consumes its BF16 buffer value.
   scores = jnp.einsum(
       "hqd,hkd->hqk", q.astype(jnp.float32), k.astype(jnp.float32)
@@ -56,7 +63,7 @@ def test_aligned_attention_rounds_pv_and_scales_combined_float32_dq(
     maximum = jnp.full((1, 128, 1), -jnp.inf)
     denominator = jnp.zeros_like(maximum)
     accumulator = jnp.zeros(q.shape, jnp.float32)
-    for start in range(0, 1024, 128):
+    for start in range(0, 2048, 128):
       score = scores[..., start : start + 128]
       next_maximum = jnp.maximum(maximum, score.max(-1, keepdims=True) * factor)
       alpha = jnp.exp2(maximum - next_maximum)
@@ -113,7 +120,7 @@ def test_aligned_attention_rounds_pv_and_scales_combined_float32_dq(
           k[:, start : start + 128],
           preferred_element_type=jnp.float32,
       )
-      for start in range(0, 1024, 128)
+      for start in range(0, 2048, 128)
   ]
   # Each memory tile sums two compute tiles before the cross-tile FP32 sum.
   expected_dq = (sum(contributions) * jnp.float32(scale)).astype(q.dtype)
@@ -125,10 +132,13 @@ def test_aligned_attention_rounds_pv_and_scales_combined_float32_dq(
   )
   for gradient in (dq, dk, dv):
     assert np.isfinite(np.asarray(gradient, np.float32)).all()
-  remat = jax.checkpoint(lambda a, b, c: kernel(a, b, c)[0])
-  _, remat_pullback = jax.vjp(remat, q, k, v)
-  for actual, recomputed in zip((dq, dk, dv), remat_pullback(do)):
-    np.testing.assert_array_equal(actual, recomputed)
+  # TPU interpretation uses ordered callbacks that remat cannot transform.
+  # Check remat here without alias feedback; the three-slot path also needs AOT.
+  if dq_reduction_steps is None:
+    remat = jax.checkpoint(lambda a, b, c: kernel(a, b, c)[0])
+    _, remat_pullback = jax.vjp(remat, q, k, v)
+    for actual, recomputed in zip((dq, dk, dv), remat_pullback(do)):
+      np.testing.assert_array_equal(actual, recomputed)
 
 
 def test_alignment_rejects_unbound_fixed_shift_and_soft_cap():
@@ -147,11 +157,11 @@ def test_alignment_rejects_unbound_fixed_shift_and_soft_cap():
 def test_aligned_sparse_grid_keeps_inactive_dq_partials_zero():
   keys = jax.random.split(jax.random.key(21), 4)
   q = jax.random.normal(keys[0], (1, 256, 72), jnp.bfloat16) * 0.25
-  k = jax.random.normal(keys[1], (1, 1024, 72), jnp.bfloat16) * 0.25
+  k = jax.random.normal(keys[1], (1, 2048, 72), jnp.bfloat16) * 0.25
   v = jax.random.normal(keys[2], k.shape, jnp.bfloat16)
   do = jax.random.normal(keys[3], q.shape, jnp.bfloat16)
   q_ids = np.repeat([1, 2], [128, 128])
-  kv_ids = np.repeat([1, 2, 0], [384, 512, 128])
+  kv_ids = np.repeat([1, 2, 0], [384, 1408, 256])
   mask = mask_lib.NumpyMask(q_ids[:, None] == kv_ids[None, :])
   config = splash.SplashConfig(
       block_q=128,
@@ -163,7 +173,7 @@ def test_aligned_sparse_grid_keeps_inactive_dq_partials_zero():
       softmax_scale=72**-0.5,
       vl_gpu_numerics_alignment=True,
       bwd_scale_after_dot=True,
-      interpret=True,
+      interpret=pltpu.InterpretParams(),
   )
   results = []
   for reduction in (None, 3):
@@ -184,11 +194,11 @@ def test_aligned_compact_segment_ids_preserve_masks_and_all_gradients(
 ):
   keys = jax.random.split(jax.random.key(51), 4)
   q = jax.random.normal(keys[0], (2, 256, 72), jnp.bfloat16) * 0.25
-  k = jax.random.normal(keys[1], (2, 1024, 72), jnp.bfloat16) * 0.25
+  k = jax.random.normal(keys[1], (2, 2048, 72), jnp.bfloat16) * 0.25
   v = jax.random.normal(keys[2], k.shape, jnp.bfloat16)
   do = jax.random.normal(keys[3], q.shape, jnp.bfloat16)
   q_ids = np.repeat([1, 2], [128, 128]).astype(np.int32)
-  kv_ids = np.repeat([1, 2, 0], [384, 512, 128]).astype(np.int32)
+  kv_ids = np.repeat([1, 2, 0], [384, 1408, 256]).astype(np.int32)
   if grouped_ids:
     q_ids = np.stack([q_ids, q_ids])
     kv_ids = np.stack([kv_ids, np.where(kv_ids > 0, 3 - kv_ids, 0)])
@@ -204,13 +214,13 @@ def test_aligned_compact_segment_ids_preserve_masks_and_all_gradients(
       vl_gpu_numerics_alignment=True,
       bwd_scale_after_dot=True,
       dq_reduction_steps=3,
-      interpret=True,
+      interpret=pltpu.InterpretParams(),
       q_layout=splash.QKVLayout.SEQ_MINOR,
       k_layout=splash.QKVLayout.SEQ_MINOR,
       v_layout=splash.QKVLayout.SEQ_MINOR,
   )
   kernel = splash.make_splash_mha_single_device(
-      mask_lib.FullMask((256, 1024)), config=config
+      mask_lib.FullMask((256, 2048)), config=config
   )
   actual, pullback = jax.vjp(
       lambda a, b, c: kernel(a, b, c, segment_ids), q, k, v
