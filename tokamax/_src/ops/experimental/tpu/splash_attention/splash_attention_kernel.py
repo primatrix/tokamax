@@ -2681,3 +2681,16 @@ make_splash_mqa_single_device = partial(make_splash_mqa, q_seq_shards=1)
 
 make_dynamic_splash_mqa = partial(_make_dynamic_splash_attention, is_mqa=True)
 make_dynamic_splash_mha = partial(_make_dynamic_splash_attention, is_mqa=False)
+
+
+def make_splash_mha_a2a(config, mesh):
+  """Build the CP8 Splash forward with head-overlapped Ulysses A2A.
+
+  The implementation lives beside this module so the native Splash entry
+  points remain unchanged.  This lazy import avoids adding the transport
+  dependency to the ordinary Splash path.
+  """
+  from tokamax._src.ops.experimental.tpu.splash_attention import (  # pylint: disable=g-import-not-at-top
+      splash_attention_a2a_kernel,
+  )
+  return splash_attention_a2a_kernel.build(config, mesh)
