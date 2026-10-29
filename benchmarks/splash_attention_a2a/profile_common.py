@@ -52,7 +52,9 @@ def array_sha(value):
   rows = []
   for leaf in jax.tree_util.tree_leaves(value):
     for shard in getattr(leaf, "addressable_shards", ()):
-      raw = np.asarray(shard.data).view(np.uint8)
+      # Gradient shards can be strided views; hash the row-major bytes. This
+      # is a no-op for contiguous arrays, so earlier hashes stay comparable.
+      raw = np.ascontiguousarray(np.asarray(shard.data)).view(np.uint8)
       rows.append({"device": shard.device.id, "index": str(shard.index),
                    "sha256": hashlib.sha256(raw).hexdigest()})
   return rows
