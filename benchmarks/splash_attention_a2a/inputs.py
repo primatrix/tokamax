@@ -14,9 +14,24 @@ FIXED_IDS_SHA256 = (
 )
 
 
+# Precision fixtures: back-to-back segments of a fixed length, chosen just
+# below a tile size so segment boundaries land inside tiles at every offset.
+# The production config has block_q == block_kv == 2048 and
+# block_kv_compute == 512.
+SHORT_SEGMENT_LENGTHS = {
+    "seg_lt_bq": 2047,
+    "seg_lt_bkv": 1023,
+    "seg_lt_bkv_compute": 511,
+}
+MODES = ("multimodal", "single", *SHORT_SEGMENT_LENGTHS)
+
+
 def make_segment_ids(n: int, mode: str = "multimodal") -> np.ndarray:
   if mode == "single":
     return np.ones(n, dtype=np.int32)
+  if mode in SHORT_SEGMENT_LENGTHS:
+    length = SHORT_SEGMENT_LENGTHS[mode]
+    return (np.arange(n, dtype=np.int32) // length + 1).astype(np.int32)
   if mode != "multimodal" or n != 262144:
     raise ValueError("only CP8 production multimodal and single fixtures are supported")
   ids = np.zeros(n, dtype=np.int32)

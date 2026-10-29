@@ -22,8 +22,8 @@ def main() -> None:
   parser = argparse.ArgumentParser()
   parser.add_argument("--out", type=Path, required=True)
   parser.add_argument("--cp", type=int, default=8)
-  parser.add_argument("--mode", default="multimodal",
-                      choices=("multimodal", "single"))
+  from inputs import MODES
+  parser.add_argument("--mode", default="multimodal", choices=MODES)
   parser.add_argument("--global-heads", type=int, default=64)
   parser.add_argument("--compile-only", action="store_true")
   args = parser.parse_args()
