@@ -43,6 +43,14 @@ def build(config: dict[str, Any], mesh):
     raise ValueError("global_heads must equal cp_size * local heads")
   if config.get("tokens") != N:
     raise ValueError("compute-only diagnostic requires N=262144")
+  # For the one-head isolation probe, use the same outer pallas grid as native
+  # Splash.  This intentionally bypasses the nested emit_pipeline wrapper;
+  # the multi-head path remains unchanged for comparison with the A2A shape.
+  if h_local == 1:
+    from tokamax._src.ops.experimental.tpu.splash_attention import (
+        splash_attention_direct_body_kernel,
+    )
+    return splash_attention_direct_body_kernel.build(config, mesh)
   splash_values = config.get("splash", {})
   if tuple(splash_values.get(x) for x in
            ("block_q", "block_kv", "block_kv_compute")) != (

@@ -77,8 +77,13 @@ def extract_optimized(trace_dir: Path, name_hint: str | None = None):
   for row in rows:
     per_plane.setdefault(row["plane"], []).append(row)
   result = {"kind": "optimized", "planes": {}, "raw_xla_ops": rows}
-  hints = tuple(x for x in (name_hint, "v7a_step_c_head_overlap_a2a_splash512",
-                            "splash_mha_a2a") if x)
+  hints = tuple(x for x in (
+      name_hint,
+      "v7a_step_c_head_overlap_a2a_splash512",
+      "splash_mha_a2a",
+      "splash_mha_compute_only",
+      "splash_mha_direct_body_compute_only",
+  ) if x)
   for plane, events in per_plane.items():
     matches = [x for x in events if any(h in x["name"] for h in hints)]
     if len(matches) != 1:
