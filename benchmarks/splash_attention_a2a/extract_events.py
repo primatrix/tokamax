@@ -102,6 +102,8 @@ def extract_optimized(trace_dir: Path, name_hint: str | None = None):
 
 def main(kind: str):
   parser = argparse.ArgumentParser()
+  parser.add_argument("--kind", choices=("baseline", "optimized"),
+                       default=kind)
   parser.add_argument("--trace-dir", type=Path, required=True)
   parser.add_argument("--out", type=Path, required=True)
   parser.add_argument("--name-hint")
@@ -110,3 +112,11 @@ def main(kind: str):
             else extract_optimized(args.trace_dir, args.name_hint))
   args.out.write_text(json.dumps(result, indent=2) + "\n")
   print(json.dumps({k: v for k, v in result.items() if k not in ("raw_xla_ops", "planes")}, indent=2))
+
+
+if __name__ == "__main__":
+  parser = argparse.ArgumentParser(add_help=False)
+  parser.add_argument("--kind", choices=("baseline", "optimized"),
+                      default="optimized")
+  args, _ = parser.parse_known_args()
+  main(args.kind)
