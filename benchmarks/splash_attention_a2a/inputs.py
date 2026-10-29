@@ -61,3 +61,16 @@ def make_replicated_ids(jax, np_module, ids, sharding):
       jax.device_put(np_module.broadcast_to(np_module.arange(n, dtype=np.int32)[:, None],
                                             (n, 128)), sharding),
   )
+
+
+def make_compute_only_arrays(jax, specs, sharding):
+  """Create complete local-head inputs for the DMA-free timing diagnostic."""
+  arrays = []
+  for operand, spec in enumerate(specs):
+    shape = tuple(spec.shape)
+    rng = np.random.default_rng(np.random.SeedSequence([20261029, operand]))
+    values = (rng.random(shape, dtype=np.float32) * 2 - 1).astype(
+        ml_dtypes.bfloat16
+    )
+    arrays.append(jax.device_put(values, sharding))
+  return tuple(arrays)
