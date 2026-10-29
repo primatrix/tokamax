@@ -41,8 +41,8 @@ def main():
   in_specs = (P(None, None, None),) * 3 + (P(None),)
   out_specs = (
       P(None, None, None),
-      {"logsumexp": P(None, None, None),
-       "max_logits": P(None, None, None)},
+      {"logsumexp": P(None, None),
+       "max_logits": P(None, None)},
   )
 
   @jax.shard_map(mesh=mesh, in_specs=in_specs, out_specs=out_specs,
