@@ -108,7 +108,6 @@ def build(config: dict[str, Any], mesh):
       ),
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=(),
-          vmem_limit_bytes=32 * 1024 * 1024,
       ),
       name="splash_mha_compute_only",
   )
