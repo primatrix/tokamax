@@ -413,6 +413,9 @@ def flash_attention_kernel(
     fuse_reciprocal: bool,  # config.fuse_reciprocal or not save_residuals
     config: SplashConfig,
     native_layout: bool = False,
+    grid_idx_override: jax.Array | None = None,
+    head_idx_override: jax.Array | None = None,
+    num_heads_override: int | None = None,
 ):
   del mask_next_ref, active_rows_ref
   float32 = jnp.float32
@@ -425,12 +428,13 @@ def flash_attention_kernel(
   # padded to that multiple with zeros.
   head_dim_v_repeats = pl.cdiv(head_dim_v, NUM_LANES)
 
-  grid_idx = pl.program_id(1)
-  h = pl.program_id(0)
+  grid_idx = pl.program_id(1) if grid_idx_override is None else grid_idx_override
+  h = pl.program_id(0) if head_idx_override is None else head_idx_override
+  num_heads = pl.num_programs(0) if num_heads_override is None else num_heads_override
 
   should_run = True
   if block_mask_ref is not None:
-    kind = _block_mask_value(block_mask_ref, grid_idx, h, pl.num_programs(0))
+    kind = _block_mask_value(block_mask_ref, grid_idx, h, num_heads)
     should_not_mask = kind != 1
     if block_mask_ref.ndim == 2:
       # A union tile can be inactive for this head group. Initialization and
