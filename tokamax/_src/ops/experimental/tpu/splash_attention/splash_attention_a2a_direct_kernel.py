@@ -3,9 +3,9 @@
 The head-level A2A schedule is the accepted Step-C schedule.  Unlike the
 older candidate, the active-block loop is explicit inside this pallas call;
 each block is loaded into VMEM and invokes the pinned Splash body with an
-explicit grid index.  This is a structural probe, not yet a performance
-candidate: tile DMA is intentionally synchronous until the no-emit shape is
-validated by AOT.
+explicit grid index.  Input tiles are double-buffered (block g+1 is prefetched
+while block g computes) and output tiles are double-buffered (a finished row is
+written back to HBM while the next row computes).
 """
 
 from __future__ import annotations
@@ -46,51 +46,105 @@ from tokamax._src.ops.experimental.tpu.splash_attention.splash_attention_a2a_ker
 )
 
 
+def _in_copies(h, g, slot, *, qref, kref, vref, qid_ref, kvid_ref, qseq_ref,
+               active_rows_ref, active_cols_ref, q_tile, k_tile, v_tile,
+               qid_tile, kvid_tile, qseq_tile, in_sem):
+  """DMA descriptors that load active block ``g`` of head ``h`` into ``slot``."""
+  q_block = active_rows_ref[g] * BQ
+  k_block = active_cols_ref[g] * BKV
+  return (
+      pltpu.make_async_copy(
+          qref.at[pl.ds(h * QK, QK), pl.ds(q_block, BQ)],
+          q_tile.at[slot], in_sem.at[slot, 0]),
+      pltpu.make_async_copy(
+          kref.at[pl.ds(h * QK, QK), pl.ds(k_block, BKV)],
+          k_tile.at[slot], in_sem.at[slot, 1]),
+      pltpu.make_async_copy(
+          vref.at[pl.ds(h * N + k_block, BKV), :],
+          v_tile.at[slot], in_sem.at[slot, 2]),
+      pltpu.make_async_copy(
+          qid_ref.at[pl.ds(q_block, BQ), :], qid_tile.at[slot],
+          in_sem.at[slot, 3]),
+      pltpu.make_async_copy(
+          kvid_ref.at[:, pl.ds(k_block, BKV)], kvid_tile.at[slot],
+          in_sem.at[slot, 4]),
+      pltpu.make_async_copy(
+          qseq_ref.at[pl.ds(q_block, BQ), :], qseq_tile.at[slot],
+          in_sem.at[slot, 5]),
+  )
+
+
+def _out_copies(h, q_block, slot, *, ofull, lse, max_logits,
+                o_tile, lse_tile, max_tile, out_sem):
+  """DMA descriptors that write one finished q row from ``slot`` to HBM."""
+  return (
+      pltpu.make_async_copy(
+          o_tile.at[slot], ofull.at[pl.ds(h * N + q_block, BQ), :],
+          out_sem.at[slot, 0]),
+      pltpu.make_async_copy(
+          lse_tile.at[slot], lse.at[pl.ds(h * N + q_block, BQ), :],
+          out_sem.at[slot, 1]),
+      pltpu.make_async_copy(
+          max_tile.at[slot], max_logits.at[pl.ds(h * N + q_block, BQ), :],
+          out_sem.at[slot, 2]),
+  )
+
+
 def _direct_head_loop(
     h, *, rank, qref, kref, vref, qid_ref, kvid_ref, qseq_ref,
     ofull, lse, max_logits, active_rows_ref, active_cols_ref,
     mask_next_ref, bounds_start_ref, bounds_end_ref, block_mask_ref,
     m_scratch, l_scratch, o_scratch,
-    q_tile, k_tile, v_tile, qid_tile, kvid_tile, qseq_tile, tile_sem,
-    o_tile, lse_tile, max_tile,
+    q_tile, k_tile, v_tile, qid_tile, kvid_tile, qseq_tile, in_sem,
+    o_tile, lse_tile, max_tile, out_sem,
     splash_kwargs,
 ):
-  """Run one head's active blocks without a nested pipeline."""
+  """Run one head's active blocks with double-buffered input/output DMA."""
+  del rank
   active_count = active_rows_ref.shape[0]
+  in_kw = dict(qref=qref, kref=kref, vref=vref, qid_ref=qid_ref,
+               kvid_ref=kvid_ref, qseq_ref=qseq_ref,
+               active_rows_ref=active_rows_ref,
+               active_cols_ref=active_cols_ref, q_tile=q_tile, k_tile=k_tile,
+               v_tile=v_tile, qid_tile=qid_tile, kvid_tile=kvid_tile,
+               qseq_tile=qseq_tile, in_sem=in_sem)
+  out_kw = dict(ofull=ofull, lse=lse, max_logits=max_logits, o_tile=o_tile,
+                lse_tile=lse_tile, max_tile=max_tile, out_sem=out_sem)
 
-  def body(grid_idx, _):
-    q_block = active_rows_ref[grid_idx] * BQ
-    k_block = active_cols_ref[grid_idx] * BKV
-    # Load the same physical tiles that the old BlockSpec/emit_pipeline path
-    # supplied.  A single slot is deliberate for this structural probe.
-    copies = (
-        pltpu.make_async_copy(
-            qref.at[pl.ds(h * QK, QK), pl.ds(q_block, BQ)],
-            q_tile, tile_sem.at[0]),
-        pltpu.make_async_copy(
-            kref.at[pl.ds(h * QK, QK), pl.ds(k_block, BKV)],
-            k_tile, tile_sem.at[1]),
-        pltpu.make_async_copy(
-            vref.at[pl.ds(h * N + k_block, BKV), :],
-            v_tile, tile_sem.at[2]),
-        pltpu.make_async_copy(
-            qid_ref.at[pl.ds(q_block, BQ), :], qid_tile, tile_sem.at[3]),
-        pltpu.make_async_copy(
-            kvid_ref.at[:, pl.ds(k_block, BKV)], kvid_tile, tile_sem.at[4]),
-        pltpu.make_async_copy(
-            qseq_ref.at[pl.ds(q_block, BQ), :], qseq_tile, tile_sem.at[5]),
-    )
-    for copy in copies:
-      copy.start()
-    for copy in copies:
+  # Prologue: block 0 goes to input slot 0.
+  for copy in _in_copies(h, 0, 0, **in_kw):
+    copy.start()
+
+  def body(grid_idx, out_count):
+    slot = grid_idx % 2
+
+    # Prefetch block g+1 into the other slot; that slot's previous block
+    # (g-1) has already been consumed by the sequential compute.
+    @pl.when(grid_idx + 1 < active_count)
+    def prefetch():
+      for copy in _in_copies(h, grid_idx + 1, 1 - slot, **in_kw):
+        copy.start()
+
+    for copy in _in_copies(h, grid_idx, slot, **in_kw):
       copy.wait()
+
+    write = bounds_end_ref[grid_idx].astype(jnp.bool_)
+    oslot = out_count % 2
+
+    # Before the body stores into an output slot, drain the writeback that
+    # used the same slot two rows ago.  Byte counts match any q_block.
+    @pl.when(jnp.logical_and(write, out_count >= 2))
+    def drain_slot():
+      for copy in _out_copies(h, 0, oslot, **out_kw):
+        copy.wait()
 
     sk.flash_attention_kernel(
         active_rows_ref, active_cols_ref, mask_next_ref,
         bounds_start_ref, bounds_end_ref, block_mask_ref,
-        q_tile, k_tile, v_tile, qid_tile, kvid_tile, None, None,
-        qseq_tile, None,
-        o_tile, lse_tile, None, max_tile,
+        q_tile.at[slot], k_tile.at[slot], v_tile.at[slot],
+        qid_tile.at[slot], kvid_tile.at[slot], None, None,
+        qseq_tile.at[slot], None,
+        o_tile.at[oslot], lse_tile.at[oslot], None, max_tile.at[oslot],
         m_scratch, l_scratch, o_scratch,
         mask_value=splash_kwargs["mask_value"], kv_steps=N // BKV,
         bq=BQ, bkv=BKV, bkv_compute=BKV_COMPUTE, head_dim_v=V,
@@ -102,33 +156,30 @@ def _direct_head_loop(
         head_idx_override=jnp.asarray(0, dtype=jnp.int32),
         num_heads_override=1,
     )
-    @pl.when(bounds_end_ref[grid_idx].astype(jnp.bool_))
-    def store_output():
-      # HBM refs cannot be written with a Python/JAX indexed assignment in
-      # Mosaic.  Use the same DMA path as the input tiles, with dedicated
-      # semaphore slots so the three result copies are ordered and drained
-      # before the next active block can reuse the output tiles.
-      out_copies = (
-          pltpu.make_async_copy(
-              o_tile,
-              ofull.at[pl.ds(h * N + q_block, BQ), :],
-              tile_sem.at[6]),
-          pltpu.make_async_copy(
-              lse_tile,
-              lse.at[pl.ds(h * N + q_block, BQ), :],
-              tile_sem.at[7]),
-          pltpu.make_async_copy(
-              max_tile,
-              max_logits.at[pl.ds(h * N + q_block, BQ), :],
-              tile_sem.at[8]),
-      )
-      for copy in out_copies:
-        copy.start()
-      for copy in out_copies:
-        copy.wait()
-    return ()
 
-  lax.fori_loop(0, active_count, body, ())
+    # Start the row writeback and do not wait; the next row computes in the
+    # other output slot meanwhile.
+    @pl.when(write)
+    def store_output():
+      for copy in _out_copies(h, active_rows_ref[grid_idx] * BQ, oslot,
+                              **out_kw):
+        copy.start()
+
+    return out_count + write.astype(jnp.int32)
+
+  out_count = lax.fori_loop(0, active_count, body, jnp.int32(0))
+
+  # Epilogue: drain the last two writebacks so ``ofull`` is complete before
+  # the caller starts this head's O a2a.
+  @pl.when(out_count >= 1)
+  def drain_last():
+    for copy in _out_copies(h, 0, (out_count - 1) % 2, **out_kw):
+      copy.wait()
+
+  @pl.when(out_count >= 2)
+  def drain_second_last():
+    for copy in _out_copies(h, 0, out_count % 2, **out_kw):
+      copy.wait()
 
 
 def build(config: dict[str, Any], mesh):
@@ -171,7 +222,7 @@ def build(config: dict[str, Any], mesh):
     pl.semaphore_wait(barrier_sem, CP_SIZE - 1)
 
     def scope(q_send, q_recv_sem, o_send, o_recv_sem, local_sem,
-              tile_sem):
+              in_sem, out_sem):
       pending_in = _start_a2a_head(
           rank_ref[0], 0, qref, kref, vref, qrecv, krecv, vrecv,
           q_send, q_recv_sem, local_sem, mesh_axis="context")
@@ -199,8 +250,8 @@ def build(config: dict[str, Any], mesh):
             m_scratch=m_scratch, l_scratch=l_scratch, o_scratch=o_scratch,
             q_tile=q_tile, k_tile=k_tile, v_tile=v_tile,
             qid_tile=qid_tile, kvid_tile=kvid_tile, qseq_tile=qseq_tile,
-            tile_sem=tile_sem, o_tile=o_tile, lse_tile=lse_tile,
-            max_tile=max_tile, splash_kwargs=splash_kwargs)
+            in_sem=in_sem, o_tile=o_tile, lse_tile=lse_tile,
+            max_tile=max_tile, out_sem=out_sem, splash_kwargs=splash_kwargs)
         if pending_o is not None:
           _wait_o_head(pending_o)
         pending_o = _start_o_head(
@@ -215,7 +266,8 @@ def build(config: dict[str, Any], mesh):
         pltpu.SemaphoreType.DMA((H_LOCAL, CP_SIZE)),
         pltpu.SemaphoreType.DMA((H_LOCAL, CP_SIZE)),
         pltpu.SemaphoreType.DMA((H_LOCAL, 4)),
-        pltpu.SemaphoreType.DMA((9,)),
+        pltpu.SemaphoreType.DMA((2, 6)),
+        pltpu.SemaphoreType.DMA((2, 3)),
     )
 
   out_shapes = (
@@ -246,19 +298,20 @@ def build(config: dict[str, Any], mesh):
               pltpu.VMEM((BQ, NUM_LANES), jnp.float32),
               pltpu.VMEM((BQ, NUM_LANES), jnp.float32),
               pltpu.VMEM((BQ, V), jnp.float32),
-              pltpu.VMEM((QK, BQ), jnp.bfloat16),
-              pltpu.VMEM((QK, BKV), jnp.bfloat16),
-              pltpu.VMEM((BKV, V), jnp.bfloat16),
-              pltpu.VMEM((BQ, NUM_LANES), jnp.int32),
-              pltpu.VMEM((NUM_SUBLANES, BKV), jnp.int32),
-              pltpu.VMEM((BQ, NUM_LANES), jnp.int32),
-              pltpu.VMEM((BQ, V), jnp.bfloat16),
-              pltpu.VMEM((BQ, NUM_LANES), jnp.float32),
-              pltpu.VMEM((BQ, NUM_LANES), jnp.float32),
+              pltpu.VMEM((2, QK, BQ), jnp.bfloat16),
+              pltpu.VMEM((2, QK, BKV), jnp.bfloat16),
+              pltpu.VMEM((2, BKV, V), jnp.bfloat16),
+              pltpu.VMEM((2, BQ, NUM_LANES), jnp.int32),
+              pltpu.VMEM((2, NUM_SUBLANES, BKV), jnp.int32),
+              pltpu.VMEM((2, BQ, NUM_LANES), jnp.int32),
+              pltpu.VMEM((2, BQ, V), jnp.bfloat16),
+              pltpu.VMEM((2, BQ, NUM_LANES), jnp.float32),
+              pltpu.VMEM((2, BQ, NUM_LANES), jnp.float32),
           ],
       ),
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=(), collective_id=0,
+          vmem_limit_bytes=56 * 1024 * 1024,
           flags={"XLA_TPU_FORCE_LP_LLO_SCHEDULER": True},
       ),
       name="splash_mha_direct_body_a2a_overlap",
