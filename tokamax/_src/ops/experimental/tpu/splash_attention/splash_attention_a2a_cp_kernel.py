@@ -653,6 +653,36 @@ def _stat_tile(ref, compact, head, seq_len, start, size):
   return ref.at[pl.ds(head * seq_len + start, size), :]
 
 
+def _local_group_rows(groups: int, num_heads: int, heads_local: int) -> int:
+  """Rows of a ``[groups, ...]`` head-grouped array that one rank needs.
+
+  Each rank owns ``heads_local`` contiguous heads; a group must either cover
+  whole ranks or be covered by one rank, so the local rows form the same kind
+  of contiguous grouping over the local heads.
+  """
+  group_size = num_heads // groups
+  if group_size >= heads_local:
+    if group_size % heads_local:
+      raise ValueError(
+          f"Head groups of size {group_size} straddle the {heads_local} heads"
+          " of a cp rank."
+      )
+    return 1
+  if heads_local % group_size:
+    raise ValueError(
+        f"{heads_local} heads per cp rank are not whole groups of {group_size}."
+    )
+  return heads_local // group_size
+
+
+def _local_groups(x, rank, num_heads: int, heads_local: int):
+  """The rows of a ``[groups, ...]`` array covering this rank's heads."""
+  groups = x.shape[0]
+  rows = _local_group_rows(groups, num_heads, heads_local)
+  first = rank * heads_local // (num_heads // groups)
+  return lax.dynamic_slice_in_dim(x, first, rows, 0)
+
+
 def _splash_attention_forward(
     mask_info: MaskInfo,
     q: jax.Array,
@@ -691,19 +721,11 @@ def _splash_attention_forward(
       and sinks is None
       and max_logit_value is None
   )
-  # TODO(step 2): native_layout, partial mask blocks (NumPy / dynamic masks),
-  # grouped segment ids, grouped block masks, GQA and the unfused reciprocal
-  # under cp > 1 still need their tile DMA in the fused driver.
-  if native_layout:
-    raise NotImplementedError("a2a cp: native_layout is not implemented yet.")
-  if mask_info.partial_mask_blocks is not None:
-    raise NotImplementedError("a2a cp: partial mask blocks are not implemented yet.")
-  if segment_ids is not None and segment_ids.q.ndim == 2:
-    raise NotImplementedError("a2a cp: grouped segment ids are not implemented yet.")
-  if mask_info.block_mask is not None and mask_info.block_mask.ndim == 2:
-    raise NotImplementedError("a2a cp: grouped block masks are not implemented yet.")
   if is_mqa:
     raise ValueError("a2a cp shards heads; MQA has a single kv head.")
+  if native_layout:
+    # Same as the native kernel: the sequence-minor body writes compact stats.
+    config = dataclasses.replace(config, compact_stats_output=True)
 
   if cp_size < 1:
     raise ValueError(f"{cp_size=} must be >= 1.")
@@ -719,14 +741,18 @@ def _splash_attention_forward(
     raise ValueError(f"Expected 'key' [heads, seq, {head_dim_qk}], got {k.shape}.")
   if k.shape[:-1] != v.shape[:-1]:
     raise ValueError(f"'key' {k.shape} and 'value' {v.shape} leading dims differ.")
-  if k.shape[0] != num_q_heads:
-    raise NotImplementedError("a2a cp: GQA is not implemented yet.")
+  num_kv_heads = k.shape[0]
+  if num_q_heads % num_kv_heads:
+    raise ValueError(f"{num_kv_heads=} must divide {num_q_heads=}.")
+  q_heads_per_kv_head = num_q_heads // num_kv_heads
   if k.shape[1] != local_seq_len:
     raise ValueError("a2a cp needs equal q and kv sequence shards.")
   head_dim_v = v.shape[-1]
-  if num_q_heads % cp_size:
-    raise ValueError(f"{cp_size=} must divide {num_q_heads=}.")
+  if num_kv_heads % cp_size:
+    # Also covers the q heads, a multiple of the kv heads.
+    raise ValueError(f"{cp_size=} must divide {num_kv_heads=}.")
   heads_local = num_q_heads // cp_size
+  kv_heads_local = num_kv_heads // cp_size
   seq_len = local_seq_len * cp_size
 
   bq, bkv = config.block_q, config.block_kv
@@ -740,19 +766,28 @@ def _splash_attention_forward(
   kv_steps = seq_len // bkv
   fuse_reciprocal = config.fuse_reciprocal or not save_residuals
   save_max_logits = save_max_logits or not fuse_reciprocal
-  if not fuse_reciprocal and cp_size > 1:
-    raise NotImplementedError(
-        "a2a cp: fuse_reciprocal=False needs the division before the o exchange."
-    )
   compact = config.compact_stats_output
 
+  def check_groups(groups, what):
+    if not groups or num_q_heads % groups:
+      raise ValueError(f"{what} groups ({groups}) must divide {num_q_heads=}.")
+    _local_group_rows(groups, num_q_heads, heads_local)
+
+  seg_groups = 1
   if segment_ids is not None:
     for name, ids in (("q", segment_ids.q), ("kv", segment_ids.kv)):
-      if ids.shape != (seq_len,):
+      if ids.ndim not in (1, 2) or ids.shape[-1] != seq_len:
         raise ValueError(
-            f"{name} segment_ids must cover the full sequence ({seq_len},), "
-            f"got {ids.shape}."
+            f"{name} segment_ids must be ({seq_len},) or (groups, {seq_len}),"
+            f" got {ids.shape}."
         )
+    if segment_ids.q.shape[:-1] != segment_ids.kv.shape[:-1]:
+      raise ValueError("Q and KV segment IDs must use the same head groups.")
+    if segment_ids.q.ndim == 2:
+      seg_groups = segment_ids.q.shape[0]
+      check_groups(seg_groups, "Segment-ID")
+  if mask_info.block_mask is not None and mask_info.block_mask.ndim == 2:
+    check_groups(mask_info.block_mask.shape[0], "Block-mask")
   if config.max_logit_const is not None and max_logit_value is not None:
     raise ValueError(
         f"Only one of {config.max_logit_const=} and {max_logit_value=} can be set."
@@ -798,6 +833,9 @@ def _splash_attention_forward(
     )
   if mask_info.block_mask is not None:
     prefetch["block_mask"] = mask_info.block_mask
+  partial_masks = mask_info.partial_mask_blocks
+  if partial_masks is not None:
+    prefetch["mask_next"] = mask_info.mask_next
 
   hbm_in = {
       "q": _flat(q, q_layout),
@@ -805,12 +843,17 @@ def _splash_attention_forward(
       "v": _flat(v, v_layout),
   }
   if segment_ids is not None:
+    # Grouped IDs stay [groups * ...]; each head reads the rows of its group.
+    q_ids = segment_ids.q.reshape(seg_groups, seq_len)
+    kv_ids = segment_ids.kv.reshape(seg_groups, seq_len)
     hbm_in["q_ids"] = lax.broadcast_in_dim(
-        segment_ids.q, (seq_len, NUM_LANES), (0,)
-    )
+        q_ids, (seg_groups, seq_len, NUM_LANES), (0, 1)
+    ).reshape(seg_groups * seq_len, NUM_LANES)
     hbm_in["kv_ids"] = lax.broadcast_in_dim(
-        segment_ids.kv, (NUM_SUBLANES, seq_len), (1,)
-    )
+        kv_ids, (seg_groups, NUM_SUBLANES, seq_len), (0, 2)
+    ).reshape(seg_groups * NUM_SUBLANES, seq_len)
+  if partial_masks is not None:
+    hbm_in["partial_mask"] = partial_masks
   if mask_info.q_sequence is not None:
     hbm_in["q_seq"] = lax.broadcast_in_dim(
         mask_info.q_sequence, (seq_len, NUM_LANES), (0,)
@@ -824,20 +867,26 @@ def _splash_attention_forward(
   def flat_shape(layout, heads, seq, dim):
     return (heads * seq, dim) if layout == head_dim_minor else (heads * dim, seq)
 
+  # The sequence-minor body writes o as [d_v, bq] tiles.
+  o_layout = QKVLayout.SEQ_MINOR if native_layout else head_dim_minor
+  # With the unfused reciprocal o is divided by l outside the kernel, exactly
+  # as the native kernel's caller does, so its exchange follows the division.
+  exchange_o = cp_size > 1 and fuse_reciprocal
+
   out_shapes = {}
   if cp_size > 1:
     out_shapes["q_recv"] = jax.ShapeDtypeStruct(
         flat_shape(q_layout, heads_local, seq_len, head_dim_qk), q.dtype)
     out_shapes["k_recv"] = jax.ShapeDtypeStruct(
-        flat_shape(k_layout, heads_local, seq_len, head_dim_qk), k.dtype)
+        flat_shape(k_layout, kv_heads_local, seq_len, head_dim_qk), k.dtype)
     out_shapes["v_recv"] = jax.ShapeDtypeStruct(
-        flat_shape(v_layout, heads_local, seq_len, head_dim_v), v.dtype)
+        flat_shape(v_layout, kv_heads_local, seq_len, head_dim_v), v.dtype)
   # o of the local heads over the full sequence; with cp == 1 it is the output.
   out_shapes["o_head"] = jax.ShapeDtypeStruct(
-      (heads_local * seq_len, head_dim_v), q.dtype)
-  if cp_size > 1:
+      flat_shape(o_layout, heads_local, seq_len, head_dim_v), q.dtype)
+  if exchange_o:
     out_shapes["out"] = jax.ShapeDtypeStruct(
-        (num_q_heads * local_seq_len, head_dim_v), q.dtype)
+        flat_shape(o_layout, num_q_heads, local_seq_len, head_dim_v), q.dtype)
   stat_shape = (
       (heads_local * NUM_SUBLANES, seq_len) if compact
       else (heads_local * seq_len, NUM_LANES)
@@ -861,14 +910,19 @@ def _splash_attention_forward(
     in_tiles["kv_ids"] = ((NUM_SUBLANES, bkv), hbm_in["kv_ids"].dtype)
   if "q_seq" in hbm_in:
     in_tiles["q_seq"] = ((bq, NUM_LANES), hbm_in["q_seq"].dtype)
-  out_tiles = {"o": ((bq, head_dim_v), q.dtype)}
+  if partial_masks is not None:
+    in_tiles["mask"] = ((bq, bkv), partial_masks.dtype)
+  out_tiles = {"o": (from_head_minor((bq, head_dim_v), o_layout), q.dtype)}
   for name in stat_names:
     out_tiles[name] = (stat_tile, jnp.float32)
 
+  # Same scratch shapes as the native kernel for either body.
+  stat_scratch = (NUM_SUBLANES, bq) if native_layout else (bq, NUM_LANES)
   scratch = {
-      "m_scratch": pltpu.VMEM((bq, NUM_LANES), jnp.float32),
-      "l_scratch": pltpu.VMEM((bq, NUM_LANES), jnp.float32),
-      "o_scratch": pltpu.VMEM((bq, head_dim_v), jnp.float32),
+      "m_scratch": pltpu.VMEM(stat_scratch, jnp.float32),
+      "l_scratch": pltpu.VMEM(stat_scratch, jnp.float32),
+      "o_scratch": pltpu.VMEM(
+          from_head_minor((bq, head_dim_v), o_layout), jnp.float32),
   }
   for name, (shape, dtype) in in_tiles.items():
     scratch[f"{name}_tile"] = pltpu.VMEM((2, *shape), dtype)
@@ -885,7 +939,7 @@ def _splash_attention_forward(
       mask_function=mask_function,
       fuse_reciprocal=fuse_reciprocal,
       config=config,
-      native_layout=False,
+      native_layout=native_layout,
   )
   names = [*prefetch, *hbm_in, *smem_in, *out_shapes, *scratch]
 
@@ -911,16 +965,23 @@ def _splash_attention_forward(
 
     def in_copies(h, g, slot, in_sem):
       i, j = block_ij(g)
+      kv_h = _div(h, q_heads_per_kv_head)
+      # Segment-ID group of the global head, as in the native index map.
+      group = (0 if seg_groups == 1
+               else _div(rank_ * heads_local + h, num_q_heads // seg_groups))
       src = {
           "q": lambda: _seq_tile(q_buf, q_layout, h, head_dim_qk, seq_len,
                                  i * bq, bq),
-          "k": lambda: _seq_tile(k_buf, k_layout, h, head_dim_qk, seq_len,
+          "k": lambda: _seq_tile(k_buf, k_layout, kv_h, head_dim_qk, seq_len,
                                  j * bkv, bkv),
-          "v": lambda: _seq_tile(v_buf, v_layout, h, head_dim_v, seq_len,
+          "v": lambda: _seq_tile(v_buf, v_layout, kv_h, head_dim_v, seq_len,
                                  j * bkv, bkv),
-          "q_ids": lambda: r["q_ids"].at[pl.ds(i * bq, bq), :],
-          "kv_ids": lambda: r["kv_ids"].at[:, pl.ds(j * bkv, bkv)],
+          "q_ids": lambda: r["q_ids"].at[
+              pl.ds(group * seq_len + i * bq, bq), :],
+          "kv_ids": lambda: r["kv_ids"].at[
+              pl.ds(group * NUM_SUBLANES, NUM_SUBLANES), pl.ds(j * bkv, bkv)],
           "q_seq": lambda: r["q_seq"].at[pl.ds(i * bq, bq), :],
+          "mask": lambda: r["partial_mask"].at[to_i32(r["mask_next"][g])],
       }
       srcs = {name: src[name]() for name in in_tiles}
       return [
@@ -930,7 +991,7 @@ def _splash_attention_forward(
       ]
 
     def out_copies(h, i, slot, out_sem):
-      dsts = {"o": _seq_tile(o_buf, head_dim_minor, h, head_dim_v, seq_len,
+      dsts = {"o": _seq_tile(o_buf, o_layout, h, head_dim_v, seq_len,
                              i * bq, bq)}
       for name in stat_names:
         dsts[name] = _stat_tile(r[name], compact, h, seq_len, i * bq, bq)
@@ -979,7 +1040,8 @@ def _splash_attention_forward(
             get("active_rows"), get("active_cols"), None,
             get("bounds_start"), get("bounds_end"), get("block_mask"),
             tile("q", slot), tile("k", slot), tile("v", slot),
-            tile("q_ids", slot), tile("kv_ids", slot), get("sinks"), None,
+            tile("q_ids", slot), tile("kv_ids", slot), get("sinks"),
+            tile("mask", slot),
             tile("q_seq", slot), get("max_logit"),
             out_tile("o", oslot), out_tile("logsumexp", oslot),
             out_tile("l_linear", oslot), out_tile("max_logits", oslot),
@@ -1032,36 +1094,41 @@ def _splash_attention_forward(
           device_id_type=pl.DeviceIdType.MESH)
     pl.semaphore_wait(barrier, cp_size - 1)
 
+    # (source, head-sharded buffer, layout, head dim, heads per rank).
     streams = (
-        (r["q"], q_buf, q_layout, head_dim_qk),
-        (r["k"], k_buf, k_layout, head_dim_qk),
-        (r["v"], v_buf, v_layout, head_dim_v),
+        (r["q"], q_buf, q_layout, head_dim_qk, heads_local),
+        (r["k"], k_buf, k_layout, head_dim_qk, kv_heads_local),
+        (r["v"], v_buf, v_layout, head_dim_v, kv_heads_local),
     )
+    q_stream, kv_streams = (0,), (1, 2)
 
     def remote(src, dst, send_sem, recv_sem, device):
       return pltpu.make_async_remote_copy(
           src, dst, send_sem, recv_sem, device_id={cp_axis: device},
           device_id_type=pl.DeviceIdType.MESH)
 
-    def in_exchange(h, in_send, in_recv, local_sem, with_recv=True):
-      """q/k/v sequence-to-head exchange of local head ``h``.
+    def in_exchange(h, which, in_send, in_recv, local_sem, with_recv=True):
+      """Sequence-to-head exchange of the ``which`` streams of local head ``h``.
 
-      ``with_recv=False`` skips the receive descriptors, which only ``wait``
-      uses; building them at start time would leave them unused.
+      k/v move once per kv head, keyed by the q head ``h`` that starts the
+      group.  ``with_recv=False`` skips the receive descriptors, which only
+      ``wait`` uses; building them at start time would leave them unused.
       """
       locals_, sends, recvs = [], [], []
-      for s, (src, dst, layout, dim) in enumerate(streams):
-        mine = _seq_tile(dst, layout, h, dim, seq_len, rank_ * local_seq_len,
+      for s in which:
+        src, dst, layout, dim, local_heads = streams[s]
+        sh = h if s == 0 else _div(h, q_heads_per_kv_head)
+        mine = _seq_tile(dst, layout, sh, dim, seq_len, rank_ * local_seq_len,
                          local_seq_len)
         locals_.append(pltpu.make_async_copy(
-            _seq_tile(src, layout, rank_ * heads_local + h, dim, local_seq_len,
+            _seq_tile(src, layout, rank_ * local_heads + sh, dim, local_seq_len,
                       0, local_seq_len),
             mine, local_sem.at[h, s]))
         for step in range(1, cp_size):
           peer_out = (rank_ + step) % cp_size
           peer_in = (rank_ + cp_size - step) % cp_size
           sends.append(remote(
-              _seq_tile(src, layout, peer_out * heads_local + h, dim,
+              _seq_tile(src, layout, peer_out * local_heads + sh, dim,
                         local_seq_len, 0, local_seq_len),
               mine, in_send.at[h, step, s], in_recv.at[h, step, s], peer_out))
           if not with_recv:
@@ -1069,7 +1136,7 @@ def _splash_attention_forward(
           # Shape-only source; waits for the shard arriving from peer_in.
           recvs.append(remote(
               _seq_tile(src, layout, 0, dim, local_seq_len, 0, local_seq_len),
-              _seq_tile(dst, layout, h, dim, seq_len, peer_in * local_seq_len,
+              _seq_tile(dst, layout, sh, dim, seq_len, peer_in * local_seq_len,
                         local_seq_len),
               in_send.at[h, step, s], in_recv.at[h, step, s], peer_out))
       return locals_, sends, recvs
@@ -1077,10 +1144,10 @@ def _splash_attention_forward(
     def o_exchange(h, o_send, o_recv, local_sem, with_recv=True):
       """o head-to-sequence exchange of local head ``h``."""
       out = r["out"]
-      mine = _seq_tile(out, head_dim_minor, rank_ * heads_local + h, head_dim_v,
+      mine = _seq_tile(out, o_layout, rank_ * heads_local + h, head_dim_v,
                        local_seq_len, 0, local_seq_len)
       local = pltpu.make_async_copy(
-          _seq_tile(o_buf, head_dim_minor, h, head_dim_v, seq_len,
+          _seq_tile(o_buf, o_layout, h, head_dim_v, seq_len,
                     rank_ * local_seq_len, local_seq_len),
           mine, local_sem.at[h, 3])
       sends, recvs = [], []
@@ -1088,15 +1155,15 @@ def _splash_attention_forward(
         peer_out = (rank_ + step) % cp_size
         peer_in = (rank_ + cp_size - step) % cp_size
         sends.append(remote(
-            _seq_tile(o_buf, head_dim_minor, h, head_dim_v, seq_len,
+            _seq_tile(o_buf, o_layout, h, head_dim_v, seq_len,
                       peer_out * local_seq_len, local_seq_len),
             mine, o_send.at[h, step], o_recv.at[h, step], peer_out))
         if not with_recv:
           continue
         recvs.append(remote(
-            _seq_tile(o_buf, head_dim_minor, h, head_dim_v, seq_len, 0,
+            _seq_tile(o_buf, o_layout, h, head_dim_v, seq_len, 0,
                       local_seq_len),
-            _seq_tile(out, head_dim_minor, peer_in * heads_local + h,
+            _seq_tile(out, o_layout, peer_in * heads_local + h,
                       head_dim_v, local_seq_len, 0, local_seq_len),
             o_send.at[h, step], o_recv.at[h, step], peer_out))
       return [local], sends, recvs
@@ -1116,31 +1183,42 @@ def _splash_attention_forward(
         d.wait_recv()
 
     def scope(in_send, in_recv, o_send, o_recv, local_sem, in_sem, out_sem):
-      ins = lambda h, **kw: in_exchange(h, in_send, in_recv, local_sem, **kw)
+      def exchange_in(h, action, **kw):
+        """Run ``action`` on q of head ``h`` and, at a kv group start, on k/v."""
+        action(in_exchange(h, q_stream, in_send, in_recv, local_sem, **kw))
+        kv = lambda: action(
+            in_exchange(h, kv_streams, in_send, in_recv, local_sem, **kw))
+        if q_heads_per_kv_head == 1:
+          kv()
+        else:
+          pl.when(lax.rem(h, q_heads_per_kv_head) == 0)(kv)
+
       outs = lambda h, **kw: o_exchange(h, o_send, o_recv, local_sem, **kw)
-      start(ins(0, with_recv=False))
+      exchange_in(0, start, with_recv=False)
 
       # incoming(h+1) overlaps compute(h); outgoing(h) overlaps compute(h+1).
       # Descriptors are rebuilt from the (dynamic) head index, so the head loop
       # is a fori_loop and compile time does not grow with heads / cp.
       def head(h, carry):
-        wait(ins(h))
+        exchange_in(h, wait)
 
         @pl.when(h + 1 < heads_local)
         def _():
-          start(ins(h + 1, with_recv=False))
+          exchange_in(h + 1, start, with_recv=False)
 
         compute_head(h, in_sem, out_sem)
 
-        @pl.when(h > 0)
-        def _():
-          wait(outs(h - 1))
+        if exchange_o:
+          @pl.when(h > 0)
+          def _():
+            wait(outs(h - 1))
 
-        start(outs(h, with_recv=False))
+          start(outs(h, with_recv=False))
         return carry
 
       lax.fori_loop(0, heads_local, head, None)
-      wait(outs(heads_local - 1))
+      if exchange_o:
+        wait(outs(heads_local - 1))
 
     pl.run_scoped(
         scope,
@@ -1193,12 +1271,6 @@ def _splash_attention_forward(
     )(*prefetch.values(), *hbm_in.values(), *smem_in.values())
   outs = dict(zip(out_shapes, all_out, strict=True))
 
-  o_head = outs["o_head"].reshape(heads_local, seq_len, head_dim_v)
-  out = (
-      outs["out"].reshape(num_q_heads, local_seq_len, head_dim_v)
-      if cp_size > 1 else o_head
-  )
-
   # Same as the native kernel: with a dynamic grid and no active block the
   # outputs were never written, so report the empty-attention defaults.
   def init_if_empty(x: jax.Array, value: float) -> jax.Array:
@@ -1206,7 +1278,12 @@ def _splash_attention_forward(
       return x
     return jnp.where(mask_info.num_active_blocks[0] == 0, value, x)
 
-  out = init_if_empty(out, 0.0)
+  o_head = init_if_empty(_unflat(outs["o_head"], o_layout, heads_local), 0.0)
+  if exchange_o:
+    out = init_if_empty(_unflat(outs["out"], o_layout, num_q_heads), 0.0)
+  else:
+    # Head sharded; with cp > 1 it is exchanged after the division below.
+    out = o_head
 
   def public_stat(x):
     if compact:
@@ -1238,11 +1315,17 @@ def _splash_attention_forward(
       logsumexp = ad_checkpoint.checkpoint_name(
           logsumexp, name=config.residual_checkpoint_name
       )
+  # The backward's o residual is the head-sharded, normalized o.
+  o_res = out if cp_size == 1 or not exchange_o else o_head
+  if cp_size > 1 and not exchange_o:
+    # Unfused reciprocal: the native caller divides, then the post-kernel
+    # all-to-all moves o back to the sequence-sharded layout.
+    out = lax.all_to_all(out, cp_axis, 1, 0, tiled=True)
   if cp_size > 1:
     buffers = {"q": outs["q_recv"], "k": outs["k_recv"], "v": outs["v_recv"],
-               "o": o_head}
+               "o": o_res}
   else:
-    buffers = {"q": q, "k": k, "v": v, "o": out}
+    buffers = {"q": q, "k": k, "v": v, "o": o_res}
   stats = None
   if save_residuals:
     stats = {"logsumexp": logsumexp, "max_logits": max_logits}
@@ -1370,19 +1453,31 @@ def _splash_attention_fwd(
   # The backward runs on the head-sharded buffers the forward already holds,
   # i.e. exactly the native kernel's inputs after the pre-kernel all-to-all.
   heads_local = q.shape[0] // cp_size
+  kv_heads_local = k.shape[0] // cp_size  # differs from heads_local with GQA
   if cp_size > 1:
     q_res = _unflat(buffers["q"], config.q_layout, heads_local)
-    k_res = _unflat(buffers["k"], config.k_layout, heads_local)
-    v_res = _unflat(buffers["v"], config.v_layout, heads_local)
+    k_res = _unflat(buffers["k"], config.k_layout, kv_heads_local)
+    v_res = _unflat(buffers["v"], config.v_layout, kv_heads_local)
     rank = lax.axis_index(cp_axis)
     sinks_res = (
         None if sinks is None
         else lax.dynamic_slice_in_dim(sinks, rank * heads_local, heads_local)
     )
+    # Head-grouped arrays: the native backward sees only the local heads, so
+    # it gets the group rows covering them.
+    num_heads = q.shape[0]
+    local = lambda x: _local_groups(x, rank, num_heads, heads_local)
+    seg_res = segment_ids
+    if segment_ids is not None and segment_ids.q.ndim == 2:
+      seg_res = base.SegmentIds(local(segment_ids.q), local(segment_ids.kv))
+    if (dkv_mask_info is not None and dkv_mask_info.block_mask is not None
+        and dkv_mask_info.block_mask.ndim == 2):
+      dkv_mask_info = dkv_mask_info._replace(
+          block_mask=local(dkv_mask_info.block_mask))
   else:
-    q_res, k_res, v_res, sinks_res = q, k, v, sinks
+    q_res, k_res, v_res, sinks_res, seg_res = q, k, v, sinks, segment_ids
   residuals = (
-      q_res, k_res, v_res, segment_ids, sinks_res, buffers["o"], logsumexp,
+      q_res, k_res, v_res, seg_res, sinks_res, buffers["o"], logsumexp,
       dkv_mask_info,
   )
   if save_residuals:
