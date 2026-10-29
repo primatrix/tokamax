@@ -11,7 +11,7 @@ from pathlib import Path
 def main() -> None:
   if "--out" not in sys.argv:
     raise SystemExit("--out is required")
-  out = Path(sys.argv[sys.argv.index("--out") + 1)
+  out = Path(sys.argv[sys.argv.index("--out") + 1])
   try:
     runpy.run_path(
         str(Path(__file__).with_name("run_direct_a2a.py")),
