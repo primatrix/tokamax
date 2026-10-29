@@ -112,6 +112,9 @@ def build(config: dict[str, Any], mesh):
       ),
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=(),
+          flags={
+              "XLA_TPU_FORCE_LP_LLO_SCHEDULER": True,
+          },
       ),
       name="splash_mha_compute_only",
   )
