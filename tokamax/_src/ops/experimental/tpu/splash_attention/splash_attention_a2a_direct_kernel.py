@@ -52,6 +52,7 @@ def _direct_head_loop(
     mask_next_ref, bounds_start_ref, bounds_end_ref, block_mask_ref,
     m_scratch, l_scratch, o_scratch,
     q_tile, k_tile, v_tile, qid_tile, kvid_tile, qseq_tile, tile_sem,
+    o_tile, lse_tile, max_tile,
     splash_kwargs,
 ):
   """Run one head's active blocks without a nested pipeline."""
@@ -89,9 +90,7 @@ def _direct_head_loop(
         bounds_start_ref, bounds_end_ref, block_mask_ref,
         q_tile, k_tile, v_tile, qid_tile, kvid_tile, None, None,
         qseq_tile, None,
-        ofull.at[pl.ds(h * N, N), :],
-        lse.at[pl.ds(h * N, N), :], None,
-        max_logits.at[pl.ds(h * N, N), :],
+        o_tile, lse_tile, None, max_tile,
         m_scratch, l_scratch, o_scratch,
         mask_value=splash_kwargs["mask_value"], kv_steps=N // BKV,
         bq=BQ, bkv=BKV, bkv_compute=BKV_COMPUTE, head_dim_v=V,
@@ -103,6 +102,11 @@ def _direct_head_loop(
         head_idx_override=jnp.asarray(0, dtype=jnp.int32),
         num_heads_override=1,
     )
+    @pl.when(bounds_end_ref[grid_idx].astype(jnp.bool_))
+    def store_output():
+      ofull.at[pl.ds(h * N + q_block, BQ), :][...] = o_tile[...]
+      lse.at[pl.ds(h * N + q_block, BQ), :][...] = lse_tile[...]
+      max_logits.at[pl.ds(h * N + q_block, BQ), :][...] = max_tile[...]
     return ()
 
   lax.fori_loop(0, active_count, body, ())
@@ -137,6 +141,7 @@ def build(config: dict[str, Any], mesh):
     m_scratch, l_scratch, o_scratch = outs[7:10]
     q_tile, k_tile, v_tile = outs[10:13]
     qid_tile, kvid_tile, qseq_tile = outs[13:16]
+    o_tile, lse_tile, max_tile = outs[16:19]
 
     barrier_sem = pltpu.get_barrier_semaphore()
     for step in range(1, CP_SIZE):
@@ -175,7 +180,8 @@ def build(config: dict[str, Any], mesh):
             m_scratch=m_scratch, l_scratch=l_scratch, o_scratch=o_scratch,
             q_tile=q_tile, k_tile=k_tile, v_tile=v_tile,
             qid_tile=qid_tile, kvid_tile=kvid_tile, qseq_tile=qseq_tile,
-            tile_sem=tile_sem, splash_kwargs=splash_kwargs)
+            tile_sem=tile_sem, o_tile=o_tile, lse_tile=lse_tile,
+            max_tile=max_tile, splash_kwargs=splash_kwargs)
         if pending_o is not None:
           _wait_o_head(pending_o)
         pending_o = _start_o_head(
@@ -227,6 +233,9 @@ def build(config: dict[str, Any], mesh):
               pltpu.VMEM((BQ, NUM_LANES), jnp.int32),
               pltpu.VMEM((NUM_SUBLANES, BKV), jnp.int32),
               pltpu.VMEM((BQ, NUM_LANES), jnp.int32),
+              pltpu.VMEM((BQ, V), jnp.bfloat16),
+              pltpu.VMEM((BQ, NUM_LANES), jnp.float32),
+              pltpu.VMEM((BQ, NUM_LANES), jnp.float32),
           ],
       ),
       compiler_params=pltpu.CompilerParams(
