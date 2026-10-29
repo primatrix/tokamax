@@ -104,9 +104,28 @@ def _direct_head_loop(
     )
     @pl.when(bounds_end_ref[grid_idx].astype(jnp.bool_))
     def store_output():
-      ofull.at[pl.ds(h * N + q_block, BQ), :][...] = o_tile[...]
-      lse.at[pl.ds(h * N + q_block, BQ), :][...] = lse_tile[...]
-      max_logits.at[pl.ds(h * N + q_block, BQ), :][...] = max_tile[...]
+      # HBM refs cannot be written with a Python/JAX indexed assignment in
+      # Mosaic.  Use the same DMA path as the input tiles, with dedicated
+      # semaphore slots so the three result copies are ordered and drained
+      # before the next active block can reuse the output tiles.
+      out_copies = (
+          pltpu.make_async_copy(
+              o_tile,
+              ofull.at[pl.ds(h * N + q_block, BQ), :],
+              tile_sem.at[6]),
+          pltpu.make_async_copy(
+              lse_tile,
+              lse.at[pl.ds(h * N + q_block, BQ), :],
+              tile_sem.at[7]),
+          pltpu.make_async_copy(
+              max_tile,
+              max_logits.at[pl.ds(h * N + q_block, BQ), :],
+              tile_sem.at[8]),
+      )
+      for copy in out_copies:
+        copy.start()
+      for copy in out_copies:
+        copy.wait()
     return ()
 
   lax.fori_loop(0, active_count, body, ())
@@ -196,7 +215,7 @@ def build(config: dict[str, Any], mesh):
         pltpu.SemaphoreType.DMA((H_LOCAL, CP_SIZE)),
         pltpu.SemaphoreType.DMA((H_LOCAL, CP_SIZE)),
         pltpu.SemaphoreType.DMA((H_LOCAL, 4)),
-        pltpu.SemaphoreType.DMA((6,)),
+        pltpu.SemaphoreType.DMA((9,)),
     )
 
   out_shapes = (
