@@ -16,6 +16,7 @@ def main() -> None:
   parser = argparse.ArgumentParser()
   parser.add_argument("--out", type=Path, required=True)
   parser.add_argument("--mode", default="multimodal", choices=("multimodal", "single"))
+  parser.add_argument("--compile-only", action="store_true")
   args = parser.parse_args()
   args.out.mkdir(parents=True, exist_ok=False)
 
@@ -63,6 +64,11 @@ def main() -> None:
       "sha256": hashlib.sha256(ids.tobytes()).hexdigest(),
   }, indent=2) + "\n")
   args.out.joinpath("compile_memory.txt").write_text(str(compiled.memory_analysis()))
+  if args.compile_only:
+    args.out.joinpath("status.json").write_text(
+        json.dumps({"status": "compiled", "executed": False}, indent=2) + "\n"
+    )
+    return
   args_list = input_arrays + [qids, kvids, qseq]
   for _ in range(3):
     jax.block_until_ready(compiled(*args_list))
