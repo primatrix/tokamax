@@ -1043,8 +1043,12 @@ def _splash_attention_forward(
           src, dst, send_sem, recv_sem, device_id={cp_axis: device},
           device_id_type=pl.DeviceIdType.MESH)
 
-    def in_exchange(h, in_send, in_recv, local_sem):
-      """q/k/v sequence-to-head exchange of local head ``h``."""
+    def in_exchange(h, in_send, in_recv, local_sem, with_recv=True):
+      """q/k/v sequence-to-head exchange of local head ``h``.
+
+      ``with_recv=False`` skips the receive descriptors, which only ``wait``
+      uses; building them at start time would leave them unused.
+      """
       locals_, sends, recvs = [], [], []
       for s, (src, dst, layout, dim) in enumerate(streams):
         mine = _seq_tile(dst, layout, h, dim, seq_len, rank_ * local_seq_len,
@@ -1060,6 +1064,8 @@ def _splash_attention_forward(
               _seq_tile(src, layout, peer_out * heads_local + h, dim,
                         local_seq_len, 0, local_seq_len),
               mine, in_send.at[h, step, s], in_recv.at[h, step, s], peer_out))
+          if not with_recv:
+            continue
           # Shape-only source; waits for the shard arriving from peer_in.
           recvs.append(remote(
               _seq_tile(src, layout, 0, dim, local_seq_len, 0, local_seq_len),
@@ -1068,7 +1074,7 @@ def _splash_attention_forward(
               in_send.at[h, step, s], in_recv.at[h, step, s], peer_out))
       return locals_, sends, recvs
 
-    def o_exchange(h, o_send, o_recv, local_sem):
+    def o_exchange(h, o_send, o_recv, local_sem, with_recv=True):
       """o head-to-sequence exchange of local head ``h``."""
       out = r["out"]
       mine = _seq_tile(out, head_dim_minor, rank_ * heads_local + h, head_dim_v,
@@ -1085,6 +1091,8 @@ def _splash_attention_forward(
             _seq_tile(o_buf, head_dim_minor, h, head_dim_v, seq_len,
                       peer_out * local_seq_len, local_seq_len),
             mine, o_send.at[h, step], o_recv.at[h, step], peer_out))
+        if not with_recv:
+          continue
         recvs.append(remote(
             _seq_tile(o_buf, head_dim_minor, h, head_dim_v, seq_len, 0,
                       local_seq_len),
@@ -1108,20 +1116,30 @@ def _splash_attention_forward(
         d.wait_recv()
 
     def scope(in_send, in_recv, o_send, o_recv, local_sem, in_sem, out_sem):
-      ins = lambda h: in_exchange(h, in_send, in_recv, local_sem)
-      outs = lambda h: o_exchange(h, o_send, o_recv, local_sem)
-      start(ins(0))
+      ins = lambda h, **kw: in_exchange(h, in_send, in_recv, local_sem, **kw)
+      outs = lambda h, **kw: o_exchange(h, o_send, o_recv, local_sem, **kw)
+      start(ins(0, with_recv=False))
+
       # incoming(h+1) overlaps compute(h); outgoing(h) overlaps compute(h+1).
-      # Heads are unrolled statically (heads / cp is small), matching the
-      # measured schedule.
-      for h in range(heads_local):
+      # Descriptors are rebuilt from the (dynamic) head index, so the head loop
+      # is a fori_loop and compile time does not grow with heads / cp.
+      def head(h, carry):
         wait(ins(h))
-        if h + 1 < heads_local:
-          start(ins(h + 1))
+
+        @pl.when(h + 1 < heads_local)
+        def _():
+          start(ins(h + 1, with_recv=False))
+
         compute_head(h, in_sem, out_sem)
-        if h > 0:
+
+        @pl.when(h > 0)
+        def _():
           wait(outs(h - 1))
-        start(outs(h))
+
+        start(outs(h, with_recv=False))
+        return carry
+
+      lax.fori_loop(0, heads_local, head, None)
       wait(outs(heads_local - 1))
 
     pl.run_scoped(
