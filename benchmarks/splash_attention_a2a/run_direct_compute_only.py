@@ -52,7 +52,9 @@ def main():
 
   replicated = NamedSharding(mesh, P(None, None, None))
   ids_sharding = NamedSharding(mesh, P(None))
-  compiled = jax.jit(mapped).lower(*specs).compile()
+  # ``mapped`` accepts one runtime segment-id vector and reuses it for both
+  # q/k metadata operands; lower only the four arguments that it exposes.
+  compiled = jax.jit(mapped).lower(*specs[:4]).compile()
   q, k, v = make_compute_only_arrays(jax, specs[:3], replicated)
   ids = jax.device_put(
       make_segment_ids(config["tokens"], "multimodal"), ids_sharding)
