@@ -17,6 +17,7 @@ def main():
   parser.add_argument("--out", type=Path, required=True)
   parser.add_argument("--maxtext-source", type=Path, required=True)
   parser.add_argument("--mode", default="multimodal", choices=("multimodal", "single"))
+  parser.add_argument("--global-heads", type=int, default=64)
   args = parser.parse_args()
   args.out.mkdir(parents=True, exist_ok=False)
   from config import production_config
@@ -29,7 +30,7 @@ def main():
   from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
   from ulysses_baseline import build
 
-  config = production_config()
+  config = production_config(global_heads=args.global_heads)
   devices = sorted(jax.devices("tpu"), key=lambda d: d.id)
   if len(devices) != 8:
     raise RuntimeError(f"expected 8 TPU devices, got {len(devices)}")

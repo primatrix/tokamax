@@ -20,7 +20,6 @@ from tokamax._src.ops.experimental.tpu.splash_attention.splash_attention_a2a_ker
     BQ,
     BKV,
     BKV_COMPUTE,
-    H_LOCAL,
     N,
     NUM_LANES,
     NUM_SUBLANES,
@@ -35,10 +34,15 @@ from tokamax._src.ops.experimental.tpu.splash_attention.splash_attention_a2a_ker
 
 def build(config: dict[str, Any], mesh):
   """Build the current fused structure with DMA removed for timing only."""
-  if config.get("cp_size") != 8 or config.get("heads") != H_LOCAL:
-    raise ValueError("compute-only diagnostic requires CP8 and 8 local heads")
-  if config.get("tokens") != N or config.get("global_heads") != 64:
-    raise ValueError("compute-only diagnostic requires N=262144 and H=64")
+  cp_size = config.get("cp_size")
+  h_local = config.get("heads")
+  h_global = config.get("global_heads")
+  if cp_size != 8 or not isinstance(h_local, int) or h_local <= 0:
+    raise ValueError("compute-only diagnostic requires CP8 and positive local heads")
+  if h_global != cp_size * h_local:
+    raise ValueError("global_heads must equal cp_size * local heads")
+  if config.get("tokens") != N:
+    raise ValueError("compute-only diagnostic requires N=262144")
   splash_values = config.get("splash", {})
   if tuple(splash_values.get(x) for x in
            ("block_q", "block_kv", "block_kv_compute")) != (
@@ -63,7 +67,7 @@ def build(config: dict[str, Any], mesh):
                   m_scratch, l_scratch, o_scratch):
     # The Python-unrolled head loop is intentionally identical to the
     # candidate.  Only the A2A start/wait calls are absent.
-    for h in range(H_LOCAL):
+    for h in range(h_local):
       _pipeline_for_head(
           h, mask_info=mask_info, splash_kwargs=splash_kwargs,
           qref=qref.at[pl.ds(h * QK, QK), :],
@@ -80,25 +84,25 @@ def build(config: dict[str, Any], mesh):
   call = pl.pallas_call(
       kernel_body,
       out_shape=(
-          jax.ShapeDtypeStruct((H_LOCAL * N, V), jnp.bfloat16),
-          jax.ShapeDtypeStruct((H_LOCAL * N, NUM_LANES), jnp.float32),
-          jax.ShapeDtypeStruct((H_LOCAL * N, NUM_LANES), jnp.float32),
+          jax.ShapeDtypeStruct((h_local * N, V), jnp.bfloat16),
+          jax.ShapeDtypeStruct((h_local * N, NUM_LANES), jnp.float32),
+          jax.ShapeDtypeStruct((h_local * N, NUM_LANES), jnp.float32),
       ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=6,
           grid=(),
           in_specs=(
-              _whole_spec((H_LOCAL * QK, N)),
-              _whole_spec((H_LOCAL * QK, N)),
-              _whole_spec((H_LOCAL * N, V)),
+              _whole_spec((h_local * QK, N)),
+              _whole_spec((h_local * QK, N)),
+              _whole_spec((h_local * N, V)),
               _whole_spec((N, NUM_LANES)),
               _whole_spec((NUM_SUBLANES, N)),
               _whole_spec((N, NUM_LANES)),
           ),
           out_specs=(
-              _whole_spec((H_LOCAL * N, V)),
-              _whole_spec((H_LOCAL * N, NUM_LANES)),
-              _whole_spec((H_LOCAL * N, NUM_LANES)),
+              _whole_spec((h_local * N, V)),
+              _whole_spec((h_local * N, NUM_LANES)),
+              _whole_spec((h_local * N, NUM_LANES)),
           ),
           scratch_shapes=[
               pltpu.VMEM((BQ, NUM_LANES), jnp.float32),
@@ -115,15 +119,15 @@ def build(config: dict[str, Any], mesh):
   axis = config["mesh_axis"]
 
   def wrapped(q, k, v, qids_in, kvids_in, qseq_in):
-    qref = q.transpose(0, 2, 1).reshape(H_LOCAL * QK, N)
-    kref = k.transpose(0, 2, 1).reshape(H_LOCAL * QK, N)
-    vref = v.reshape(H_LOCAL * N, V)
+    qref = q.transpose(0, 2, 1).reshape(h_local * QK, N)
+    kref = k.transpose(0, 2, 1).reshape(h_local * QK, N)
+    vref = v.reshape(h_local * N, V)
     outputs = call(active_rows, active_cols, jnp.zeros_like(active_rows),
                    bounds_start, bounds_end, block_mask,
                    qref, kref, vref, qids_in, kvids_in, qseq_in)
-    return (outputs[0].reshape(H_LOCAL, N, V),
-            outputs[1].reshape(H_LOCAL, N, NUM_LANES),
-            outputs[2].reshape(H_LOCAL, N, NUM_LANES))
+    return (outputs[0].reshape(h_local, N, V),
+            outputs[1].reshape(h_local, N, NUM_LANES),
+            outputs[2].reshape(h_local, N, NUM_LANES))
 
   def local(q, k, v, qids_in, kvids_in, qseq_in):
     return wrapped(q, k, v, qids_in, kvids_in, qseq_in)
@@ -136,9 +140,9 @@ def build(config: dict[str, Any], mesh):
       check_vma=False,
   )
   specs = (
-      jax.ShapeDtypeStruct((H_LOCAL, N, QK), jnp.bfloat16),
-      jax.ShapeDtypeStruct((H_LOCAL, N, QK), jnp.bfloat16),
-      jax.ShapeDtypeStruct((H_LOCAL, N, V), jnp.bfloat16),
+      jax.ShapeDtypeStruct((h_local, N, QK), jnp.bfloat16),
+      jax.ShapeDtypeStruct((h_local, N, QK), jnp.bfloat16),
+      jax.ShapeDtypeStruct((h_local, N, V), jnp.bfloat16),
       jax.ShapeDtypeStruct((N, NUM_LANES), jnp.int32),
       jax.ShapeDtypeStruct((NUM_SUBLANES, N), jnp.int32),
       jax.ShapeDtypeStruct((N, NUM_LANES), jnp.int32),
@@ -147,7 +151,7 @@ def build(config: dict[str, Any], mesh):
       "expected_kernel_name": "splash_mha_compute_only",
       "custom_call_count_expected": 1,
       "diagnostic": "same head loop and nested Splash emit_pipeline; no DMA/semaphore",
-      "shape": {"H_local": H_LOCAL, "N": N, "qk": QK, "v": V},
+      "shape": {"H_local": h_local, "N": N, "qk": QK, "v": V},
       "splash": {"block_q": BQ, "block_kv": BKV,
                   "block_kv_compute": BKV_COMPUTE},
   }

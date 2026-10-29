@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 
-def production_config() -> dict:
+def production_config(*, global_heads: int = 64, cp_size: int = 8) -> dict:
+  if global_heads % cp_size:
+    raise ValueError("global_heads must be divisible by cp_size")
   return {
       "name": "ling3_mla_splash_attention_cp8",
-      "cp_size": 8,
+      "cp_size": cp_size,
       "mesh_axis": "context",
-      "global_heads": 64,
-      "heads": 8,
+      "global_heads": global_heads,
+      "heads": global_heads // cp_size,
       "tokens": 262144,
       "qk_head_dim": 192,
       "v_head_dim": 128,
