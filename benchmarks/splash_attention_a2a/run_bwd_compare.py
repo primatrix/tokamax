@@ -121,13 +121,20 @@ def main() -> None:
     sf = sorted(array_sha(gf), key=lambda r: r["device"])
     equal = sum(a["sha256"] == b["sha256"] for a, b in zip(sb, sf))
     diff = jnp.abs(gb[0].astype(jnp.float32) - gf.astype(jnp.float32))
+    # Whole-array bit comparison: independent of how XLA shards each output
+    # and sensitive to +0/-0, unlike the value difference.
+    bits = lambda x: jax.lax.bitcast_convert_type(x, jnp.uint16)
+    num_bit_diff = int(jnp.sum(bits(gb[0]) != bits(gf)))
     entry = {
         "shards_equal": f"{equal}/{len(sb)}",
+        "num_bit_diff": num_bit_diff,
         "max_abs_diff": float(jnp.max(diff)),
         "num_diff": int(jnp.sum(diff > 0)),
         "max_abs_ref": float(jnp.max(jnp.abs(gb.astype(jnp.float32)))),
+        "base_shard_index": sb[0]["index"],
+        "fused_shard_index": sf[0]["index"],
     }
-    all_equal &= equal == len(sb)
+    all_equal &= num_bit_diff == 0
     report[name] = entry
   report["bitwise_equal"] = bool(all_equal)
   args.out.joinpath("grad_compare.json").write_text(
