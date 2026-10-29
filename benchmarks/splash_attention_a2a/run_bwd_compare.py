@@ -6,7 +6,8 @@ bwd, dq/dk/dv a2a).  Candidate: ``make_splash_mha_a2a_cp`` inside a
 shard_map, whose custom_vjp runs the same native bwd on head-sharded buffers.
 
 Both sides use the same q/k/v/dO values (same ``make_sharded_arrays`` seeds as
-the forward benchmarks), so per-shard SHA equality means bitwise equality.
+the forward benchmarks).  The two sides run one after the other and the
+gradients are compared bitwise on the host over the whole array.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ def main() -> None:
 
   from config import production_config
   from inputs import make_segment_ids, make_sharded_arrays
-  from profile_common import array_sha, set_profile_flags
+  from profile_common import set_profile_flags
 
   set_profile_flags(args.out)
   import jax
@@ -101,38 +102,51 @@ def main() -> None:
   ids = make_segment_ids(n, args.mode)
   ids_base = jax.device_put(ids[None, :], ids_sharding)
   ids_fused = jax.device_put(ids, NamedSharding(mesh, P(None)))
-  # Same shard bytes, leading batch axis dropped.
-  fused_inputs = [x[0] for x in base_inputs]
-  fused_inputs = [jax.device_put(x, NamedSharding(mesh, seq3))
-                  for x in fused_inputs]
 
+  # Run the two sides one after the other with only one side's inputs and
+  # gradients on device: with cp == 1 both sets do not fit in one HBM.
+  # Host copies keep the inputs byte-identical across the two sides.
+  host_inputs = [np.asarray(x)[0] for x in base_inputs]
   base_out = jax.block_until_ready(
       base_grad(base_inputs[0], base_inputs[1], base_inputs[2], ids_base,
                 base_inputs[3]))
+  base_host = [np.asarray(g)[0] for g in base_out]
+  for x in (*base_inputs, *base_out):
+    x.delete()
+  del base_inputs, base_out
+
+  # Same bytes, leading batch axis dropped.
+  fused_inputs = [jax.device_put(x, NamedSharding(mesh, seq3))
+                  for x in host_inputs]
+  del host_inputs
   fused_out = jax.block_until_ready(
       fused_grad(fused_inputs[0], fused_inputs[1], fused_inputs[2], ids_fused,
                  fused_inputs[3]))
+  fused_host = [np.asarray(g) for g in fused_out]
 
   report = {"cp": args.cp, "mode": args.mode,
             "ids_sha256": hashlib.sha256(ids.tobytes()).hexdigest()}
   all_equal = True
-  for name, gb, gf in zip(("dq", "dk", "dv"), base_out, fused_out):
-    sb = sorted(array_sha(gb), key=lambda r: r["device"])
-    sf = sorted(array_sha(gf), key=lambda r: r["device"])
-    equal = sum(a["sha256"] == b["sha256"] for a, b in zip(sb, sf))
-    diff = jnp.abs(gb[0].astype(jnp.float32) - gf.astype(jnp.float32))
+  for name, gb, gf in zip(("dq", "dk", "dv"), base_host, fused_host):
+    if gb.shape != gf.shape or gb.dtype != gf.dtype:
+      raise ValueError(f"{name}: {gb.shape}/{gb.dtype} vs {gf.shape}/{gf.dtype}")
     # Whole-array bit comparison: independent of how XLA shards each output
     # and sensitive to +0/-0, unlike the value difference.
-    bits = lambda x: jax.lax.bitcast_convert_type(x, jnp.uint16)
-    num_bit_diff = int(jnp.sum(bits(gb[0]) != bits(gf)))
+    differs = gb.view(np.uint16) != gf.view(np.uint16)
+    num_bit_diff = int(np.count_nonzero(differs))
+    # Full FP32 copies of a cp=1 gradient are tens of GB of host memory, so
+    # only materialise the differing elements.
+    max_abs_diff = 0.0
+    if num_bit_diff:
+      max_abs_diff = float(np.max(np.abs(
+          gb[differs].astype(np.float32) - gf[differs].astype(np.float32))))
+    del differs
     entry = {
-        "shards_equal": f"{equal}/{len(sb)}",
         "num_bit_diff": num_bit_diff,
-        "max_abs_diff": float(jnp.max(diff)),
-        "num_diff": int(jnp.sum(diff > 0)),
-        "max_abs_ref": float(jnp.max(jnp.abs(gb.astype(jnp.float32)))),
-        "base_shard_index": sb[0]["index"],
-        "fused_shard_index": sf[0]["index"],
+        "max_abs_diff": max_abs_diff,
+        "max_abs_ref": float(np.max(np.abs(gb))),
+        "sha256_base": hashlib.sha256(np.ascontiguousarray(gb).tobytes()).hexdigest(),
+        "sha256_fused": hashlib.sha256(np.ascontiguousarray(gf).tobytes()).hexdigest(),
     }
     all_equal &= num_bit_diff == 0
     report[name] = entry
