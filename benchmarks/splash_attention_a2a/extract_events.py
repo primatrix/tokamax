@@ -79,6 +79,7 @@ def extract_optimized(trace_dir: Path, name_hint: str | None = None):
   result = {"kind": "optimized", "planes": {}, "raw_xla_ops": rows}
   hints = tuple(x for x in (
       name_hint,
+      "splash_mha_fwd_a2a_cp",
       "v7a_step_c_head_overlap_a2a_splash512",
       "splash_mha_a2a",
       "splash_mha_compute_only",
