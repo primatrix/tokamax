@@ -113,7 +113,6 @@ def build(config: dict[str, Any], mesh):
                 pl.BlockSpec((BQ, NUM_LANES), qid_map),
                 pl.BlockSpec((BQ, NUM_LANES), qid_map),
             ),
-            dimension_semantics=("parallel", "arbitrary"),
             scratch_shapes=[
                 pltpu.VMEM((BQ, NUM_LANES), jnp.float32),
                 pltpu.VMEM((BQ, NUM_LANES), jnp.float32),
