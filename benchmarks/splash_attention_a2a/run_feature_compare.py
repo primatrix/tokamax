@@ -139,7 +139,9 @@ def main() -> None:
     cols = np.arange(n)[None, :]
     # Causal band with a ragged left edge: partial tiles on both edges.
     dense = (cols <= rows) & (cols > rows - 3000 - (rows % 7) * 50)
-    native = sk.make_splash_mha(dense, config=config, save_residuals=True)
+    # The native kernel runs after the pre-kernel a2a on the full sequence.
+    native = sk.make_splash_mha(dense, config=config, save_residuals=True,
+                                q_seq_shards=1)
     fused = a2a.make_splash_mha_a2a_cp(dense, config=config,
                                        save_residuals=True, **fused_kw)
   elif case == "dynamic_mask":
@@ -163,7 +165,8 @@ def main() -> None:
   else:
     mask = (sm.FullMask((n, n)) if case == "native_layout"
             else sm.CausalMask((n, n)))
-    native = sk.make_splash_mha(mask, config=config, save_residuals=True)
+    native = sk.make_splash_mha(mask, config=config, save_residuals=True,
+                                q_seq_shards=1)
     fused = a2a.make_splash_mha_a2a_cp(mask, config=config,
                                        save_residuals=True, **fused_kw)
 
