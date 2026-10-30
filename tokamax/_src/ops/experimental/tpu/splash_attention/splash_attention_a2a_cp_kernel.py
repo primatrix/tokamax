@@ -825,7 +825,10 @@ def _splash_attention_forward(
   # Operands are keyed by name; absent optional operands are simply omitted.
   prefetch = {"rank": rank}
   if dynamic_grid:
+    # Dynamic masks pad active_rows/cols to the full grid with -1; the native
+    # kernel's grid stops at num_active_blocks, so the block loop does too.
     prefetch.update(
+        num_active=mask_info.num_active_blocks.astype(jnp.int32),
         active_rows=mask_info.active_rows,
         active_cols=mask_info.active_cols,
         bounds_start=bounds_start,
@@ -1012,14 +1015,18 @@ def _splash_attention_forward(
     def compute_head(h, in_sem, out_sem):
       """All active blocks of local head ``h`` with double-buffered DMA."""
       head_idx = rank_ * heads_local + h
-      for copy in in_copies(h, 0, 0, in_sem):
-        copy.start()
+      n_active = to_i32(r["num_active"][0]) if dynamic_grid else num_blocks
+
+      @pl.when(n_active > 0)
+      def _():
+        for copy in in_copies(h, 0, 0, in_sem):
+          copy.start()
 
       def block(g, out_count):
         slot = g % 2
 
         # Prefetch block g+1 into the other slot; block g-1 already used it.
-        @pl.when(g + 1 < num_blocks)
+        @pl.when(g + 1 < n_active)
         def _():
           for copy in in_copies(h, g + 1, 1 - slot, in_sem):
             copy.start()
@@ -1059,7 +1066,7 @@ def _splash_attention_forward(
 
         return out_count + write.astype(jnp.int32)
 
-      out_count = lax.fori_loop(0, num_blocks, block, jnp.int32(0))
+      out_count = lax.fori_loop(0, n_active, block, jnp.int32(0))
 
       # Drain the last two writebacks so o is complete before its exchange.
       @pl.when(out_count >= 1)
