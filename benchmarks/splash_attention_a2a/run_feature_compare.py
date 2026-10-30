@@ -110,6 +110,12 @@ def main() -> None:
     values["fuse_reciprocal"] = False
   if case == "soft_cap":
     values["attn_logits_soft_cap"] = 20.0
+  if case == "gqa":
+    # The native GQA backward keeps fp32 dk/dv blocks for the in/out-aliased
+    # group accumulation; at these tiles that needs ~33.5 MiB of scoped VMEM,
+    # over the 32 MiB default.  Both sides share the config, so the
+    # comparison is unchanged.
+    values["bwd_vmem_limit_bytes"] = 64 * 1024 * 1024
   for name in ("q_layout", "k_layout", "v_layout"):
     values[name] = sk.QKVLayout(values[name])
   config = sk.SplashConfig(**values)
