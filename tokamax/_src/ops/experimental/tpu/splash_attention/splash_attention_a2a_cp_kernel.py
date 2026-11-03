@@ -1856,11 +1856,28 @@ def _make_splash_attention(
     assert (mask_function_fwd is None) == (mask_function_dkv is None)
 
     dkv_mask_sparsity = float(np.mean(dkv_mask_info.block_mask != 0))
+    if cp_size > 1:
+      # The fused backward's configuration and schedule checks read the static
+      # mask metadata with NumPy, so run them before the arrays are converted
+      # (the factory may be called while tracing). The closure is not used.
+      mla_fused_backward.make_backward(
+          SplashAttentionA2ACpKernel(
+              fwd_mask_info,
+              dkv_mask_info,
+              config=config,
+              is_mqa=is_mqa,
+              mask_value=mask_value,
+              mask_function=mask_function_dkv,
+              dkv_mask_sparsity=dkv_mask_sparsity,
+          ),
+          cp_size,
+          axis_name=cp_axis,
+      )
     dkv_mask_info = tree_util.tree_map(jnp.array, dkv_mask_info)
   else:
     dkv_mask_sparsity = 1.0
 
-  kernel = SplashAttentionA2ACpKernel(
+  return SplashAttentionA2ACpKernel(
       fwd_mask_info,
       dkv_mask_info,
       config=config,
@@ -1875,12 +1892,6 @@ def _make_splash_attention(
       bwd_input_exchange=bwd_input_exchange,
       head_checkpoint_names=head_checkpoint_names,
   )
-  if cp_size > 1 and config.has_backward_blocks:
-    # The fused backward's configuration and schedule checks need the concrete
-    # mask metadata, which is only available here; the returned closure is not
-    # used.
-    mla_fused_backward.make_backward(kernel, cp_size, axis_name=cp_axis)
-  return kernel
 
 
 def _make_dynamic_splash_attention(
