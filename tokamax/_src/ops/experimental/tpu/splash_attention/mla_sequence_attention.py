@@ -21,6 +21,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.layout import Layout, with_layout_constraint
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_a2a_cp_kernel as a2a_cp
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as sk
 
 from tokamax._src.ops.experimental.tpu.splash_attention.mla_fused_backward import make_backward, validate_source
@@ -338,7 +339,7 @@ def make_local_attention(
       "kv_shadow_prefetch",
   ):
     raise ValueError("Unsupported MLA backward input exchange")
-  if fwd_input_exchange not in ("external", "remote_dma"):
+  if fwd_input_exchange not in ("external", "remote_dma", "fused_a2a"):
     raise ValueError("Unsupported MLA forward input exchange")
   if fwd_output_exchange not in ("external", "remote_dma"):
     raise ValueError("Unsupported MLA forward output exchange")
@@ -565,7 +566,16 @@ def make_local_attention(
 
 
 def _make_attention_with_external_inputs(
-    kernel, *, mesh, batch_axes, axis_name, record_max_logits, pullback, sequence_residuals, fwd_output_exchange
+    kernel,
+    *,
+    mesh,
+    batch_axes,
+    axis_name,
+    record_max_logits,
+    pullback,
+    sequence_residuals,
+    fwd_output_exchange,
+    fused_forward=False,
 ):
   """Keep the original global forward boundary and own backward exchanges.
 
@@ -630,7 +640,53 @@ def _make_attention_with_external_inputs(
       check_vma=False,
   )
 
+  if fused_forward:
+    if not sequence_residuals:
+      raise ValueError("The fused a2a forward keeps no head-layout Q/K/V; use a sequence-residual backward exchange")
+    cp = mesh.shape[axis_name]
+
+    @functools.partial(
+        jax.shard_map,
+        mesh=mesh,
+        in_specs=(sequence, sequence, sequence, full_segments),
+        out_specs=(sequence, head, head_stats, head_stats if record_max_logits else None),
+        check_vma=False,
+    )
+    def fused_forward_local(q, k, v, ids):
+      # The kernel exchanges sequence-sharded Q/K/V to heads and O back, and
+      # also returns the head-layout O that the native forward would produce.
+      to_hsd = lambda x: jnp.transpose(x[0], (1, 0, 2))
+      out, stats, buffers = a2a_cp._splash_attention_forward(  # pylint: disable=protected-access
+          kernel.fwd_mask_info,
+          to_hsd(q),
+          to_hsd(k),
+          to_hsd(v),
+          sk.SegmentIds(ids[0], ids[0]),
+          None,
+          mask_value=kernel.kwargs["mask_value"],
+          is_mqa=False,
+          config=cfg,
+          save_residuals=True,
+          mask_function=kernel.kwargs["mask_function"],
+          fwd_mask_sparsity=kernel.kwargs["fwd_mask_sparsity"],
+          cp_size=cp,
+          cp_axis=axis_name,
+      )
+      oh, lse = buffers["o"][None], stats["logsumexp"][None]
+      if cfg.residual_checkpoint_name:
+        oh = ad_checkpoint.checkpoint_name(oh, cfg.residual_checkpoint_name)
+        lse = ad_checkpoint.checkpoint_name(lse, cfg.residual_checkpoint_name)
+      output = jnp.transpose(out, (1, 0, 2))[None]
+      return output, oh, lse, stats["max_logits"][None] if record_max_logits else None
+
   def forward(q, k, v, ids):
+    if fused_forward:
+      full_ids = lax.with_sharding_constraint(ids, NamedSharding(mesh, full_segments))
+      output, oh, lse, max_logits = fused_forward_local(q, k, v, full_ids)
+      output = ad_checkpoint.checkpoint_name(output, "mla_attention_out")
+      if record_max_logits:
+        output = (output, lax.stop_gradient(jnp.max(max_logits, axis=2)))
+      return output, (q, k, v, full_ids, oh, lse)
     packed = lax.with_sharding_constraint(
         jnp.concatenate((q, k, v), axis=-1), NamedSharding(mesh, P(batch_axes, None, axis_name, None))
     )
@@ -680,7 +736,7 @@ def make_attention(
   batch_size = math.prod(mesh.shape[a] for a in axes)
   sequence = P(batch_axes, axis_name, None, None)
   segments = P(batch_axes, axis_name)
-  external_inputs = fused and fwd_input_exchange == "external"
+  external_inputs = fused and fwd_input_exchange in ("external", "fused_a2a")
   local = make_local_attention(
       kernel,
       cp=cp,
@@ -705,6 +761,7 @@ def make_attention(
         pullback=pullback,
         sequence_residuals=sequence_residuals,
         fwd_output_exchange=fwd_output_exchange,
+        fused_forward=fwd_input_exchange == "fused_a2a",
     )
   else:
     mapped = jax.shard_map(
