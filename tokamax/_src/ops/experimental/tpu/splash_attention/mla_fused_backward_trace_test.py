@@ -204,6 +204,124 @@ def test_export_writes_match_actual_bounds(export_metadata_kernel, cp):
   assert np.count_nonzero(writes) < n  # Interior Q accumulation does not send.
 
 
+@pytest.mark.parametrize("cp", [8, 16])
+@pytest.mark.parametrize("prefetch", [False, True])
+@pytest.mark.parametrize("owner_first", [False, True])
+def test_q_receive_precedes_actual_local_dma_start(export_metadata_kernel, monkeypatch, cp, prefetch, owner_first):
+  """Execute the wrapper's actual callbacks with a protocol-checking DMA stub.
+
+  This checks issue/wait order, not hardware visibility or arithmetic. In
+  particular a wait in prepare(g) is too late for load(g) issued at g-1.
+  """
+  kernel = export_metadata_kernel
+  proof = mla_fused_backward.validate_metadata(kernel, cp)
+  n, bq, sequence = proof["programs_per_head"], 512, 65536
+  rows = np.asarray(kernel.dkv_mask_info.active_rows, dtype=np.int32)
+  cols = np.asarray(kernel.dkv_mask_info.active_cols, dtype=np.int32)
+  assert proof["q_steps"] * bq == sequence
+  length = sequence // cp
+  assert np.all(cols[:n] * bq // length == ((cols[:n] + 1) * bq - 1) // length)
+  issued, received, loaded = set(), set(), set()
+  launches, receive_programs = {}, {}
+  current = [0, 0]
+
+  class Ref:
+    def __init__(self, name, indices=()):
+      self.name, self.indices = name, indices
+
+    @property
+    def at(self):
+      return self
+
+    def __getitem__(self, indices):
+      return Ref(self.name, indices)
+
+  class Transfer:
+    def __init__(self, source, destination, semaphore, remote=False):
+      self.source, self.destination, self.semaphore, self.remote = source, destination, semaphore, remote
+
+    def start(self):
+      head, program = current
+      if self.remote:
+        target_head, peer = map(int, self.semaphore.indices)
+        if target_head > head:
+          assert {(head, o) for o in range(cp)} <= received
+        issued.add((target_head, peer))
+        launches.setdefault(target_head, set()).add((head, program))
+      else:
+        assert self.destination.name == "bank"
+        generation = program if program == 0 and (head, 0) not in loaded else program + 1
+        tile = self.source.indices[1].start // bq
+        assert tile == int(cols[generation])
+        assert int(self.destination.indices) == generation % 3
+        assert (head, tile * bq // length) in received, "local Q DMA started before owner receive"
+        loaded.add((head, generation))
+
+    def wait(self):
+      head, program = current
+      if self.semaphore.name == "recv":
+        key = tuple(map(int, self.semaphore.indices))
+        assert key not in received, "receive consumed twice"
+        assert key[0] == head and {(head, p) for p in range(cp)} <= issued
+        received.add(key)
+        receive_programs[key] = program
+      else:
+        assert (head, program) in loaded
+
+    def wait_send(self):
+      assert tuple(map(int, self.semaphore.indices)) in issued
+
+  def when(condition):
+    def invoke(fn):
+      if bool(condition):
+        fn()
+    return invoke
+
+  def fori_loop(start, stop, body, carry, **kwargs):
+    del kwargs
+    for value in range(int(start), int(stop)):
+      carry = body(np.int32(value), carry)
+    return carry
+
+  monkeypatch.setattr(mla_fused_backward, "pl", SimpleNamespace(
+      program_id=lambda axis: np.int32(current[axis]), num_programs=lambda axis: n,
+      when=when, ds=lambda start, size: slice(int(start), int(start + size)),
+  ))
+  monkeypatch.setattr(mla_fused_backward, "lax", SimpleNamespace(
+      axis_index=lambda axis: np.int32(0), rem=np.remainder, div=np.floor_divide, fori_loop=fori_loop,
+  ))
+  monkeypatch.setattr(mla_fused_backward, "pltpu", SimpleNamespace(
+      make_async_copy=lambda src, dst, sem: Transfer(src, dst, sem),
+      make_async_remote_copy=lambda src, dst, send, recv, **kwargs: Transfer(src, dst, send, remote=True),
+  ))
+  monkeypatch.setattr(mla_fused_backward, "jnp", SimpleNamespace(int32=np.int32, logical_and=np.logical_and))
+  monkeypatch.setattr(mla_fused_backward, "sk", SimpleNamespace(to_i32=np.int32))
+  refs = [Ref(str(i)) for i in range(53)]
+  refs[:2] = rows, cols
+  refs[49:] = [Ref(name) for name in ("bank", "send", "recv", "load")]
+
+  def body(*args, q_prepare, q_prefetch):
+    del args
+    q_prepare()
+    q_prefetch()
+
+  for head in range(4):
+    for program in range(n):
+      current[:] = head, program
+      mla_fused_backward.q_hbm_output_kernel(
+          *refs, base_kernel=body, cp=cp, axis_name="context", heads=4,
+          sequence=sequence, bq=bq, prefetch=prefetch, owner_first=owner_first,
+      )
+  assert received == {(h, o) for h in range(4) for o in range(cp)}
+  assert loaded == {(h, g) for h in range(4) for g in range(n)}
+  for head in range(4):
+    for owner in range(cp):
+      first = int(np.flatnonzero(cols[:n] * bq // length == owner)[0])
+      assert receive_programs[head, owner] == (max(0, first - 1) if owner_first else 0)
+    expected_launch = (head - 1, (cp - 1) * (length // bq) - 1 if owner_first else 0)
+    assert launches[head] == {expected_launch if prefetch and head else (head, 0)}
+
+
 def test_export_rejects_padding_that_suppresses_last_send(export_metadata_kernel):
   info = export_metadata_kernel.dkv_mask_info
   n = int(np.asarray(info.num_active_blocks)[0])
@@ -254,6 +372,7 @@ def test_export_rejects_reordered_accumulation(export_metadata_kernel):
         "kv_hbm_traced",
         "qkv_hbm_serial",
         "qkv_hbm_prefetch",
+        "qkv_hbm_owner_first",
         "kv_shadow_serial",
         "kv_shadow_prefetch",
     ],
@@ -327,6 +446,7 @@ def test_input_exchanges_preserve_original_policy_saved_tensors(export_metadata_
       "kv_hbm_traced",
       "qkv_hbm_serial",
       "qkv_hbm_prefetch",
+      "qkv_hbm_owner_first",
       "kv_shadow_serial",
       "kv_shadow_prefetch",
   ):
@@ -383,6 +503,7 @@ def test_input_exchanges_preserve_original_policy_saved_tensors(export_metadata_
         "kv_hbm_traced",
         "qkv_hbm_serial",
         "qkv_hbm_prefetch",
+        "qkv_hbm_owner_first",
         "kv_shadow_serial",
         "kv_shadow_prefetch",
     ],
@@ -407,6 +528,7 @@ def test_experimental_inputs_reject_ordinary_vjp(export_metadata_kernel, exchang
         "kv_hbm_traced",
         "qkv_hbm_serial",
         "qkv_hbm_prefetch",
+        "qkv_hbm_owner_first",
         "kv_shadow_serial",
         "kv_shadow_prefetch",
     ],

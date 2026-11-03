@@ -716,7 +716,7 @@ def kv_hbm_output_kernel(
       lax.fori_loop(0, heads, wait_head, None, unroll=False)
 
 
-def q_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, sequence, bq, prefetch):
+def q_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, sequence, bq, prefetch, owner_first=False):
   """Import each Q head once, then stream tiles through three VMEM banks.
 
   Unique HBM destinations and remote counters are never reused in a call.
@@ -732,6 +732,8 @@ def q_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, sequence, bq, 
   rank = lax.axis_index(axis_name)
   head, program = pl.program_id(0), pl.program_id(1)
   length, programs = sequence // cp, pl.num_programs(1)
+  assert length % bq == 0
+  tiles_per_owner = length // bq
 
   def remote(h, peer):
     return pltpu.make_async_remote_copy(
@@ -756,6 +758,20 @@ def q_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, sequence, bq, 
         load_sem.at[lax.rem(g, 3)],
     )
 
+  def receive(owner, _=None):
+    pltpu.make_async_copy(
+        source.at[rank * heads + head],
+        destination.at[head, pl.ds(owner * length, length), :],
+        recv.at[head, owner],
+    ).wait()
+
+  def launch_next_head():
+    if prefetch:
+
+      @pl.when(head + 1 < heads)
+      def next_head():
+        launch(head + 1)
+
   @pl.when(program == 0)
   def bootstrap():
     if prefetch:
@@ -770,22 +786,15 @@ def q_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, sequence, bq, 
   def prepare():
     @pl.when(program == 0)
     def receive_head():
-      # The first causal KV row consumes all Q owners, so wait each source
-      # once here. K/V bootstrap has already been enqueued by the wrapper.
-      def receive(owner, _):
-        pltpu.make_async_copy(
-            source.at[rank * heads + head],
-            destination.at[head, pl.ds(owner * length, length), :],
-            recv.at[head, owner],
-        ).wait()
-
-      lax.fori_loop(0, cp, receive, None, unroll=False)
+      # K/V bootstrap has already been enqueued by the wrapper. Complete
+      # causal metadata starts at Q tile 0, wholly within owner 0's chunk.
+      if owner_first:
+        receive(jnp.int32(0))
+      else:
+        lax.fori_loop(0, cp, receive, None, unroll=False)
       load(jnp.int32(0)).start()
-      if prefetch:
-
-        @pl.when(head + 1 < heads)
-        def next_head():
-          launch(head + 1)
+      if not owner_first:
+        launch_next_head()
 
     load(program).wait()
 
@@ -795,6 +804,24 @@ def q_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, sequence, bq, 
     # bank is either unused or protected by the preceding head's drain.
     @pl.when(program + 1 < programs)
     def enqueue():
+      if owner_first:
+        # The validated first KV row visits every Q tile in order. Each
+        # owner must arrive before its first local DMA START, one program
+        # ahead of consumption. Later KV rows must not consume it again.
+        row = sk.to_i32(original[0][program + 1])
+        tile = sk.to_i32(original[1][program + 1])
+
+        @pl.when(jnp.logical_and(row == 0, lax.rem(tile, tiles_per_owner) == 0))
+        def receive_first_tile():
+          owner = lax.div(tile, tiles_per_owner)
+          receive(owner)
+
+          @pl.when(owner == cp - 1)
+          def all_owners_received():
+            # Preserve the all-owner path's cross-head traffic invariant:
+            # next head is launched only after every current receive.
+            launch_next_head()
+
       load(program + 1).start()
 
   original[6] = bank.at[lax.rem(program, 3)]
@@ -988,6 +1015,7 @@ def fused_backward(
     kv_hbm_prefetch: bool | None = None,
     kv_hbm_trace: bool = False,
     q_hbm_prefetch: bool | None = None,
+    q_owner_first: bool = False,
     shadow_imports: tuple | None = None,
     shadow_prefetch: bool = False,
     bq: int,
@@ -1002,6 +1030,8 @@ def fused_backward(
 ):
   kv_hbm = kv_hbm_prefetch is not None
   q_hbm = q_hbm_prefetch is not None
+  if type(q_owner_first) is not bool or (q_owner_first and not q_hbm):
+    raise ValueError("Q owner-first receives require a static selector and Q HBM staging")
   if q_hbm and (type(q_hbm_prefetch) is not bool or not kv_hbm or cp_barrier):
     raise ValueError("Q HBM import requires K/V HBM staging and the global barrier")
   if type(kv_hbm_trace) is not bool or (kv_hbm_trace and kv_hbm_prefetch is not True):
@@ -1551,6 +1581,7 @@ def fused_backward(
           sequence=q_seq_len,
           bq=bq,
           prefetch=q_hbm_prefetch,
+          owner_first=q_owner_first,
       )
       out_shapes.append(jax.ShapeDtypeStruct(q_head_shape, q.dtype))
       out_specs.append(pl.BlockSpec(memory_space=pl.ANY))
@@ -1695,7 +1726,7 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
       or any(layout != sk.QKVLayout.HEAD_DIM_MINOR for layout in (cfg.q_layout, cfg.k_layout, cfg.v_layout))
   ):
     raise ValueError("Unsupported MLA fused backward configuration")
-  validate_metadata(kernel, cp)
+  metadata = validate_metadata(kernel, cp)
 
   def backward(
       q,
@@ -1715,11 +1746,17 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
       kv_hbm_prefetch=None,
       kv_hbm_trace=False,
       q_hbm_prefetch=None,
+      q_owner_first=False,
       shadow_imports=None,
       shadow_prefetch=False,
   ):
     q_hbm = q_hbm_prefetch is not None
     heads, sequence = o.shape[:2] if q_hbm else q.shape[:2]
+    if q_owner_first and (
+        metadata["q_steps"] * cfg.block_q_dkv != sequence
+        or sequence % (cp * cfg.block_q_dkv)
+    ):
+      raise ValueError("Q owner-first receives require complete Q tiles matching the validated causal schedule")
     kv_import = kv_import_prefetch is not None or kv_hbm_prefetch is not None
     q_shape = (cp * heads, sequence // cp, 192) if q_hbm else (heads, sequence, 192)
     k_shape = (cp * heads, sequence // cp, 192) if kv_import else (heads, sequence, 192)
@@ -1756,6 +1793,7 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
         kv_hbm_prefetch=kv_hbm_prefetch,
         kv_hbm_trace=kv_hbm_trace,
         q_hbm_prefetch=q_hbm_prefetch,
+        q_owner_first=q_owner_first,
         shadow_imports=shadow_imports,
         shadow_prefetch=shadow_prefetch,
         bq=cfg.block_q_dkv,
