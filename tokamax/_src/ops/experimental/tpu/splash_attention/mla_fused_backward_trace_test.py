@@ -107,6 +107,21 @@ def config():
   )
 
 
+def _equations(value):
+  if hasattr(value, "eqns"):
+    for equation in value.eqns:
+      yield equation
+      yield from _equations(equation.params)
+  elif hasattr(value, "jaxpr"):
+    yield from _equations(value.jaxpr)
+  elif isinstance(value, dict):
+    for child in value.values():
+      yield from _equations(child)
+  elif isinstance(value, (tuple, list)):
+    for child in value:
+      yield from _equations(child)
+
+
 def test_pinned_source_and_bad_config_rejection():
   mla_fused_backward.validate_source()
   cfg = config()
@@ -237,12 +252,14 @@ def test_export_rejects_reordered_accumulation(export_metadata_kernel):
         "kv_hbm_serial",
         "kv_hbm_prefetch",
         "kv_hbm_traced",
+        "qkv_hbm_serial",
+        "qkv_hbm_prefetch",
         "kv_shadow_serial",
         "kv_shadow_prefetch",
     ],
 )
 def test_full_sequence_vjp_output_ownership(cp, cp_barrier, bwd_input_exchange):
-  if cp_barrier and bwd_input_exchange.startswith(("per_head", "kv_credit", "kv_hbm", "kv_shadow")):
+  if cp_barrier and bwd_input_exchange.startswith(("per_head", "kv_credit", "kv_hbm", "qkv_hbm", "kv_shadow")):
     pytest.skip("Experimental import paths require the compiler global barrier")
   fsdp, heads = 16 // cp, cp * 4
   mesh = Mesh(np.asarray(jax.devices()[:16]).reshape(fsdp, cp), ("fsdp", "context"))
@@ -274,6 +291,15 @@ def test_full_sequence_vjp_output_ownership(cp, cp_barrier, bwd_input_exchange):
       (fsdp, seq, heads, 128),
   ]
   assert "name=mla_fused_dq_dkv_a2a" in str(program)
+  if bwd_input_exchange.startswith(("kv_hbm", "qkv_hbm")):
+    # Forward retains the original global sharding constraints. The only
+    # explicit all_to_all operations here belong to the backward pullback.
+    widths = sorted(
+        equation.invars[0].aval.shape[-1]
+        for equation in _equations(program)
+        if equation.primitive.name == "all_to_all"
+    )
+    assert widths == ([128] if bwd_input_exchange.startswith("qkv_hbm") else [128, 192])
 
 
 @pytest.mark.skipif(len(jax.devices()) < 16, reason="Requires 16 logical devices")
@@ -299,6 +325,8 @@ def test_input_exchanges_preserve_original_policy_saved_tensors(export_metadata_
       "kv_hbm_serial",
       "kv_hbm_prefetch",
       "kv_hbm_traced",
+      "qkv_hbm_serial",
+      "qkv_hbm_prefetch",
       "kv_shadow_serial",
       "kv_shadow_prefetch",
   ):
@@ -353,6 +381,8 @@ def test_input_exchanges_preserve_original_policy_saved_tensors(export_metadata_
         "kv_hbm_serial",
         "kv_hbm_prefetch",
         "kv_hbm_traced",
+        "qkv_hbm_serial",
+        "qkv_hbm_prefetch",
         "kv_shadow_serial",
         "kv_shadow_prefetch",
     ],
@@ -375,6 +405,8 @@ def test_experimental_inputs_reject_ordinary_vjp(export_metadata_kernel, exchang
         "kv_hbm_serial",
         "kv_hbm_prefetch",
         "kv_hbm_traced",
+        "qkv_hbm_serial",
+        "qkv_hbm_prefetch",
         "kv_shadow_serial",
         "kv_shadow_prefetch",
     ],

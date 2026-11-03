@@ -334,6 +334,8 @@ def make_local_attention(
       "kv_hbm_serial",
       "kv_hbm_prefetch",
       "kv_hbm_traced",
+      "qkv_hbm_serial",
+      "qkv_hbm_prefetch",
       "kv_shadow_serial",
       "kv_shadow_prefetch",
   ):
@@ -345,7 +347,8 @@ def make_local_attention(
   if bwd_input_exchange != "remat" and not fused:
     raise ValueError("Experimental backward input exchanges require the fused VJP")
   per_head = bwd_input_exchange in ("per_head_split", "per_head_a2a", "per_head_import")
-  kv_hbm = bwd_input_exchange in ("kv_hbm_serial", "kv_hbm_prefetch", "kv_hbm_traced")
+  q_hbm = bwd_input_exchange in ("qkv_hbm_serial", "qkv_hbm_prefetch")
+  kv_hbm = q_hbm or bwd_input_exchange in ("kv_hbm_serial", "kv_hbm_prefetch", "kv_hbm_traced")
   kv_import = kv_hbm or bwd_input_exchange in (
       "kv_credit_serial",
       "kv_credit_prefetch",
@@ -372,6 +375,8 @@ def make_local_attention(
       "kv_hbm_serial",
       "kv_hbm_prefetch",
       "kv_hbm_traced",
+      "qkv_hbm_serial",
+      "qkv_hbm_prefetch",
       "kv_shadow_serial",
       "kv_shadow_prefetch",
   )
@@ -475,9 +480,10 @@ def make_local_attention(
     elif bwd_input_exchange == "separate" or kv_shadow:
       qh, kh, vh, do_head = (to_head(x) for x in (q_seq, k_seq, v_seq, do_sequence))
     elif kv_import:
-      # Q/dO remain once-per-call external imports for this intermediate
-      # candidate. The backward kernel owns each K/V sequence row's exchange.
-      qh, do_head = (to_head(x) for x in (q_seq, do_sequence))
+      # dO keeps its qualified external exchange and di reduction. K/V and,
+      # optionally, Q are imported from sequence-owned sources by backward.
+      qh = jnp.transpose(q_seq, (0, 2, 1, 3)) if q_hbm else to_head(q_seq)
+      do_head = to_head(do_sequence)
       kh, vh = (jnp.transpose(x, (0, 2, 1, 3)) for x in (k_seq, v_seq))
     elif bwd_input_exchange in ("per_head_a2a", "per_head_import"):
       # Keep each tensor separate so no 640-wide unpacking is needed. The
@@ -536,6 +542,7 @@ def make_local_attention(
           kv_import_prefetch=(bwd_input_exchange != "kv_credit_serial") if kv_import and not kv_hbm else None,
           kv_hbm_prefetch=(bwd_input_exchange != "kv_hbm_serial") if kv_hbm else None,
           kv_hbm_trace=bwd_input_exchange == "kv_hbm_traced",
+          q_hbm_prefetch=(bwd_input_exchange == "qkv_hbm_prefetch") if q_hbm else None,
           kv_import_defer_send=bwd_input_exchange in ("kv_credit_deferred", "kv_credit_ahead"),
           kv_import_launch_after_credit=bwd_input_exchange == "kv_credit_ahead",
           # Keep the diagnostic source conversion independent of the real

@@ -50,7 +50,8 @@ requires explicit revalidation; do not simply refresh the expected hash.
 
 ## Migration and validation
 
-The backward implementation is byte-identical to MaxText commit
+The stable migration at Tokamax commit `924d4d9` has a backward implementation
+byte-identical to MaxText commit
 `a4b23b5add26644bf39e2b620ce144d56d8e154e`. The sequence wrapper changes only
 its import of that implementation. Function/kernel names, checkpoint tags,
 forward sharding and backward dQ layout are preserved. The base is
@@ -82,3 +83,23 @@ XLA_FLAGS=--xla_force_host_platform_device_count=16 python -m pytest -q \
 ```
 
 These CPU checks do not execute TPU remote DMA or establish device accuracy.
+
+## Experimental Q HBM import
+
+`qkv_hbm_serial` and `qkv_hbm_prefetch` add Q import to the existing prefetched
+K/V HBM path. Both keep dO's external exchange and the qualified di reduction.
+The serial selector waits until the current head to send Q; the prefetch
+selector sends the next head while computing the current head. Neither is
+production qualified.
+
+Each head receives Q into a distinct HBM destination. Its first program waits
+for every owner's receive exactly once, before any local Q load starts. Three
+VMEM banks stream Q tiles: the prefetch of program g+1 reuses the bank from g-2
+only after the existing full dQ store for g-2 completes. The final two dQ
+stores drain at each head boundary, and every Q send drains before return.
+This requires the pipelined dQ path and the compiler global barrier.
+
+The inner Splash arithmetic, dQ accumulation order, grid, block sizes and
+checkpoint policy are unchanged. CPU tracing can check shapes and exchange
+ownership; CPU TPU compilation, repeated device bitwise comparisons, group
+isolation, memory analysis and full-model precision remain separate gates.
