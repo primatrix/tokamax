@@ -15,9 +15,9 @@
 
 """Splash attention with the Ulysses (a2a) context-parallel exchange fused in.
 
-This module provides the forward pass only.  It is derived from
-``splash_attention_kernel.py``; the attention math (``flash_attention_kernel``
-body and mask processing) is unchanged and only the forward driver differs:
+It is derived from ``splash_attention_kernel.py``; the attention math
+(``flash_attention_kernel`` body and mask processing) is unchanged and only the
+forward driver differs:
 
 * the native forward is a gridded ``pallas_call`` over (head, active block);
 * here a single ``pallas_call`` owns, per local head, the q/k/v sequence-to-head
@@ -26,6 +26,10 @@ body and mask processing) is unchanged and only the forward driver differs:
   outgoing(h) overlaps compute(h+1).
 
 With ``cp_size == 1`` the same block loop runs without any exchange.
+
+The backward is ``mla_fused_backward``: dO is exchanged to the head layout with
+``lax.all_to_all`` and the kernel exports dq/dk/dv back to sequence shards.  It
+supports cp 8/16, a static mask schedule and the qualified MLA configuration.
 
 Calling convention for ``cp_size > 1`` (inside the caller's ``shard_map`` over
 ``cp_axis``): q/k/v are the local sequence shards ``[heads, N / cp, d]``,
@@ -52,6 +56,7 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.tpu.splash_attention import base
+from tokamax._src.ops.experimental.tpu.splash_attention import mla_fused_backward
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask_info as mask_info_lib
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as _native
@@ -1493,7 +1498,71 @@ def _splash_attention_fwd(
     return out, residuals
 
 
-# TODO: `_splash_attention_bwd` lands with the backward optimization.
+def _splash_attention_bwd(
+    save_residuals: bool,
+    mask_value: float,
+    is_mqa: bool,
+    config: SplashConfig,
+    mask_function: MaskFunctionType | None,
+    fwd_mask_sparsity: float,
+    dkv_mask_sparsity: float,
+    cp_size: int,
+    cp_axis: str | None,
+    res: base.SplashResidualsType,
+    grads: jax.Array | tuple[jax.Array, dict[str, jax.Array]],
+):
+  # If `save_residuals` is True, `_splash_attention_fwd` returns `(out, stats)`,
+  # so we unpack the gradients, otherwise it returns `out` and `grads` is just
+  # `do`.
+  if save_residuals:
+    do, _ = grads
+  else:
+    do = grads
+  del save_residuals, fwd_mask_sparsity
+  if not config.has_backward_blocks:
+    raise ValueError("Need to specify backward blocks.")
+  if cp_size == 1:
+    raise NotImplementedError("The MLA fused backward requires cp_size 8 or 16.")
+  q, k, v, segment_ids, sinks, o, logsumexp, dkv_mask_info = res
+  if sinks is not None:
+    raise NotImplementedError("The MLA fused backward does not support sinks.")
+  # dO arrives sequence sharded; move it to the head-sharded layout of o.
+  do = lax.all_to_all(do, cp_axis, 0, 1, tiled=True)
+  with jax.named_scope("splash_bwd_di"):
+    di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))
+  # The kernel exports dq/dk/dv in the caller's sequence-sharded layout.
+  dq, dk, dv = mla_fused_backward.fused_backward(
+      q,
+      k,
+      v,
+      segment_ids,
+      logsumexp,
+      do,
+      di,
+      cp=cp_size,
+      axis_name=cp_axis,
+      bq=config.block_q_dkv,
+      bkv=config.block_kv_dkv,
+      bkv_compute=config.block_kv_dkv_compute,
+      is_mqa=is_mqa,
+      mask_info=dkv_mask_info,
+      mask_value=mask_value,
+      mask_function=mask_function,
+      config=config,
+      dkv_mask_sparsity=dkv_mask_sparsity,
+  )
+  return (
+      None,  # fwd_mask_info
+      None,  # dvk_mak_info
+      dq,  # q
+      dk,  # k
+      dv,  # v
+      None,  # segment_ids
+      None,  # sinks
+      None,  # max_logit_estimate
+  )
+
+
 _splash_attention_custom.defvjp(_splash_attention_fwd, _splash_attention_bwd)
 
 
@@ -1698,7 +1767,7 @@ def _make_splash_attention(
   else:
     dkv_mask_sparsity = 1.0
 
-  return SplashAttentionA2ACpKernel(
+  kernel = SplashAttentionA2ACpKernel(
       fwd_mask_info,
       dkv_mask_info,
       config=config,
@@ -1711,6 +1780,12 @@ def _make_splash_attention(
       cp_size=cp_size,
       cp_axis=cp_axis,
   )
+  if cp_size > 1 and config.has_backward_blocks:
+    # The fused backward's configuration and schedule checks need the concrete
+    # mask metadata, which is only available here; the returned closure is not
+    # used.
+    mla_fused_backward.make_backward(kernel, cp_size, axis_name=cp_axis)
+  return kernel
 
 
 def _make_dynamic_splash_attention(
@@ -1743,6 +1818,10 @@ def _make_dynamic_splash_attention(
 
   # This is the only mode that supports the dynamic grid.
   config = dataclasses.replace(config, dq_reduction_steps=3)
+  if cp_size > 1 and config.has_backward_blocks:
+    raise NotImplementedError(
+        "The MLA fused backward requires a static mask schedule."
+    )
 
   def process_mask_shard(mask):
     process_mask_fn = functools.partial(
