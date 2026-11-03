@@ -566,7 +566,7 @@ def kv_previous_send(generation, *, rows, cp):
 
 def kv_hbm_output_kernel(
     *refs, base_kernel, cp, axis_name, heads, rows, bq, prefetch, trace_regions=False,
-    q_prepare=None, q_prefetch=None,
+    q_prepare=None, q_prefetch=None, q_bootstrap=None,
 ):
   """Import into unique HBM head slots, then explicitly load two VMEM banks.
 
@@ -577,6 +577,7 @@ def kv_hbm_output_kernel(
   Hardware visibility and that last-read dependency need device acceptance.
   """
   assert len(refs) == 48 and heads == 4 and rows % cp == 0 and rows % 2 == 0
+  assert q_bootstrap is None or prefetch
   original = list(refs[:23]) + list(refs[26:42])
   destinations, fence_output = refs[23:25], refs[25]
   k_bank, v_bank, send, recv, load_sem, fence_sem = refs[42:]
@@ -647,6 +648,10 @@ def kv_hbm_output_kernel(
       @pl.when(head == 0)
       def bootstrap():
         launch(jnp.int32(0))
+        if q_bootstrap is not None:
+          # Enqueue Q only after every K/V head-0 send has been issued,
+          # before the first K/V receive. This callback launches no waits.
+          q_bootstrap()
 
     else:
       launch(head)
@@ -716,7 +721,9 @@ def kv_hbm_output_kernel(
       lax.fori_loop(0, heads, wait_head, None, unroll=False)
 
 
-def q_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, sequence, bq, prefetch, owner_first=False):
+def q_hbm_output_kernel(
+    *refs, base_kernel, cp, axis_name, heads, sequence, bq, prefetch, owner_first=False, kv_first=False,
+):
   """Import each Q head once, then stream tiles through three VMEM banks.
 
   Unique HBM destinations and remote counters are never reused in a call.
@@ -725,6 +732,7 @@ def q_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, sequence, bq, 
   introduced; device qualification must check the compiler dependency.
   """
   assert len(refs) == 53 and heads == 4 and sequence % cp == 0
+  assert not kv_first or (prefetch and owner_first)
   original = list(refs[:26]) + list(refs[27:49])
   destination = refs[26]
   bank, send, recv, load_sem = refs[49:]
@@ -772,16 +780,18 @@ def q_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, sequence, bq, 
       def next_head():
         launch(head + 1)
 
-  @pl.when(program == 0)
-  def bootstrap():
-    if prefetch:
+  if not kv_first:
 
-      @pl.when(head == 0)
-      def first_head():
-        launch(jnp.int32(0))
+    @pl.when(program == 0)
+    def bootstrap():
+      if prefetch:
 
-    else:
-      launch(head)
+        @pl.when(head == 0)
+        def first_head():
+          launch(jnp.int32(0))
+
+      else:
+        launch(head)
 
   def prepare():
     @pl.when(program == 0)
@@ -825,7 +835,14 @@ def q_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, sequence, bq, 
       load(program + 1).start()
 
   original[6] = bank.at[lax.rem(program, 3)]
-  base_kernel(*original, q_prepare=prepare, q_prefetch=next_tile)
+  if kv_first:
+    # The inner wrapper invokes this exactly once at head 0 / program 0,
+    # after its K/V launch and before its first receive. All Q consumption,
+    # later-head launches and three-bank dependencies stay in the old path.
+    base_kernel(*original, q_prepare=prepare, q_prefetch=next_tile,
+                q_bootstrap=lambda: launch(jnp.int32(0)))
+  else:
+    base_kernel(*original, q_prepare=prepare, q_prefetch=next_tile)
 
   @pl.when(jnp.logical_and(head == heads - 1, program == programs - 1))
   def drain_sources():
@@ -1016,6 +1033,7 @@ def fused_backward(
     kv_hbm_trace: bool = False,
     q_hbm_prefetch: bool | None = None,
     q_owner_first: bool = False,
+    q_kv_first: bool = False,
     shadow_imports: tuple | None = None,
     shadow_prefetch: bool = False,
     bq: int,
@@ -1030,6 +1048,10 @@ def fused_backward(
 ):
   kv_hbm = kv_hbm_prefetch is not None
   q_hbm = q_hbm_prefetch is not None
+  if type(q_kv_first) is not bool or (
+      q_kv_first and (not q_owner_first or q_hbm_prefetch is not True or kv_hbm_prefetch is not True)
+  ):
+    raise ValueError("K/V-first bootstrap requires owner-first Q and prefetched Q/K/V HBM staging")
   if type(q_owner_first) is not bool or (q_owner_first and not q_hbm):
     raise ValueError("Q owner-first receives require a static selector and Q HBM staging")
   if q_hbm and (type(q_hbm_prefetch) is not bool or not kv_hbm or cp_barrier):
@@ -1582,6 +1604,7 @@ def fused_backward(
           bq=bq,
           prefetch=q_hbm_prefetch,
           owner_first=q_owner_first,
+          kv_first=q_kv_first,
       )
       out_shapes.append(jax.ShapeDtypeStruct(q_head_shape, q.dtype))
       out_specs.append(pl.BlockSpec(memory_space=pl.ANY))
@@ -1747,6 +1770,7 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
       kv_hbm_trace=False,
       q_hbm_prefetch=None,
       q_owner_first=False,
+      q_kv_first=False,
       shadow_imports=None,
       shadow_prefetch=False,
   ):
@@ -1794,6 +1818,7 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
         kv_hbm_trace=kv_hbm_trace,
         q_hbm_prefetch=q_hbm_prefetch,
         q_owner_first=q_owner_first,
+        q_kv_first=q_kv_first,
         shadow_imports=shadow_imports,
         shadow_prefetch=shadow_prefetch,
         bq=cfg.block_q_dkv,

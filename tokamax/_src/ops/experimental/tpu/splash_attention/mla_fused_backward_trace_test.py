@@ -5,6 +5,7 @@ qualification is a separate CP8/CP16 test; this checks the production ABI.
 """
 
 import dataclasses
+import functools
 import math
 from types import SimpleNamespace
 
@@ -322,6 +323,142 @@ def test_q_receive_precedes_actual_local_dma_start(export_metadata_kernel, monke
     assert launches[head] == {expected_launch if prefetch and head else (head, 0)}
 
 
+@pytest.mark.parametrize("cp", [8, 16])
+def test_kv_first_changes_only_bootstrap_issue_order(export_metadata_kernel, monkeypatch, cp):
+  """Run both actual wrappers; all events after head-0 issue must match.
+
+  Receive-before-local-start and all source drains are checked for Q/K/V.
+  This protocol simulation does not qualify TPU DMA visibility or bank reads.
+  """
+  proof = mla_fused_backward.validate_metadata(export_metadata_kernel, cp)
+  programs, bq, sequence = proof["programs_per_head"], 512, 65536
+  rows = np.asarray(export_metadata_kernel.dkv_mask_info.active_rows, dtype=np.int32)
+  cols = np.asarray(export_metadata_kernel.dkv_mask_info.active_cols, dtype=np.int32)
+  kv_rows, block = sequence // (8 * bq), 8 * bq
+  first = np.r_[True, rows[1:] != rows[:-1]]
+  last = np.r_[rows[:-1] != rows[1:], True]
+  current, events, issued, received, drained = [0, 0], [], set(), set(), set()
+
+  class Ref:
+    def __init__(self, name, indices=()):
+      self.name, self.indices = name, indices
+
+    @property
+    def at(self):
+      return self
+
+    def __getitem__(self, indices):
+      return Ref(self.name, indices)
+
+  class Transfer:
+    def __init__(self, source, destination, semaphore, remote=False):
+      self.source, self.destination, self.semaphore, self.remote = source, destination, semaphore, remote
+
+    def key(self):
+      indices = self.semaphore.indices
+      if not isinstance(indices, tuple):
+        indices = (indices,)
+      return self.semaphore.name.split("_")[0], *map(int, indices)
+
+    def record(self, operation):
+      events.append((operation, *current, self.semaphore.name, *self.key()[1:]))
+
+    def start(self):
+      self.record("start")
+      head, program = current
+      if self.remote:
+        key = self.key()
+        assert key not in issued, "remote transfer issued twice"
+        issued.add(key)
+        if key[0] == "q" and key[1] > head:
+          assert {("q", head, o) for o in range(cp)} <= received
+      elif self.semaphore.name == "q_load":
+        tile = self.source.indices[1].start // bq
+        assert ("q", head, tile * bq // (sequence // cp)) in received
+      elif self.semaphore.name == "kv_load":
+        row = self.source.indices[1].start // block
+        tensor = int(self.semaphore.indices[1])
+        assert ("kv", head, row // (kv_rows // cp), tensor) in received
+
+    def wait(self):
+      self.record("wait")
+      if self.semaphore.name.endswith("_recv"):
+        key = self.key()
+        assert key in issued and key not in received
+        received.add(key)
+
+    def wait_send(self):
+      self.record("wait_send")
+      key = self.key()
+      assert current == [3, programs - 1]
+      assert key in issued and key not in drained
+      drained.add(key)
+
+  def when(condition):
+    def invoke(fn):
+      if bool(condition):
+        fn()
+    return invoke
+
+  def fori_loop(start, stop, body, carry, **kwargs):
+    del kwargs
+    for value in range(int(start), int(stop)):
+      carry = body(np.int32(value), carry)
+    return carry
+
+  monkeypatch.setattr(mla_fused_backward, "pl", SimpleNamespace(
+      program_id=lambda axis: np.int32(current[axis]), num_programs=lambda axis: programs,
+      when=when, ds=lambda start, size: slice(int(start), int(start + size)),
+  ))
+  monkeypatch.setattr(mla_fused_backward, "lax", SimpleNamespace(
+      axis_index=lambda axis: np.int32(0), rem=np.remainder, div=np.floor_divide, fori_loop=fori_loop,
+  ))
+  monkeypatch.setattr(mla_fused_backward, "pltpu", SimpleNamespace(
+      make_async_copy=lambda src, dst, sem: Transfer(src, dst, sem),
+      make_async_remote_copy=lambda src, dst, send, recv, **kwargs: Transfer(src, dst, send, remote=True),
+  ))
+  monkeypatch.setattr(mla_fused_backward, "jnp", SimpleNamespace(
+      int32=np.int32, bool_=np.bool_, logical_and=np.logical_and,
+  ))
+  monkeypatch.setattr(mla_fused_backward, "sk", SimpleNamespace(to_i32=np.int32))
+  refs = [Ref(str(i)) for i in range(53)]
+  refs[:2], refs[3:5] = [rows, cols], [first, last]
+  refs[43:49] = [Ref(name) for name in ("k_bank", "v_bank", "kv_send", "kv_recv", "kv_load", "fence")]
+  refs[49:] = [Ref(name) for name in ("q_bank", "q_send", "q_recv", "q_load")]
+
+  def body(*args, q_prefetch):
+    del args
+    q_prefetch()
+
+  inner = functools.partial(
+      mla_fused_backward.kv_hbm_output_kernel, base_kernel=body, cp=cp,
+      axis_name="context", heads=4, rows=kv_rows, bq=bq, prefetch=True,
+  )
+  traces = []
+  for kv_first in (False, True):
+    events.clear()
+    issued.clear()
+    received.clear()
+    drained.clear()
+    for head in range(4):
+      for program in range(programs):
+        current[:] = head, program
+        mla_fused_backward.q_hbm_output_kernel(
+            *refs, base_kernel=inner, cp=cp, axis_name="context", heads=4,
+            sequence=sequence, bq=bq, prefetch=True, owner_first=True, kv_first=kv_first,
+        )
+    expected = {("q", h, p) for h in range(4) for p in range(cp)}
+    expected |= {("kv", h, p, t) for h in range(4) for p in range(cp) for t in range(2)}
+    assert issued == received == drained == expected
+    traces.append(list(events))
+  old, new = traces
+  assert all(e[3] == "q_send" for e in old[:cp])
+  assert all(e[3] == "kv_send" for e in old[cp:3 * cp])
+  assert new[:2 * cp] == old[cp:3 * cp]
+  assert new[2 * cp:3 * cp] == old[:cp]
+  assert new[3 * cp:] == old[3 * cp:]
+
+
 def test_export_rejects_padding_that_suppresses_last_send(export_metadata_kernel):
   info = export_metadata_kernel.dkv_mask_info
   n = int(np.asarray(info.num_active_blocks)[0])
@@ -373,6 +510,7 @@ def test_export_rejects_reordered_accumulation(export_metadata_kernel):
         "qkv_hbm_serial",
         "qkv_hbm_prefetch",
         "qkv_hbm_owner_first",
+        "qkv_hbm_kv_first",
         "kv_shadow_serial",
         "kv_shadow_prefetch",
     ],
@@ -447,6 +585,7 @@ def test_input_exchanges_preserve_original_policy_saved_tensors(export_metadata_
       "qkv_hbm_serial",
       "qkv_hbm_prefetch",
       "qkv_hbm_owner_first",
+      "qkv_hbm_kv_first",
       "kv_shadow_serial",
       "kv_shadow_prefetch",
   ):
@@ -504,6 +643,7 @@ def test_input_exchanges_preserve_original_policy_saved_tensors(export_metadata_
         "qkv_hbm_serial",
         "qkv_hbm_prefetch",
         "qkv_hbm_owner_first",
+        "qkv_hbm_kv_first",
         "kv_shadow_serial",
         "kv_shadow_prefetch",
     ],
@@ -529,6 +669,7 @@ def test_experimental_inputs_reject_ordinary_vjp(export_metadata_kernel, exchang
         "qkv_hbm_serial",
         "qkv_hbm_prefetch",
         "qkv_hbm_owner_first",
+        "qkv_hbm_kv_first",
         "kv_shadow_serial",
         "kv_shadow_prefetch",
     ],
