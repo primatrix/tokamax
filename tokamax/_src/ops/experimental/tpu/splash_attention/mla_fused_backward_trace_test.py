@@ -237,12 +237,15 @@ def test_export_rejects_reordered_accumulation(export_metadata_kernel):
         "kv_hbm_serial",
         "kv_hbm_prefetch",
         "kv_hbm_traced",
+        "do_hbm_serial",
+        "do_hbm_prefetch",
+        "do_hbm_traced",
         "kv_shadow_serial",
         "kv_shadow_prefetch",
     ],
 )
 def test_full_sequence_vjp_output_ownership(cp, cp_barrier, bwd_input_exchange):
-  if cp_barrier and bwd_input_exchange.startswith(("per_head", "kv_credit", "kv_hbm", "kv_shadow")):
+  if cp_barrier and bwd_input_exchange.startswith(("per_head", "kv_credit", "kv_hbm", "do_hbm", "kv_shadow")):
     pytest.skip("Experimental import paths require the compiler global barrier")
   fsdp, heads = 16 // cp, cp * 4
   mesh = Mesh(np.asarray(jax.devices()[:16]).reshape(fsdp, cp), ("fsdp", "context"))
@@ -299,6 +302,9 @@ def test_input_exchanges_preserve_original_policy_saved_tensors(export_metadata_
       "kv_hbm_serial",
       "kv_hbm_prefetch",
       "kv_hbm_traced",
+      "do_hbm_serial",
+      "do_hbm_prefetch",
+      "do_hbm_traced",
       "kv_shadow_serial",
       "kv_shadow_prefetch",
   ):
@@ -353,6 +359,9 @@ def test_input_exchanges_preserve_original_policy_saved_tensors(export_metadata_
         "kv_hbm_serial",
         "kv_hbm_prefetch",
         "kv_hbm_traced",
+        "do_hbm_serial",
+        "do_hbm_prefetch",
+        "do_hbm_traced",
         "kv_shadow_serial",
         "kv_shadow_prefetch",
     ],
@@ -375,6 +384,9 @@ def test_experimental_inputs_reject_ordinary_vjp(export_metadata_kernel, exchang
         "kv_hbm_serial",
         "kv_hbm_prefetch",
         "kv_hbm_traced",
+        "do_hbm_serial",
+        "do_hbm_prefetch",
+        "do_hbm_traced",
         "kv_shadow_serial",
         "kv_shadow_prefetch",
     ],

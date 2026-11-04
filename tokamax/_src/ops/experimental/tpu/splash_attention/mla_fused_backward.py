@@ -36,6 +36,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as sk
+from tokamax._src.ops.experimental.tpu.splash_attention.mla_do_import import do_hbm_output_kernel
 
 SOURCE_SHA = "d798fdd38edd5aed5650344b72bd43724cf4345a4c9e0a92fb722a9e6ccd81f9"
 
@@ -878,6 +879,7 @@ def fused_backward(
     kv_import_launch_after_credit: bool = False,
     kv_hbm_prefetch: bool | None = None,
     kv_hbm_trace: bool = False,
+    do_hbm_prefetch: bool | None = None,
     shadow_imports: tuple | None = None,
     shadow_prefetch: bool = False,
     bq: int,
@@ -891,6 +893,9 @@ def fused_backward(
     dkv_mask_sparsity: float,
 ):
   kv_hbm = kv_hbm_prefetch is not None
+  do_hbm = do_hbm_prefetch is not None
+  if do_hbm and (type(do_hbm_prefetch) is not bool or kv_hbm_prefetch is not True or bq != 512):
+    raise ValueError("Experimental dO import requires prefetched HBM K/V and 512-token Q tiles")
   if type(kv_hbm_trace) is not bool or (kv_hbm_trace and kv_hbm_prefetch is not True):
     raise ValueError("HBM region tracing requires prefetched HBM K/V imports")
   if kv_hbm and (type(kv_hbm_prefetch) is not bool or kv_import_prefetch is not None):
@@ -909,6 +914,9 @@ def fused_backward(
       and do.dtype == q.dtype
   )
   num_q_heads, q_seq_len, head_dim_qk = q.shape
+  if do_hbm and (do.shape != (cp * 4, q_seq_len // cp, 128) or do.dtype != jnp.bfloat16
+                 or di.shape != (4, q_seq_len, 128) or di.dtype != jnp.bfloat16):
+    raise ValueError("dO import requires sequence-owned BF16 dO and head-owned BF16 O")
   if shadow_imports is not None:
     if kv_import or import_head is not None or imports is not None or cp_barrier or num_q_heads != 4:
       raise ValueError("Shadow K/V traffic requires separate four-head inputs and the global barrier")
@@ -1102,7 +1110,9 @@ def fused_backward(
 
   logsumexp_index_map = unravel(lambda h, i, j: (h, 0, i))
 
-  assert logsumexp.shape == di.shape == (num_q_heads, q_seq_len)
+  assert logsumexp.shape == (num_q_heads, q_seq_len)
+  if not do_hbm:
+    assert di.shape == logsumexp.shape
   # TODO: Remove the sublane expansion once Mosaic has all retilings
   logsumexp_shape = (num_q_heads, NUM_SUBLANES, q_seq_len)
   logsumexp = jnp.broadcast_to(jnp.expand_dims(logsumexp, -2), logsumexp_shape)
@@ -1110,9 +1120,14 @@ def fused_backward(
   assert logsumexp.ndim == len(logsumexp_spec.block_shape)
 
   # TODO: Remove the sublane expansion once Mosaic has all retilings
-  di = jnp.broadcast_to(jnp.expand_dims(di, -2), logsumexp_shape)
-  di_spec = pl.BlockSpec((None, NUM_SUBLANES, bq), logsumexp_index_map)
-  assert di.ndim == len(di_spec.block_shape)
+  if do_hbm:
+    # Reuse the two input ABI positions for sequence-owned dO and O residual.
+    # The outer wrapper supplies tiled dO/Di refs to the unchanged inner body.
+    do_spec = di_spec = pl.BlockSpec(memory_space=pl.ANY)
+  else:
+    di = jnp.broadcast_to(jnp.expand_dims(di, -2), logsumexp_shape)
+    di_spec = pl.BlockSpec((None, NUM_SUBLANES, bq), logsumexp_index_map)
+    assert di.ndim == len(di_spec.block_shape)
 
   in_specs = [
       q_spec,
@@ -1423,6 +1438,22 @@ def fused_backward(
         pltpu.SemaphoreType.DMA((2, 2)),
         pltpu.SemaphoreType.DMA((1,)),
     ]
+    if do_hbm:
+      assert len(out_shapes) == 7 and len(scratch_shapes) == 22
+      kernel = functools.partial(do_hbm_output_kernel, base_kernel=kernel,
+          cp=cp, axis_name=axis_name, heads=num_q_heads, rows=kv_steps, bq=bq,
+          prefetch=do_hbm_prefetch, trace_regions=kv_hbm_trace)
+      out_shapes += [jax.ShapeDtypeStruct((4, q_seq_len, 128), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((4, NUM_SUBLANES, q_seq_len), jnp.float32)]
+      out_specs += [pl.BlockSpec(memory_space=pl.ANY) for _ in range(2)]
+      scratch_shapes += [
+          pltpu.VMEM((2, bq, 128), jnp.bfloat16),
+          pltpu.VMEM((2, bq, 128), jnp.bfloat16),
+          pltpu.VMEM((4, NUM_SUBLANES, bq), jnp.float32),
+          pltpu.SemaphoreType.DMA((4, cp)), pltpu.SemaphoreType.DMA((4, cp)),
+          pltpu.SemaphoreType.DMA((2,)), pltpu.SemaphoreType.DMA((2,)),
+          pltpu.SemaphoreType.DMA((2,)), pltpu.SemaphoreType.DMA((2,)),
+      ]
   elif kv_import:
     assert num_args == 14 and input_output_aliases == {14: 0} and len(scratch_shapes) == 16
     kernel = functools.partial(
@@ -1577,6 +1608,7 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
       kv_import_launch_after_credit=False,
       kv_hbm_prefetch=None,
       kv_hbm_trace=False,
+      do_hbm_prefetch=None,
       shadow_imports=None,
       shadow_prefetch=False,
   ):
@@ -1586,13 +1618,18 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
     v_shape = (cp * heads, sequence // cp, 128) if kv_import else (heads, sequence, 128)
     if heads not in (1, 4) or k.shape != k_shape or q.shape != (heads, sequence, 192):
       raise ValueError("MLA backward requires one or four matching Q/K heads of width 192")
-    if v.shape != v_shape or o.shape != (heads, sequence, 128) or do.shape != o.shape:
+    do_shape = (cp * heads, sequence // cp, 128) if do_hbm_prefetch is not None else o.shape
+    if v.shape != v_shape or o.shape != (heads, sequence, 128) or do.shape != do_shape:
       raise ValueError("MLA backward V/O/dO must match the head count and sequence, with width 128")
     if ids.shape != (sequence,) or lse.shape != (heads, sequence):
       raise ValueError("MLA backward requires shared sequence IDs and per-head LSE")
     if heads == 1 and cp_barrier:
       raise ValueError("Per-head MLA backward requires the compiler global barrier")
-    if di is None:
+    if do_hbm_prefetch is not None:
+      if di is not None:
+        raise ValueError("dO import computes Di inside the kernel; explicit Di is unsupported")
+      di = o
+    elif di is None:
       with jax.named_scope("splash_bwd_di"):
         di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))
     elif di.shape != (heads, sequence) or di.dtype != jnp.float32:
@@ -1615,6 +1652,7 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
         kv_import_launch_after_credit=kv_import_launch_after_credit,
         kv_hbm_prefetch=kv_hbm_prefetch,
         kv_hbm_trace=kv_hbm_trace,
+        do_hbm_prefetch=do_hbm_prefetch,
         shadow_imports=shadow_imports,
         shadow_prefetch=shadow_prefetch,
         bq=cfg.block_q_dkv,
