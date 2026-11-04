@@ -337,6 +337,7 @@ def make_local_attention(
       "do_hbm_serial",
       "do_hbm_prefetch",
       "do_hbm_traced",
+      "do_vmem_di_prefetch",
       "kv_shadow_serial",
       "kv_shadow_prefetch",
   ):
@@ -348,7 +349,7 @@ def make_local_attention(
   if bwd_input_exchange != "remat" and not fused:
     raise ValueError("Experimental backward input exchanges require the fused VJP")
   per_head = bwd_input_exchange in ("per_head_split", "per_head_a2a", "per_head_import")
-  do_hbm = bwd_input_exchange in ("do_hbm_serial", "do_hbm_prefetch", "do_hbm_traced")
+  do_hbm = bwd_input_exchange in ("do_hbm_serial", "do_hbm_prefetch", "do_hbm_traced", "do_vmem_di_prefetch")
   kv_hbm = do_hbm or bwd_input_exchange in ("kv_hbm_serial", "kv_hbm_prefetch", "kv_hbm_traced")
   kv_import = kv_hbm or bwd_input_exchange in (
       "kv_credit_serial",
@@ -379,6 +380,7 @@ def make_local_attention(
       "do_hbm_serial",
       "do_hbm_prefetch",
       "do_hbm_traced",
+      "do_vmem_di_prefetch",
       "kv_shadow_serial",
       "kv_shadow_prefetch",
   )
@@ -545,6 +547,7 @@ def make_local_attention(
           kv_hbm_prefetch=(bwd_input_exchange != "kv_hbm_serial") if kv_hbm else None,
           kv_hbm_trace=bwd_input_exchange in ("kv_hbm_traced", "do_hbm_traced"),
           do_hbm_prefetch=(bwd_input_exchange != "do_hbm_serial") if do_hbm else None,
+          do_di_resident=bwd_input_exchange == "do_vmem_di_prefetch",
           kv_import_defer_send=bwd_input_exchange in ("kv_credit_deferred", "kv_credit_ahead"),
           kv_import_launch_after_credit=bwd_input_exchange == "kv_credit_ahead",
           # Keep the diagnostic source conversion independent of the real

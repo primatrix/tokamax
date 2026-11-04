@@ -30,10 +30,10 @@ def di_tile(o, do):
   return jnp.broadcast_to(acc[:1, :], (8, 512))
 
 
-def do_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, prefetch, trace_regions=False):
+def do_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, prefetch, trace_regions=False, di_resident=False):
   """Import once per head/owner; compute Di in row 0, reuse it in later rows.
 
-  Existing K/V wrapper receives its unchanged 48-ref ABI. Two new outputs
+  Existing K/V wrapper receives its unchanged 48-ref ABI. In HBM-cache mode, two new outputs
   precede its scratch: dO destination and Di cache. Nine new scratch refs are
   appended. Di write banks and cache-load banks are distinct halves of one
   four-slot allocation; their DMA semaphores remain separate.
@@ -42,11 +42,24 @@ def do_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, pre
   writes, as in the stable dQ input stage. This is not established by a dQ
   store fence: dV also reads dO. A deliberate same-slot overwrite control and
   repeated integrated gradient comparisons must precede acceptance.
+
+  The resident-Di candidate uses di_bank as a full [S/512, 8, 512] VMEM
+  cache for one head. Row 0 writes every column before later rows read it.
+  Only vector loads/stores access this cache; the arbitrary head/program
+  grid preserves these scratch dependencies across programs and heads.
+  It removes the HBM Di output and both Di DMA semaphore groups. The dO/O
+  bank protocol and the exact di_tile arithmetic remain unchanged.
   """
-  assert len(refs) == 59 and heads == 4 and bq == 512 and rows % cp == 0
-  original = list(refs[:26]) + list(refs[28:50])
-  destination, di_cache = refs[26:28]
-  do_bank, o_bank, di_bank, send, recv, do_load, o_load, di_store, di_load = refs[50:]
+  assert len(refs) == (56 if di_resident else 59) and heads == 4 and bq == 512 and rows % cp == 0
+  if di_resident:
+    original = list(refs[:26]) + list(refs[27:49])
+    destination = refs[26]
+    do_bank, o_bank, di_bank, send, recv, do_load, o_load = refs[49:]
+    di_cache = di_store = di_load = None
+  else:
+    original = list(refs[:26]) + list(refs[28:50])
+    destination, di_cache = refs[26:28]
+    do_bank, o_bank, di_bank, send, recv, do_load, o_load, di_store, di_load = refs[50:]
   source, o_source = original[12:14]
   head, program = pl.program_id(0), pl.program_id(1)
   programs = pl.num_programs(1)
@@ -121,17 +134,24 @@ def do_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, pre
   @pl.when(row == 0)
   def compute_di():
     o_transfer(program).wait()
-    @pl.when(program > 0)
-    def _():
-      di_write(program - 1).wait()
+    if not di_resident:
+      @pl.when(program > 0)
+      def _():
+        di_write(program - 1).wait()
     with scope("mla_do_di_compute"):
-      di_bank.at[slot][...] = di_tile(o_bank.at[slot][...], do_bank.at[slot][...])
-    di_write(program).start()
+      value = di_tile(o_bank.at[slot][...], do_bank.at[slot][...])
+      if di_resident:
+        di_bank.at[col][...] = value
+      else:
+        di_bank.at[slot][...] = value
+    if not di_resident:
+      di_write(program).start()
 
-  @pl.when(row > 0)
-  def consume_cached_di():
-    with scope("mla_do_di_cache_wait"):
-      di_read(program).wait()
+  if not di_resident:
+    @pl.when(row > 0)
+    def consume_cached_di():
+      with scope("mla_do_di_cache_wait"):
+        di_read(program).wait()
 
   @pl.when(program + 1 < programs)
   def prefetch_next():
@@ -141,16 +161,17 @@ def do_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, pre
     @pl.when(r == 0)
     def _():
       o_transfer(program + 1).start()
-    @pl.when(r > 0)
-    def _():
-      # Drain row0's final store before the first cache load is issued.
-      @pl.when(row == 0)
+    if not di_resident:
+      @pl.when(r > 0)
       def _():
-        di_write(program).wait()
-      di_read(program + 1).start()
+        # Drain row0's final store before the first cache load is issued.
+        @pl.when(row == 0)
+        def _():
+          di_write(program).wait()
+        di_read(program + 1).start()
 
   original[12] = do_bank.at[slot]
-  original[13] = di_bank.at[jnp.where(row == 0, slot, 2 + slot)]
+  original[13] = di_bank.at[col] if di_resident else di_bank.at[jnp.where(row == 0, slot, 2 + slot)]
   base_kernel(*original)
 
   if prefetch:

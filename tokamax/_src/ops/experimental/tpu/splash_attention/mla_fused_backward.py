@@ -880,6 +880,7 @@ def fused_backward(
     kv_hbm_prefetch: bool | None = None,
     kv_hbm_trace: bool = False,
     do_hbm_prefetch: bool | None = None,
+    do_di_resident: bool = False,
     shadow_imports: tuple | None = None,
     shadow_prefetch: bool = False,
     bq: int,
@@ -894,6 +895,8 @@ def fused_backward(
 ):
   kv_hbm = kv_hbm_prefetch is not None
   do_hbm = do_hbm_prefetch is not None
+  if type(do_di_resident) is not bool or (do_di_resident and not do_hbm):
+    raise ValueError("Resident Di requires the experimental dO import path")
   if do_hbm and (type(do_hbm_prefetch) is not bool or kv_hbm_prefetch is not True or bq != 512):
     raise ValueError("Experimental dO import requires prefetched HBM K/V and 512-token Q tiles")
   if type(kv_hbm_trace) is not bool or (kv_hbm_trace and kv_hbm_prefetch is not True):
@@ -1442,18 +1445,20 @@ def fused_backward(
       assert len(out_shapes) == 7 and len(scratch_shapes) == 22
       kernel = functools.partial(do_hbm_output_kernel, base_kernel=kernel,
           cp=cp, axis_name=axis_name, heads=num_q_heads, rows=kv_steps, bq=bq,
-          prefetch=do_hbm_prefetch, trace_regions=kv_hbm_trace)
-      out_shapes += [jax.ShapeDtypeStruct((4, q_seq_len, 128), jnp.bfloat16),
-                     jax.ShapeDtypeStruct((4, NUM_SUBLANES, q_seq_len), jnp.float32)]
-      out_specs += [pl.BlockSpec(memory_space=pl.ANY) for _ in range(2)]
+          prefetch=do_hbm_prefetch, trace_regions=kv_hbm_trace, di_resident=do_di_resident)
+      out_shapes.append(jax.ShapeDtypeStruct((4, q_seq_len, 128), jnp.bfloat16))
+      if not do_di_resident:
+        out_shapes.append(jax.ShapeDtypeStruct((4, NUM_SUBLANES, q_seq_len), jnp.float32))
+      out_specs += [pl.BlockSpec(memory_space=pl.ANY) for _ in range(1 if do_di_resident else 2)]
       scratch_shapes += [
           pltpu.VMEM((2, bq, 128), jnp.bfloat16),
           pltpu.VMEM((2, bq, 128), jnp.bfloat16),
-          pltpu.VMEM((4, NUM_SUBLANES, bq), jnp.float32),
+          pltpu.VMEM((q_seq_len // bq if do_di_resident else 4, NUM_SUBLANES, bq), jnp.float32),
           pltpu.SemaphoreType.DMA((4, cp)), pltpu.SemaphoreType.DMA((4, cp)),
           pltpu.SemaphoreType.DMA((2,)), pltpu.SemaphoreType.DMA((2,)),
-          pltpu.SemaphoreType.DMA((2,)), pltpu.SemaphoreType.DMA((2,)),
       ]
+      if not do_di_resident:
+        scratch_shapes += [pltpu.SemaphoreType.DMA((2,)), pltpu.SemaphoreType.DMA((2,))]
   elif kv_import:
     assert num_args == 14 and input_output_aliases == {14: 0} and len(scratch_shapes) == 16
     kernel = functools.partial(
@@ -1609,6 +1614,7 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
       kv_hbm_prefetch=None,
       kv_hbm_trace=False,
       do_hbm_prefetch=None,
+      do_di_resident=False,
       shadow_imports=None,
       shadow_prefetch=False,
   ):
@@ -1653,6 +1659,7 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
         kv_hbm_prefetch=kv_hbm_prefetch,
         kv_hbm_trace=kv_hbm_trace,
         do_hbm_prefetch=do_hbm_prefetch,
+        do_di_resident=do_di_resident,
         shadow_imports=shadow_imports,
         shadow_prefetch=shadow_prefetch,
         bq=cfg.block_q_dkv,
