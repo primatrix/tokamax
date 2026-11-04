@@ -18,7 +18,6 @@ import jax.numpy as jnp
 from jax import ad_checkpoint, lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from jax.experimental.layout import Layout, with_layout_constraint
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as sk
@@ -462,17 +461,10 @@ def _make_attention_with_external_inputs(
 
   residual_qkv = sequence if sequence_residuals else head
 
-  def layout_preserving_pullback(residuals, cotangent):
-    dq, dk, dv, dids = pullback(residuals, cotangent)
-    # The original backward A2A leaves BSHD dQ sequence-minor. Preserve that
-    # physical boundary: head-dimension-minor remote output otherwise changes
-    # wq_b's downstream FP8 GEMM layout/emitter and BF16 rounding. This only
-    # constrains layout; the fused kernel still owns every gradient exchange.
-    dq = with_layout_constraint(dq, Layout((0, 2, 3, 1)))
-    return dq, dk, dv, dids
-
+  # dQ keeps the kernel's head-dimension-minor layout; XLA chooses the
+  # downstream projection layout.
   mapped_pullback = jax.shard_map(
-      layout_preserving_pullback,
+      pullback,
       mesh=mesh,
       in_specs=(
           (residual_qkv, residual_qkv, residual_qkv, full_segments, head, head_stats),

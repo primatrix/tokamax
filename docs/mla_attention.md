@@ -60,7 +60,7 @@ requires explicit revalidation; do not simply refresh the expected hash.
 The backward implementation is byte-identical to MaxText commit
 `a4b23b5add26644bf39e2b620ce144d56d8e154e`. The sequence wrapper changes only
 its import of that implementation. Function/kernel names, checkpoint tags,
-forward sharding and backward dQ layout are preserved. The base is
+forward sharding is preserved; the backward dQ layout constraint (bitwise-only) was removed. The base is
 `d5edf54` on `epic/absorb_a2a_into_splash_mha_kernel-based-release-v0.2`;
 its Splash arithmetic is identical to the previously pinned `5936d8b`.
 
