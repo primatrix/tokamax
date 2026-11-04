@@ -1094,7 +1094,7 @@ def fused_backward(
         bq=bq,
         prefetch=kv_hbm_prefetch,
     )
-    out_shapes += [jax.ShapeDtypeStruct((num_q_heads, q_seq_len, d), jnp.bfloat16) for d in (192, 128)]
+    out_shapes += [jax.ShapeDtypeStruct((num_q_heads, q_seq_len, d), jnp.bfloat16) for d in (head_dim_qk, head_dim_v)]
     out_shapes.append(jax.ShapeDtypeStruct((bq, head_dim_qk), q.dtype))
     out_specs += [pl.BlockSpec(memory_space=pl.ANY) for _ in range(3)]
     scratch_shapes += [
