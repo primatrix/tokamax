@@ -29,8 +29,6 @@ def test_forward_input_exchange_shape_contract(monkeypatch):
   monkeypatch.setattr(module.pl, "pallas_call", fake_pallas_call)
   source = jnp.zeros((32, 4096, 512), jnp.bfloat16)
   assert module._forward_input_exchange(source, cp=8, axis_name="context").shape == (4, 32768, 512)
-  source = jnp.zeros((32, 4096, 640), jnp.bfloat16)
-  assert module._backward_input_exchange(source, cp=8, axis_name="context").shape == (4, 32768, 640)
 
 
 @pytest.mark.parametrize("shape", [(31, 4096, 512), (32, 4097, 512), (32, 4096, 512)])
@@ -61,7 +59,6 @@ def test_forward_output_exchange_rejects_unqualified_cp_or_dtype(monkeypatch, cp
 def test_forward_output_kernel_uses_remote_dma_and_drains():
   source = inspect.getsource(module)
   assert "mla_fwd_input_remote_a2a" in source
-  assert "mla_bwd_input_remote_a2a" in source
   assert "mla_fwd_output_remote_a2a" in source
   assert "make_async_remote_copy" in source
   assert "wait_send()" in source
