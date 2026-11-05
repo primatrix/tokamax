@@ -55,6 +55,7 @@ from jax import ad_checkpoint
 from jax import lax
 from jax import tree_util
 from jax.experimental import pallas as pl
+from jax.experimental.layout import Layout, with_layout_constraint
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
@@ -1626,6 +1627,12 @@ def _splash_attention_bwd(
       config=config,
       dkv_mask_sparsity=dkv_mask_sparsity,
   )
+  # The native path's post-kernel all-to-all leaves dq [heads, N / cp, d]
+  # sequence-minor. Keep that layout: the kernel's head-dimension-minor dq
+  # changes the layout of the caller's downstream FP8 projection GEMM, which
+  # cost 0.6% step time in Plus-VL 256K training (see mla_sequence_attention).
+  # Layout only; values are unchanged.
+  dq = with_layout_constraint(dq, Layout((0, 2, 1)))
   return (
       None,  # fwd_mask_info
       None,  # dvk_mak_info
