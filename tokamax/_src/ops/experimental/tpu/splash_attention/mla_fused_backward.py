@@ -217,8 +217,8 @@ def dkv_output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv
   slot = lax.rem(ordinal, depth)
 
   # @reference.begin dkv_export_mapping
-  # All logical output elements: source[c,h,j*4096+u,d] ->
-  # destination[j//T,c*4+h,(j%T)*4096+u,d]. No arithmetic or reduction here.
+  # All logical output elements: source[c,h,j*bkv+u,d] ->
+  # destination[j//T,c*H+h,(j%T)*bkv+u,d]. No arithmetic or reduction here.
   def copies(message):
     mh, mj = lax.div(message, kv_steps), lax.rem(message, kv_steps)
     ms = lax.rem(message, depth)
@@ -304,10 +304,10 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
   h, g = pl.program_id(0), pl.program_id(1)
   n = pl.num_programs(1)
   bq, bkv = params["bq"], params["bkv"]
-  assert bkv == 8 * bq
+  assert bkv == Q_TILES_PER_KV * bq
   slot = lax.rem(g, 2) if dq_pipeline else jnp.int32(0)
   j, i = sk.to_i32(original[0][g]), sk.to_i32(original[1][g])
-  final_q = j == lax.div(i, 8)
+  final_q = j == lax.div(i, Q_TILES_PER_KV)
   sender = lax.axis_index(axis_name)
   per_peer = kv_steps // cp
 
@@ -385,7 +385,7 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
   @pl.when(final_q)
   def _():
     message = h * kv_steps + j
-    sub = lax.rem(i, 8)
+    sub = lax.rem(i, Q_TILES_PER_KV)
     if dq_pipeline:
 
       @pl.when(jnp.logical_and(sub == 0, message > 0))
@@ -1159,17 +1159,23 @@ def validate_source():
 def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
   """Fused dQ/dK/dV backward for any CP that evenly partitions the K/V tiles.
 
-  Local heads are ``q.shape[0]``; global heads are ``CP * local heads``.
-  The tile configuration is structural: diagonal dQ finalization needs eight
-  512-token Q tiles per 4096-token K/V tile and three dQ partial slots.
+  Local heads are ``q.shape[0]``; global heads are ``CP * local heads``. Head
+  widths and tile sizes come from the inputs and the Splash config; Splash and
+  Pallas enforce TPU block alignment. Diagonal dQ finalization fixes the tile
+  ratio: block_kv_dkv must be Q_TILES_PER_KV * block_q_dkv, with three dQ
+  partial slots.
   """
   validate_source()
   cfg = kernel.kwargs["config"]
+  if cfg.dq_reduction_steps != 3 or cfg.block_q_dkv is None or cfg.block_kv_dkv != Q_TILES_PER_KV * cfg.block_q_dkv:
+    raise ValueError(
+        f"MLA fused backward needs dq_reduction_steps=3 and block_kv_dkv == {Q_TILES_PER_KV} * block_q_dkv; got "
+        f"{cfg.dq_reduction_steps=}, {cfg.block_q_dkv=}, {cfg.block_kv_dkv=}"
+    )
   if (
       type(cp) is not int
       or cp < 1
       or kernel.kwargs["is_mqa"]
-      or (cfg.block_q_dkv, cfg.block_kv_dkv, cfg.block_kv_dkv_compute, cfg.dq_reduction_steps) != (512, 4096, 512, 3)
       or not cfg.bwd_kv_unroll
       or cfg.bwd_scheduler is not None
       or not cfg.bwd_cast_before_transpose

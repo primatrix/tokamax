@@ -270,6 +270,58 @@ def test_full_sequence_vjp_output_ownership(cp, local_heads, bwd_input_exchange)
   assert str(program).count("name=mla_fused_dq_dkv_a2a") == 1
 
 
+# (CP, local heads, Q/K width, V width, block_q_dkv, block_kv_dkv, block_kv_dkv_compute).
+# Widths and tiles come from the call and the Splash config; only the 8:1 tile ratio is fixed.
+GENERIC = [
+    (8, 4, 128, 128, 512, 4096, 512),
+    (4, 2, 192, 128, 256, 2048, 512),
+    (4, 4, 256, 128, 256, 2048, 256),
+    (16, 2, 64, 64, 128, 1024, 128),
+]
+
+
+@pytest.mark.skipif(len(jax.devices()) < 16, reason="Run with 16 logical CPU devices or on a 16-device slice")
+@pytest.mark.parametrize("cp,local_heads,dqk,dv,bq,bkv,bkv_compute", GENERIC)
+@pytest.mark.parametrize("bwd_input_exchange", ["remat", "kv_hbm_prefetch"])
+def test_generic_widths_and_tiles(cp, local_heads, dqk, dv, bq, bkv, bkv_compute, bwd_input_exchange):
+  mesh, fsdp = _mesh(cp)
+  heads, seq = cp * local_heads, cp * bkv * 2
+  cfg = dataclasses.replace(
+      config(), block_q=bkv, block_kv=bkv, block_kv_compute=bkv_compute,
+      block_q_dkv=bq, block_kv_dkv=bkv, block_kv_dkv_compute=bkv_compute,
+  )
+  with jax.ensure_compile_time_eval():
+    kernel = mla_sequence_attention.make_static_splash_kernel(sm.CausalMask((seq, seq)), cfg)
+    attention = mla_attention.make_attention(
+        kernel, mesh=mesh, batch_axes="fsdp", record_max_logits=True, bwd_input_exchange=bwd_input_exchange
+    )
+
+  def cycle(q, k, v, ids, do):
+    (out, stats), pullback = jax.vjp(lambda q, k, v: attention(q, k, v, ids), q, k, v)
+    return out, stats, *pullback((do, jnp.ones_like(stats)))
+
+  args = [jax.ShapeDtypeStruct((fsdp, seq, heads, d), jnp.bfloat16) for d in (dqk, dqk, dv)]
+  args += [jax.ShapeDtypeStruct((fsdp, seq), jnp.int32), jax.ShapeDtypeStruct((fsdp, seq, heads, dv), jnp.bfloat16)]
+  with jax.set_mesh(mesh):
+    program = jax.make_jaxpr(cycle)(*args)
+  assert [v.aval.shape for v in program.jaxpr.outvars] == [
+      (fsdp, seq, heads, dv),
+      (fsdp, heads),
+      (fsdp, seq, heads, dqk),
+      (fsdp, seq, heads, dqk),
+      (fsdp, seq, heads, dv),
+  ]
+  assert str(program).count("name=mla_fused_dq_dkv_a2a") == 1
+
+
+@pytest.mark.parametrize("bq,bkv", [(512, 2048), (1024, 4096), (512, 8192)])
+def test_tile_ratio_other_than_eight_rejected(bq, bkv):
+  cfg = dataclasses.replace(config(), block_q_dkv=bq, block_kv_dkv=bkv, block_kv_dkv_compute=512)
+  kernel = mla_sequence_attention.make_static_splash_kernel(sm.CausalMask((65536, 65536)), cfg)
+  with pytest.raises(ValueError, match="block_kv_dkv =="):
+    mla_fused_backward.make_backward(kernel, 8)
+
+
 @pytest.mark.skipif(len(jax.devices()) < 16, reason="Run with 16 logical CPU devices or on a 16-device slice")
 @pytest.mark.parametrize("cp,local_heads", [(16, 4), (8, 8)])
 def test_traced_kernel_metadata_end_to_end(cp, local_heads):
