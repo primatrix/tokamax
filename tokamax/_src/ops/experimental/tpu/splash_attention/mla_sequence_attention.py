@@ -3,8 +3,9 @@
 The factory accepts the caller's complete Splash kernel/configuration; it does
 not change its tile/cost configuration or install a remat policy. The fused
 backward supports any context parallelism CP that divides the global head
-count and the number of 4096-token K/V tiles. Callers keep their existing
-implementation for other masks and shapes.
+count and the number of K/V tiles (``block_kv_dkv`` tokens each). Head widths
+come from the Q/K/V inputs. Callers keep their existing implementation for
+other masks and shapes.
 """
 
 from __future__ import annotations
@@ -329,8 +330,8 @@ def make_local_attention(
       raise ValueError("MHA Q/K/V leading shapes must match")
     if q.shape[0] != 1 or q.shape[2] % cp:
       raise ValueError("Local boundary requires batch one and heads divisible by CP")
-    if q.shape[1] % 4096 or ids.shape != q.shape[:2]:
-      raise ValueError("Sequence shard must be divisible by 4096 and match segment IDs")
+    if q.shape[1] % cfg.block_kv_dkv or ids.shape != q.shape[:2]:
+      raise ValueError("Sequence shard must be divisible by block_kv_dkv and match segment IDs")
     if not all(x.dtype == jnp.bfloat16 for x in (q, k, v)) or ids.dtype != jnp.int32:
       raise ValueError("Supported data types are BF16 and int32 segment IDs")
     # Preserve the production input Q/K/V collective fusion.
@@ -488,7 +489,9 @@ def _make_attention_with_external_inputs(
     )
     qh, kh, vh = (
         jnp.transpose(ad_checkpoint.checkpoint_name(x, name), (0, 2, 1, 3))
-        for x, name in zip(jnp.split(packed, (192, 384), axis=-1), ("mla_q_head", "mla_k_head", "mla_v_head"))
+        for x, name in zip(
+            jnp.split(packed, (q.shape[-1], 2 * q.shape[-1]), axis=-1), ("mla_q_head", "mla_k_head", "mla_v_head")
+        )
     )
     full_ids = lax.with_sharding_constraint(ids, NamedSharding(mesh, full_segments))
     oh, lse, max_logits = head_forward(qh, kh, vh, full_ids)
@@ -573,8 +576,8 @@ def make_attention(
     if external_inputs:
       if q.shape != k.shape or q.shape[:3] != v.shape[:3] or q.shape[2] % cp:
         raise ValueError("Global boundary requires matching Q/K/V with heads divisible by CP")
-      if q.shape[1] % (cp * 4096) or ids.shape != q.shape[:2]:
-        raise ValueError("Sequence shards must be divisible by 4096 and match segment IDs")
+      if q.shape[1] % (cp * kernel.kwargs["config"].block_kv_dkv) or ids.shape != q.shape[:2]:
+        raise ValueError("Sequence shards must be divisible by block_kv_dkv and match segment IDs")
       if not all(x.dtype == jnp.bfloat16 for x in (q, k, v)) or ids.dtype != jnp.int32:
         raise ValueError("Supported data types are BF16 and int32 segment IDs")
     return mapped(q, k, v, ids)

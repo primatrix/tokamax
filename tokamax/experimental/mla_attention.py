@@ -1,7 +1,8 @@
 """Experimental sequence-layout MLA attention with fused TPU communication.
 
 Supports BF16 causal MLA attention for any context-parallel size that evenly
-partitions the 4096-token K/V tiles and the global heads, as described in
+partitions the backward K/V tiles (``block_kv_dkv`` tokens) and the global
+heads, with head widths taken from the inputs, as described in
 docs/mla_attention.md. This API is experimental. Model configuration,
 rematerialization policy and BF16 projection/gate integration belong to the
 caller.
