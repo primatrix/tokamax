@@ -31,11 +31,10 @@ kernel = make_static_splash_kernel(mask, splash_config)
 attention = make_attention(
     kernel, mesh=mesh, batch_axes="fsdp", record_max_logits=True,
     cp_barrier=False, bwd_input_exchange="kv_hbm_prefetch",
-    fwd_input_exchange="external", fwd_output_exchange="remote_dma",
 )
 ```
 
-Forward owns its input exchange and output remote DMA. Backward imports K/V
+Forward uses XLA all-to-all for its input and output exchanges. Backward imports K/V
 through HBM staging, overlaps staging with kernel computation, and exports
 dQ/dK/dV inside the kernel. Q and dO backward input exchanges remain external.
 The separate MTP path uses `bwd_input_exchange="remat"`. The original remat
@@ -46,7 +45,10 @@ Backward input exchanges are `remat` (rematerialized head-layout Q/K/V) and
 `kv_hbm_prefetch` / `kv_hbm_serial` (in-kernel K/V import; both require
 `cp_barrier=False`, i.e. the compiler global barrier). Earlier diagnostic
 modes (packed/separate/remote_dma inputs, per-head, credit and shadow imports,
-traced HBM regions) were removed.
+traced HBM regions) were removed. The forward remote-DMA input/output exchanges
+(`fwd_input_exchange`/`fwd_output_exchange`) were also removed: production uses
+the external all-to-all, and the full-model output remote DMA measured +6.8 ms
+per step, within run-to-run spread.
 The existing forward-only `splash_attention_a2a_cp_kernel` is an independent
 implementation and is not used by this API.
 
@@ -84,8 +86,7 @@ metadata and DMA boundary contracts:
 
 ```sh
 XLA_FLAGS=--xla_force_host_platform_device_count=16 python -m pytest -q \
-  tokamax/_src/ops/experimental/tpu/splash_attention/mla_fused_backward_trace_test.py \
-  tokamax/_src/ops/experimental/tpu/splash_attention/mla_forward_output_exchange_test.py
+  tokamax/_src/ops/experimental/tpu/splash_attention/mla_fused_backward_trace_test.py
 ```
 
 These CPU checks do not execute TPU remote DMA or establish device accuracy.
