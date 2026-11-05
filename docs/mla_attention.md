@@ -63,8 +63,11 @@ selects how the backward gets head-layout Q/K/V:
   the kernel imports K/V. No GQA.
 - `a2a`: saves the sequence shards; Q/K/V use XLA all-to-alls.
 
-The head-layout O residual is named with `residual_checkpoint_name`, like the
-output and LSE.
+The backward's O residual is the sequence-layout output, already named with
+`residual_checkpoint_name` like the LSE. The backward forms Di there and
+exchanges only Di, so O is saved once. To avoid re-running the forward kernel,
+the remat policy must save `residual_checkpoint_name`; with `kv_hbm_prefetch`
+or `a2a` that is the only extra residual.
 
 The whole-source SHA256 check against `splash_attention_kernel.py` protects
 private Ref ordering and buffer-lifetime assumptions. A Splash source change
