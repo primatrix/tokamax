@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 from jax._src.ad_checkpoint import saved_residuals
 from jax.sharding import Mesh, PartitionSpec as P
+from tokamax._src.ops.experimental.tpu.splash_attention import mla_fused_backward
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_a2a_cp_kernel as a2a
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as sk
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as sm
@@ -140,6 +141,26 @@ def test_backward_exchanges_and_forward_recompute(exchange, names, saved):
       "@LayoutConstraint" in line and "result_layouts = [dense<[1, 2, 0]>" in line and dq_type in line
       for line in hlo.splitlines()
   )
+
+
+def test_factory_under_jit_checks_concrete_metadata(monkeypatch):
+  """MaxText builds the kernel while tracing; the schedule check still reads NumPy metadata."""
+  results = []
+  validate = mla_fused_backward.validate_metadata
+
+  def recording(*args, **kwargs):
+    results.append(validate(*args, **kwargs))
+    return results[-1]
+
+  monkeypatch.setattr(mla_fused_backward, "validate_metadata", recording)
+
+  @jax.jit
+  def build(x):
+    a2a.make_splash_mha_a2a_cp(sm.CausalMask((SEQ, SEQ)), config=config(), cp_size=CP, cp_axis="context")
+    return x
+
+  build(jnp.zeros(()))
+  assert results and all(r is not None and r["concrete"] for r in results)
 
 
 @pytest.mark.parametrize(
