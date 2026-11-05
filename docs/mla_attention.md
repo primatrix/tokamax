@@ -13,11 +13,13 @@ The model caller owns dispatch, configuration, rematerialization policy,
 projection/gate integration and any model-specific precision constraints.
 
 The geometry is derived from the call: CP is the mesh context size, local
-heads are global heads / CP (any positive count), and the sequence must be a
-multiple of CP x 4096 so every rank owns whole K/V tiles. Inputs are BF16 with
+heads are global heads / CP (any positive count), head widths are the Q/K and
+V input widths, and the sequence must be a multiple of CP x `block_kv_dkv` so
+every rank owns whole K/V tiles. Tile sizes come from the Splash config; Splash
+and Pallas enforce TPU block alignment. Diagonal dQ finalization requires
+`block_kv_dkv == 8 * block_q_dkv` and three dQ partials. Inputs are BF16 with
 int32 segment IDs, causal attention, natural-log softmax, HEAD_DIM_MINOR
-layouts and backward blocks Q512/KV4096/compute512 with three dQ partials and
-cast-before-transpose; diagonal dQ finalization depends on these blocks. Mask
+layouts and cast-before-transpose. Mask
 metadata may be concrete NumPy (checked element-wise) or traced, e.g. when the
 kernel is built inside topology AOT; traced metadata is checked against the
 static causal schedule proof for the call's sequence length. The production
