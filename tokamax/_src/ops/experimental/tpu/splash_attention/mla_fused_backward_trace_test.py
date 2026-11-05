@@ -1,8 +1,11 @@
-"""Abstract regression of the actual fused caller at the production geometry.
+"""Abstract regression of the fused MLA backward caller.
 
-Runs on CPU without allocating the large attention tensors. Device numerical
-qualification is a separate CP8/CP16 test; this checks the production ABI.
+Runs on CPU without allocating the large attention tensors. Covers the
+production CP16/four-head geometry and other CP sizes and local head counts,
+including metadata that is traced (as in topology AOT). Device numerics are
+validated separately by full-model training.
 """
+
 
 import dataclasses
 import math
@@ -56,7 +59,6 @@ def test_global_forward_boundary_preserves_values_and_vjp_ownership(record_max_l
       record_max_logits=record_max_logits,
       pullback=pullback,
       sequence_residuals=True,
-      fwd_output_exchange="external",
   )
   shape = (2, 16, 8, 192)
   q = (jnp.arange(math.prod(shape)).reshape(shape) % 7).astype(jnp.bfloat16)
@@ -120,34 +122,6 @@ def test_pinned_source_and_bad_config_rejection():
     mla_fused_backward.make_backward(bad, 8)
 
 
-@pytest.mark.parametrize("cp", [8, 16])
-@pytest.mark.parametrize("rows_per_owner", [1, 2, 3, 4, 8])
-def test_deferred_send_predecessors_match_independent_owner_history(cp, rows_per_owner):
-  rows = cp * rows_per_owner
-  generations = np.arange(4 * rows, dtype=np.int32)
-  actual = np.asarray(mla_fused_backward.kv_previous_send(generations, rows=rows, cp=cp))
-  history = {}
-  drained = []
-  for generation, previous in zip(generations, actual, strict=True):
-    owner = (generation % rows) // rows_per_owner
-    key = (int(owner), int(generation % 2))
-    if key in history:
-      assert previous == history[key]
-      drained.append(int(previous))
-    else:
-      assert previous < 0
-    history[key] = int(generation)
-  # Every source counter has exactly one consuming wait, including final exit.
-  assert sorted(drained + list(history.values())) == list(generations)
-  assert len(history) == cp * min(2, rows_per_owner)
-
-
-@pytest.mark.parametrize("rows,cp", [(3, 3), (9, 3), (10, 8), (4, 8), (16, 0)])
-def test_deferred_send_predecessors_reject_invalid_partitions(rows, cp):
-  with pytest.raises(ValueError, match="even rows and complete owner partitions"):
-    mla_fused_backward.kv_previous_send(jnp.int32(0), rows=rows, cp=cp)
-
-
 def test_static_mask_metadata_stays_numpy_with_outer_mesh():
   mesh = Mesh(np.asarray(jax.devices()), ("outer",))
   observed = []
@@ -176,7 +150,7 @@ def export_metadata_kernel():
   return mla_sequence_attention.make_static_splash_kernel(sm.CausalMask((65536, 65536)), config())
 
 
-@pytest.mark.parametrize("cp", [8, 16])
+@pytest.mark.parametrize("cp", [1, 2, 4, 8, 16])
 def test_export_writes_match_actual_bounds(export_metadata_kernel, cp):
   kernel = export_metadata_kernel
   proof = mla_fused_backward.validate_metadata(kernel, cp)
@@ -217,36 +191,57 @@ def test_export_rejects_reordered_accumulation(export_metadata_kernel):
     mla_fused_backward.validate_metadata(SimpleNamespace(dkv_mask_info=info._replace(active_cols=cols)), 16)
 
 
+
+def test_export_rejects_cp_that_does_not_partition_kv_tiles(export_metadata_kernel):
+  # 64K has sixteen 4096-token K/V tiles; three ranks cannot own whole tiles.
+  with pytest.raises(ValueError, match="complete CP partitions"):
+    mla_fused_backward.validate_metadata(export_metadata_kernel, 3)
+
+
+@pytest.mark.parametrize("cp", [2, 4, 16])
+def test_traced_metadata_uses_static_causal_proof(export_metadata_kernel, cp):
+  """Topology AOT can trace the mask metadata; it is never read on the host."""
+  info = export_metadata_kernel.dkv_mask_info
+  concrete = mla_fused_backward.validate_metadata(export_metadata_kernel, cp, 65536)
+  observed = []
+
+  def traced(count, rows, cols):
+    kernel = SimpleNamespace(
+        dkv_mask_info=info._replace(num_active_blocks=count, active_rows=rows, active_cols=cols),
+        kwargs=export_metadata_kernel.kwargs,
+    )
+    assert mla_fused_backward.validate_metadata(kernel, cp) is None
+    observed.append(mla_fused_backward.validate_metadata(kernel, cp, 65536))
+    with pytest.raises(ValueError, match="complete CP partitions"):
+      mla_fused_backward.validate_metadata(kernel, 3, 65536)
+    with pytest.raises(ValueError, match="schedule length"):
+      mla_fused_backward.validate_metadata(kernel, cp, 131072)
+    return count
+
+  leaves = (info.num_active_blocks, info.active_rows, info.active_cols)
+  jax.eval_shape(traced, *(jax.ShapeDtypeStruct(np.shape(x), x.dtype) for x in leaves))
+  (proof,) = observed
+  assert proof.pop("concrete") is False and concrete.pop("concrete") is True
+  assert proof == concrete
+
+
+def _mesh(cp):
+  devices = jax.devices()
+  fsdp = len(devices) // cp
+  return Mesh(np.asarray(devices[: fsdp * cp]).reshape(fsdp, cp), ("fsdp", "context")), fsdp
+
+
+# (CP, local heads): production CP16/H64 is (16, 4); Plus-VL H64 at CP8 is
+# (8, 8); CP3 checks a non-power-of-two context group.
+GEOMETRIES = [(16, 4), (8, 8), (16, 2), (4, 4), (3, 4), (2, 8)]
+
+
 @pytest.mark.skipif(len(jax.devices()) < 16, reason="Run with 16 logical CPU devices or on a 16-device slice")
-@pytest.mark.parametrize("cp", [8, 16])
-@pytest.mark.parametrize("cp_barrier", [False, True])
-@pytest.mark.parametrize(
-    "bwd_input_exchange",
-    [
-        "remat",
-        "packed",
-        "separate",
-        "remote_dma",
-        "per_head_split",
-        "per_head_a2a",
-        "per_head_import",
-        "kv_credit_serial",
-        "kv_credit_prefetch",
-        "kv_credit_deferred",
-        "kv_credit_ahead",
-        "kv_hbm_serial",
-        "kv_hbm_prefetch",
-        "kv_hbm_traced",
-        "kv_shadow_serial",
-        "kv_shadow_prefetch",
-    ],
-)
-def test_full_sequence_vjp_output_ownership(cp, cp_barrier, bwd_input_exchange):
-  if cp_barrier and bwd_input_exchange.startswith(("per_head", "kv_credit", "kv_hbm", "kv_shadow")):
-    pytest.skip("Experimental import paths require the compiler global barrier")
-  fsdp, heads = 16 // cp, cp * 4
-  mesh = Mesh(np.asarray(jax.devices()[:16]).reshape(fsdp, cp), ("fsdp", "context"))
-  seq = 262144
+@pytest.mark.parametrize("cp,local_heads", GEOMETRIES)
+@pytest.mark.parametrize("bwd_input_exchange", ["remat", "kv_hbm_serial", "kv_hbm_prefetch"])
+def test_full_sequence_vjp_output_ownership(cp, local_heads, bwd_input_exchange):
+  mesh, fsdp = _mesh(cp)
+  heads, seq = cp * local_heads, cp * 4096 * 2
   with jax.ensure_compile_time_eval():
     kernel = mla_sequence_attention.make_static_splash_kernel(sm.CausalMask((seq, seq)), config())
     attention = mla_attention.make_attention(
@@ -254,7 +249,6 @@ def test_full_sequence_vjp_output_ownership(cp, cp_barrier, bwd_input_exchange):
         mesh=mesh,
         batch_axes="fsdp",
         record_max_logits=True,
-        cp_barrier=cp_barrier,
         bwd_input_exchange=bwd_input_exchange,
     )
 
@@ -273,41 +267,99 @@ def test_full_sequence_vjp_output_ownership(cp, cp_barrier, bwd_input_exchange):
       (fsdp, seq, heads, 192),
       (fsdp, seq, heads, 128),
   ]
-  assert "name=mla_fused_dq_dkv_a2a" in str(program)
+  assert str(program).count("name=mla_fused_dq_dkv_a2a") == 1
+
+
+# (CP, local heads, Q/K width, V width, block_q_dkv, block_kv_dkv, block_kv_dkv_compute).
+# Widths and tiles come from the call and the Splash config; only the 8:1 tile ratio is fixed.
+GENERIC = [
+    (8, 4, 128, 128, 512, 4096, 512),
+    (4, 2, 192, 128, 256, 2048, 512),
+    (4, 4, 256, 128, 256, 2048, 256),
+    (16, 2, 64, 64, 128, 1024, 128),
+]
+
+
+@pytest.mark.skipif(len(jax.devices()) < 16, reason="Run with 16 logical CPU devices or on a 16-device slice")
+@pytest.mark.parametrize("cp,local_heads,dqk,dv,bq,bkv,bkv_compute", GENERIC)
+@pytest.mark.parametrize("bwd_input_exchange", ["remat", "kv_hbm_prefetch"])
+def test_generic_widths_and_tiles(cp, local_heads, dqk, dv, bq, bkv, bkv_compute, bwd_input_exchange):
+  mesh, fsdp = _mesh(cp)
+  heads, seq = cp * local_heads, cp * bkv * 2
+  cfg = dataclasses.replace(
+      config(), block_q=bkv, block_kv=bkv, block_kv_compute=bkv_compute,
+      block_q_dkv=bq, block_kv_dkv=bkv, block_kv_dkv_compute=bkv_compute,
+  )
+  with jax.ensure_compile_time_eval():
+    kernel = mla_sequence_attention.make_static_splash_kernel(sm.CausalMask((seq, seq)), cfg)
+    attention = mla_attention.make_attention(
+        kernel, mesh=mesh, batch_axes="fsdp", record_max_logits=True, bwd_input_exchange=bwd_input_exchange
+    )
+
+  def cycle(q, k, v, ids, do):
+    (out, stats), pullback = jax.vjp(lambda q, k, v: attention(q, k, v, ids), q, k, v)
+    return out, stats, *pullback((do, jnp.ones_like(stats)))
+
+  args = [jax.ShapeDtypeStruct((fsdp, seq, heads, d), jnp.bfloat16) for d in (dqk, dqk, dv)]
+  args += [jax.ShapeDtypeStruct((fsdp, seq), jnp.int32), jax.ShapeDtypeStruct((fsdp, seq, heads, dv), jnp.bfloat16)]
+  with jax.set_mesh(mesh):
+    program = jax.make_jaxpr(cycle)(*args)
+  assert [v.aval.shape for v in program.jaxpr.outvars] == [
+      (fsdp, seq, heads, dv),
+      (fsdp, heads),
+      (fsdp, seq, heads, dqk),
+      (fsdp, seq, heads, dqk),
+      (fsdp, seq, heads, dv),
+  ]
+  assert str(program).count("name=mla_fused_dq_dkv_a2a") == 1
+
+
+@pytest.mark.parametrize("bq,bkv", [(512, 2048), (1024, 4096), (512, 8192)])
+def test_tile_ratio_other_than_eight_rejected(bq, bkv):
+  cfg = dataclasses.replace(config(), block_q_dkv=bq, block_kv_dkv=bkv, block_kv_dkv_compute=512)
+  kernel = mla_sequence_attention.make_static_splash_kernel(sm.CausalMask((65536, 65536)), cfg)
+  with pytest.raises(ValueError, match="block_kv_dkv =="):
+    mla_fused_backward.make_backward(kernel, 8)
+
+
+@pytest.mark.skipif(len(jax.devices()) < 16, reason="Run with 16 logical CPU devices or on a 16-device slice")
+@pytest.mark.parametrize("cp,local_heads", [(16, 4), (8, 8)])
+def test_traced_kernel_metadata_end_to_end(cp, local_heads):
+  """The whole fused VJP traces when every mask-metadata leaf is a tracer."""
+  mesh, fsdp = _mesh(cp)
+  heads, seq = cp * local_heads, cp * 4096 * 2
+  kernel = mla_sequence_attention.make_static_splash_kernel(sm.CausalMask((seq, seq)), config())
+  leaves, treedef = jax.tree.flatten(kernel)
+  assert leaves and all(isinstance(x, np.ndarray) for x in leaves)
+
+  def cycle(leaves, q, k, v, ids, do):
+    traced = jax.tree.unflatten(treedef, leaves)
+    assert not isinstance(traced.dkv_mask_info.active_rows, np.ndarray)
+    attention = mla_attention.make_attention(
+        traced, mesh=mesh, batch_axes="fsdp", record_max_logits=True, bwd_input_exchange="kv_hbm_prefetch"
+    )
+    (out, stats), pullback = jax.vjp(lambda q, k, v: attention(q, k, v, ids), q, k, v)
+    return out, stats, *pullback((do, jnp.ones_like(stats)))
+
+  args = [jax.ShapeDtypeStruct((fsdp, seq, heads, d), jnp.bfloat16) for d in (192, 192, 128)]
+  args += [jax.ShapeDtypeStruct((fsdp, seq), jnp.int32), jax.ShapeDtypeStruct((fsdp, seq, heads, 128), jnp.bfloat16)]
+  with jax.set_mesh(mesh):
+    program = jax.make_jaxpr(cycle)(leaves, *args)
+  assert str(program).count("name=mla_fused_dq_dkv_a2a") == 1
 
 
 @pytest.mark.skipif(len(jax.devices()) < 16, reason="Requires 16 logical devices")
-@pytest.mark.parametrize("cp", [8, 16])
-def test_input_exchanges_preserve_original_policy_saved_tensors(export_metadata_kernel, cp):
-  fsdp, seq = 16 // cp, 65536
-  mesh = Mesh(np.asarray(jax.devices()[:16]).reshape(fsdp, cp), ("fsdp", "context"))
-  args = [jax.ShapeDtypeStruct((fsdp, seq, cp * 4, d), jnp.bfloat16) for d in (192, 192, 128)]
+@pytest.mark.parametrize("cp,local_heads", [(16, 4), (8, 8), (4, 2)])
+def test_input_exchanges_preserve_original_policy_saved_tensors(cp, local_heads):
+  mesh, fsdp = _mesh(cp)
+  heads, seq = cp * local_heads, 65536
+  kernel = mla_sequence_attention.make_static_splash_kernel(sm.CausalMask((seq, seq)), config())
+  args = [jax.ShapeDtypeStruct((fsdp, seq, heads, d), jnp.bfloat16) for d in (192, 192, 128)]
   args.append(jax.ShapeDtypeStruct((fsdp, seq), jnp.int32))
   saved_sets = []
-  for exchange in (
-      "remat",
-      "packed",
-      "separate",
-      "remote_dma",
-      "per_head_split",
-      "per_head_a2a",
-      "per_head_import",
-      "kv_credit_serial",
-      "kv_credit_prefetch",
-      "kv_credit_deferred",
-      "kv_credit_ahead",
-      "kv_hbm_serial",
-      "kv_hbm_prefetch",
-      "kv_hbm_traced",
-      "kv_shadow_serial",
-      "kv_shadow_prefetch",
-  ):
+  for exchange in ("remat", "kv_hbm_serial", "kv_hbm_prefetch"):
     attention = mla_attention.make_attention(
-        export_metadata_kernel,
-        mesh=mesh,
-        batch_axes="fsdp",
-        record_max_logits=True,
-        bwd_input_exchange=exchange,
+        kernel, mesh=mesh, batch_axes="fsdp", record_max_logits=True, bwd_input_exchange=exchange
     )
     checkpointed = jax.checkpoint(
         attention,
@@ -323,182 +375,47 @@ def test_input_exchanges_preserve_original_policy_saved_tensors(export_metadata_
             if origin != "from a constant"
         )
     )
-  assert all(saved == saved_sets[0] for saved in saved_sets)
   expected = sorted(
       [
-          ("bfloat16", fsdp * seq * cp * 4 * 192, "from the argument q"),
-          ("bfloat16", fsdp * seq * cp * 4 * 192, "from the argument k"),
-          ("bfloat16", fsdp * seq * cp * 4 * 128, "from the argument v"),
+          ("bfloat16", fsdp * seq * heads * 192, "from the argument q"),
+          ("bfloat16", fsdp * seq * heads * 192, "from the argument k"),
+          ("bfloat16", fsdp * seq * heads * 128, "from the argument v"),
           ("int32", fsdp * seq, "from the argument ids"),
-          ("bfloat16", 16 * 4 * seq * 128, "activation"),
-          ("float32", 16 * 4 * seq, "activation"),
+          ("bfloat16", fsdp * heads * seq * 128, "activation"),
+          ("float32", fsdp * heads * seq, "activation"),
       ]
   )
   assert all(saved == expected for saved in saved_sets)
 
 
-@pytest.mark.parametrize(
-    "exchange",
-    [
-        "packed",
-        "separate",
-        "remote_dma",
-        "per_head_split",
-        "per_head_a2a",
-        "per_head_import",
-        "kv_credit_serial",
-        "kv_credit_prefetch",
-        "kv_credit_deferred",
-        "kv_credit_ahead",
-        "kv_hbm_serial",
-        "kv_hbm_prefetch",
-        "kv_hbm_traced",
-        "kv_shadow_serial",
-        "kv_shadow_prefetch",
-    ],
-)
-def test_experimental_inputs_reject_ordinary_vjp(export_metadata_kernel, exchange):
-  with pytest.raises(ValueError, match="require the fused VJP"):
-    mla_sequence_attention.make_local_attention(export_metadata_kernel, cp=8, fused=False, bwd_input_exchange=exchange)
+@pytest.mark.skipif(len(jax.devices()) < 16, reason="Requires 16 logical devices")
+@pytest.mark.parametrize("case", ["heads", "sequence"])
+def test_global_boundary_rejects_incomplete_partitions(case):
+  cp = 16
+  mesh, fsdp = _mesh(cp)
+  seq = 65536
+  kernel = mla_sequence_attention.make_static_splash_kernel(sm.CausalMask((seq, seq)), config())
+  attention = mla_attention.make_attention(kernel, mesh=mesh, batch_axes="fsdp", bwd_input_exchange="kv_hbm_prefetch")
+  heads = cp * 4 + 1 if case == "heads" else cp * 4
+  length = seq if case == "heads" else seq + cp * 2048
+  q = jax.ShapeDtypeStruct((fsdp, length, heads, 192), jnp.bfloat16)
+  v = jax.ShapeDtypeStruct((fsdp, length, heads, 128), jnp.bfloat16)
+  with jax.set_mesh(mesh), pytest.raises(ValueError, match="divisible"):
+    jax.eval_shape(attention, q, q, v, jax.ShapeDtypeStruct((fsdp, length), jnp.int32))
 
 
-@pytest.mark.parametrize(
-    "exchange",
-    [
-        "per_head_split",
-        "per_head_a2a",
-        "per_head_import",
-        "kv_credit_serial",
-        "kv_credit_prefetch",
-        "kv_credit_deferred",
-        "kv_credit_ahead",
-        "kv_hbm_serial",
-        "kv_hbm_prefetch",
-        "kv_hbm_traced",
-        "kv_shadow_serial",
-        "kv_shadow_prefetch",
-    ],
-)
-def test_per_head_inputs_reject_cp_barrier(export_metadata_kernel, exchange):
+def test_removed_input_exchanges_rejected(export_metadata_kernel):
+  for exchange in ("separate", "remote_dma", "per_head_import", "kv_credit_prefetch", "kv_shadow_prefetch", "x"):
+    with pytest.raises(ValueError, match="Unsupported MLA backward input exchange"):
+      mla_sequence_attention.make_local_attention(export_metadata_kernel, cp=8, bwd_input_exchange=exchange)
+
+
+def test_kv_import_requires_fused_vjp_and_global_barrier(export_metadata_kernel):
+  with pytest.raises(ValueError, match="fused VJP"):
+    mla_sequence_attention.make_local_attention(
+        export_metadata_kernel, cp=8, fused=False, bwd_input_exchange="kv_hbm_prefetch"
+    )
   with pytest.raises(ValueError, match="global barrier"):
     mla_sequence_attention.make_local_attention(
-        export_metadata_kernel,
-        cp=8,
-        cp_barrier=True,
-        bwd_input_exchange=exchange,
-    )
-
-
-def test_unknown_input_exchange_rejected(export_metadata_kernel):
-  with pytest.raises(ValueError, match="Unsupported MLA backward input exchange"):
-    mla_sequence_attention.make_local_attention(export_metadata_kernel, cp=8, bwd_input_exchange="invalid")
-
-
-def test_unknown_forward_input_exchange_rejected(export_metadata_kernel):
-  with pytest.raises(ValueError, match="Unsupported MLA forward input exchange"):
-    mla_sequence_attention.make_local_attention(export_metadata_kernel, cp=8, fwd_input_exchange="invalid")
-
-
-@pytest.mark.skipif(len(jax.devices()) < 16, reason="Requires 16 logical devices")
-@pytest.mark.parametrize("cp", [8, 16])
-def test_per_head_exchange_and_gradient_values(cp):
-  from jax import lax
-  from jax.sharding import PartitionSpec as P
-
-  fsdp, length = 16 // cp, 4
-  mesh = Mesh(np.asarray(jax.devices()[:16]).reshape(fsdp, cp), ("fsdp", "context"))
-  for tensor, width in enumerate((192, 192, 128, 128)):
-    shape = (fsdp, cp, cp * 4, length, width)
-    values = np.arange(math.prod(shape), dtype=np.int32).reshape(shape) + tensor * 10_000_000
-
-    def local(x):
-      x = x[0, 0]
-      full = lax.all_to_all(x, "context", split_axis=0, concat_axis=1, tiled=True)
-      heads = tuple(mla_sequence_attention._exchange_head(x, h, cp, "context") for h in range(4))
-      parts = tuple(lax.all_to_all(a, "context", split_axis=1, concat_axis=0, tiled=True) for a in heads)
-      assembled = mla_sequence_attention._merge_head_gradients(parts)
-      return full[None, None], jnp.concatenate(heads, axis=0)[None, None], assembled[None, None]
-
-    fn = jax.jit(
-        jax.shard_map(
-            local,
-            mesh=mesh,
-            in_specs=P("fsdp", "context"),
-            out_specs=(P("fsdp", "context"),) * 3,
-            check_vma=False,
-        )
-    )
-    full, heads, roundtrip = map(np.asarray, fn(jnp.asarray(values)))
-    np.testing.assert_array_equal(full, heads)
-    np.testing.assert_array_equal(roundtrip, values)
-  # Distinguish every sender/head pair independently of communication roundtrip.
-  parts = tuple(jnp.broadcast_to(jnp.arange(cp)[:, None, None] * 4 + h, (cp, length, 3)) for h in range(4))
-  merged = np.asarray(mla_sequence_attention._merge_head_gradients(parts))
-  np.testing.assert_array_equal(merged, np.broadcast_to(np.arange(cp * 4)[:, None, None], merged.shape))
-
-
-@pytest.mark.parametrize(
-    "bad_di", [jax.ShapeDtypeStruct((1, 65536), jnp.bfloat16), jax.ShapeDtypeStruct((2, 65536), jnp.float32)]
-)
-def test_explicit_di_rejected(export_metadata_kernel, bad_di):
-  backward = mla_fused_backward.make_backward(export_metadata_kernel, 16)
-  q = jax.ShapeDtypeStruct((1, 65536, 192), jnp.bfloat16)
-  v = jax.ShapeDtypeStruct((1, 65536, 128), jnp.bfloat16)
-  with pytest.raises(ValueError, match="Explicit MLA di"):
-    backward(
-        q, q, v, jax.ShapeDtypeStruct((65536,), jnp.int32), v, jax.ShapeDtypeStruct((1, 65536), jnp.float32), v, di=bad_di
-    )
-
-
-def test_two_head_backward_rejected(export_metadata_kernel):
-  backward = mla_fused_backward.make_backward(export_metadata_kernel, 16)
-  q = jax.ShapeDtypeStruct((2, 65536, 192), jnp.bfloat16)
-  v = jax.ShapeDtypeStruct((2, 65536, 128), jnp.bfloat16)
-  with pytest.raises(ValueError, match="one or four"):
-    backward(q, q, v, jax.ShapeDtypeStruct((65536,), jnp.int32), v, jax.ShapeDtypeStruct((2, 65536), jnp.float32), v)
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "head_zero",
-        "head_four",
-        "bool_head",
-        "four_heads",
-        "missing_sources",
-        "short_sources",
-        "wrong_shape",
-        "wrong_dtype",
-        "sources_without_head",
-        "cp_barrier",
-    ],
-)
-def test_import_rejects_invalid_contract(export_metadata_kernel, case):
-  cp, sequence = 16, 65536
-  heads = 4 if case == "four_heads" else 1
-  shape = lambda dims, dtype=jnp.bfloat16: jax.ShapeDtypeStruct(dims, dtype)
-  q, v = shape((heads, sequence, 192)), shape((heads, sequence, 128))
-  sources = tuple(shape((cp * 4, sequence // cp, d)) for d in (192, 192, 128, 128))
-  import_head = {"head_zero": 0, "head_four": 4, "bool_head": True, "sources_without_head": None}.get(case, 1)
-  if case == "missing_sources":
-    sources = None
-  elif case == "short_sources":
-    sources = sources[:3]
-  elif case == "wrong_shape":
-    sources = (shape((cp * 4, sequence // cp, 128)), *sources[1:])
-  elif case == "wrong_dtype":
-    sources = (shape(sources[0].shape, jnp.float32), *sources[1:])
-  backward = mla_fused_backward.make_backward(export_metadata_kernel, cp, cp_barrier=case == "cp_barrier")
-  with pytest.raises(ValueError, match="[Ii]mport|global barrier"):
-    backward(
-        q,
-        q,
-        v,
-        shape((sequence,), jnp.int32),
-        v,
-        shape((heads, sequence), jnp.float32),
-        v,
-        di=shape((heads, sequence), jnp.float32),
-        import_head=import_head,
-        imports=sources,
+        export_metadata_kernel, cp=8, cp_barrier=True, bwd_input_exchange="kv_hbm_prefetch"
     )
