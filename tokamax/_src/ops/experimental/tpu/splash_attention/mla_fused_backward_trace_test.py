@@ -59,7 +59,6 @@ def test_global_forward_boundary_preserves_values_and_vjp_ownership(record_max_l
       record_max_logits=record_max_logits,
       pullback=pullback,
       sequence_residuals=True,
-      fwd_output_exchange="external",
   )
   shape = (2, 16, 8, 192)
   q = (jnp.arange(math.prod(shape)).reshape(shape) % 7).astype(jnp.bfloat16)
@@ -420,8 +419,3 @@ def test_kv_import_requires_fused_vjp_and_global_barrier(export_metadata_kernel)
     mla_sequence_attention.make_local_attention(
         export_metadata_kernel, cp=8, cp_barrier=True, bwd_input_exchange="kv_hbm_prefetch"
     )
-
-
-def test_unknown_forward_input_exchange_rejected(export_metadata_kernel):
-  with pytest.raises(ValueError, match="Unsupported MLA forward input exchange"):
-    mla_sequence_attention.make_local_attention(export_metadata_kernel, cp=8, fwd_input_exchange="invalid")
