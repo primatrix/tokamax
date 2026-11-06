@@ -55,7 +55,6 @@ from jax import ad_checkpoint
 from jax import lax
 from jax import tree_util
 from jax.experimental import pallas as pl
-from jax.experimental.layout import Layout, with_layout_constraint
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
@@ -1595,15 +1594,13 @@ def _splash_attention_bwd(
   # dO arrives sequence sharded; the kernel takes it in the head layout.
   do_head = to_head(do)
   with jax.named_scope("splash_bwd_di"):
-    rowdot = lambda o, do: jnp.einsum(
-        "hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))
     # In the VJP forward fuse_reciprocal is config.fuse_reciprocal, and with
     # cp_size > 1 it fuses the o exchange: the saved o is sequence sharded
-    # like dO. Form Di there and exchange Di, d_v times smaller than o.
-    if config.fuse_reciprocal:
-      di = to_head(rowdot(o, do))
-    else:
-      di = rowdot(o, do_head)
+    # like dO. Form Di from the head-layout o and dO that the kernel reads,
+    # as the native backward does.
+    o_head = to_head(o) if config.fuse_reciprocal else o
+    di = jnp.einsum(
+        "hsd,hsd->hs", o_head.astype(jnp.float32), do_head.astype(jnp.float32))
   do = do_head
   # The kernel exports dq/dk/dv in the caller's sequence-sharded layout.
   dq, dk, dv = mla_fused_backward.fused_backward(
@@ -1627,12 +1624,6 @@ def _splash_attention_bwd(
       config=config,
       dkv_mask_sparsity=dkv_mask_sparsity,
   )
-  # The native path's post-kernel all-to-all leaves dq [heads, N / cp, d]
-  # sequence-minor. Keep that layout: the kernel's head-dimension-minor dq
-  # changes the layout of the caller's downstream FP8 projection GEMM, which
-  # cost 0.6% step time in Plus-VL 256K training (see mla_sequence_attention).
-  # Layout only; values are unchanged.
-  dq = with_layout_constraint(dq, Layout((0, 2, 1)))
   return (
       None,  # fwd_mask_info
       None,  # dvk_mak_info
