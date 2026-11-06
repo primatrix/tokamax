@@ -1595,15 +1595,13 @@ def _splash_attention_bwd(
   # dO arrives sequence sharded; the kernel takes it in the head layout.
   do_head = to_head(do)
   with jax.named_scope("splash_bwd_di"):
-    rowdot = lambda o, do: jnp.einsum(
-        "hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))
     # In the VJP forward fuse_reciprocal is config.fuse_reciprocal, and with
     # cp_size > 1 it fuses the o exchange: the saved o is sequence sharded
-    # like dO. Form Di there and exchange Di, d_v times smaller than o.
-    if config.fuse_reciprocal:
-      di = to_head(rowdot(o, do))
-    else:
-      di = rowdot(o, do_head)
+    # like dO. Form Di from the head-layout o and dO that the kernel reads,
+    # as the native backward does.
+    o_head = to_head(o) if config.fuse_reciprocal else o
+    di = jnp.einsum(
+        "hsd,hsd->hs", o_head.astype(jnp.float32), do_head.astype(jnp.float32))
   do = do_head
   # The kernel exports dq/dk/dv in the caller's sequence-sharded layout.
   dq, dk, dv = mla_fused_backward.fused_backward(
