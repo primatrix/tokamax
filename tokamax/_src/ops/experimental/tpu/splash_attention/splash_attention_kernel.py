@@ -185,6 +185,8 @@ class SplashConfig:
   dq_reduction_steps: int | None = None
   # Arithmetic reordering may change floating-point rounding.
   combine_log2_scale: bool = False
+  # Retain loop bodies for large tiles to bound compiler VMEM live ranges.
+  fwd_kv_unroll: bool = True
   bwd_kv_unroll: bool = True
   bwd_dq_first: bool = False
   bwd_cast_before_transpose: bool = False
@@ -626,12 +628,12 @@ def flash_attention_kernel(
 
   @pl.when(jnp.logical_and(should_not_mask, should_run))
   def _():
-    lax.fori_loop(0, num_iters, body, None, unroll=True)
+    lax.fori_loop(0, num_iters, body, None, unroll=config.fwd_kv_unroll)
 
   @pl.when(jnp.logical_and(jnp.logical_not(should_not_mask), should_run))
   def _():
     lax.fori_loop(
-        0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
+        0, num_iters, partial(body, has_partial_mask=True), None, unroll=config.fwd_kv_unroll
     )
 
   @pl.when(should_write)
