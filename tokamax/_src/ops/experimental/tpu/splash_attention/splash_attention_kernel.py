@@ -1767,6 +1767,7 @@ def _splash_attention_bwd_dkv(
     mask_function: MaskFunctionType | None,
     config: SplashConfig,
     dkv_mask_sparsity: float,
+    fp32_partials: bool = False,
 ):
   native_layout = (
       _use_native_layout(
@@ -2007,7 +2008,8 @@ def _splash_attention_bwd_dkv(
     )
     dq_spec = pl.BlockSpec(dq_block_shape, dq_index_map)
     dq_alias_spec = dq_spec
-    dq_shape = jax.ShapeDtypeStruct((3, *dq_output_shape), q.dtype)
+    dq_dtype = jnp.float32 if fp32_partials else q.dtype
+    dq_shape = jax.ShapeDtypeStruct((3, *dq_output_shape), dq_dtype)
     dq = jnp.zeros_like(dq_shape)
   else:
     dq_index_map = unravel(
@@ -2042,8 +2044,8 @@ def _splash_attention_bwd_dkv(
   else:
     in_specs += [None, None]
     dk, dv = None, None
-    dk_type = k.dtype
-    dv_type = v.dtype
+    dk_type = jnp.float32 if fp32_partials else k.dtype
+    dv_type = jnp.float32 if fp32_partials else v.dtype
 
   dk_shape = k.mT.shape if native_layout else k.shape
   dv_shape = v.mT.shape if native_layout else v.shape
@@ -2283,8 +2285,9 @@ def _splash_attention_bwd_dkv(
       dq = dq.mT
       dk = dk.mT
       dv = dv.mT
-    dk = dk.astype(k.dtype)
-    dv = dv.astype(v.dtype)
+    if not fp32_partials:
+      dk = dk.astype(k.dtype)
+      dv = dv.astype(v.dtype)
   return dq, dk, dv
 
 
@@ -2298,6 +2301,8 @@ def _splash_attention_bwd(
     dkv_mask_sparsity: float,
     res: base.SplashResidualsType,
     grads: jax.Array | tuple[jax.Array, dict[str, jax.Array]],
+    *,
+    fp32_partials: bool = False,
 ) -> tuple[
     MaskInfo | None,  # fwd_mask_info
     MaskInfo | None,  # dvk_mask_info
@@ -2308,6 +2313,8 @@ def _splash_attention_bwd(
     jax.Array | None,  # segment_ids
     jax.Array | None,  # max_logit_estimate
 ]:
+  # A caller that owns a cross-shard VJP can keep dK/dV in FP32 until
+  # its reduction. The ordinary custom VJP returns the operand dtypes.
   # If `save_residuals` is True, `_splash_attention_fwd` returns `(out, stats)`,
   # so we unpack the gradients, otherwise it returns `out` and `grads` is just
   # `do`.
@@ -2348,6 +2355,7 @@ def _splash_attention_bwd(
         mask_function=mask_function,
         config=config,
         dkv_mask_sparsity=dkv_mask_sparsity,
+        fp32_partials=fp32_partials,
     )
   dsinks = None
   if sinks is not None:
