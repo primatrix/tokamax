@@ -135,12 +135,10 @@ def test_backward_exchanges_and_forward_recompute(exchange, names, saved):
   hlo = jax.jit(run).trace(*args).lower(lowering_platforms=("tpu",)).as_text()
   # Unnamed head buffers can only be rebuilt by re-running the forward kernel.
   assert live_forward_kernels(hlo) == (2 if exchange == "head" and names is None else 1)
-  # dq keeps the native path's sequence-minor layout (minor-to-major [1, 2, 0]).
+  # dq keeps the kernel's head-dimension-minor layout; XLA chooses the
+  # downstream projection layout.
   dq_type = f"tensor<{HEADS}x{SEQ // CP}x192xbf16>"
-  assert any(
-      "@LayoutConstraint" in line and "result_layouts = [dense<[1, 2, 0]>" in line and dq_type in line
-      for line in hlo.splitlines()
-  )
+  assert not any("@LayoutConstraint" in line and dq_type in line for line in hlo.splitlines())
 
 
 def test_factory_under_jit_checks_concrete_metadata(monkeypatch):
