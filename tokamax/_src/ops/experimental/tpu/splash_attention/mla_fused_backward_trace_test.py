@@ -271,12 +271,17 @@ def test_full_sequence_vjp_output_ownership(cp, local_heads, bwd_input_exchange)
 
 
 # (CP, local heads, Q/K width, V width, block_q_dkv, block_kv_dkv, block_kv_dkv_compute).
-# Widths and tiles come from the call and the Splash config; only the 8:1 tile ratio is fixed.
+# Widths, tiles and the Q tiles per K/V tile come from the call and the Splash config.
 GENERIC = [
     (8, 4, 128, 128, 512, 4096, 512),
     (4, 2, 192, 128, 256, 2048, 512),
     (4, 4, 256, 128, 256, 2048, 256),
     (16, 2, 64, 64, 128, 1024, 128),
+    # Tiny-VL decoder: CP8, two local heads, 2048/2048 (one Q tile per K/V tile).
+    (8, 2, 192, 128, 2048, 2048, 512),
+    (4, 2, 192, 128, 1024, 2048, 512),
+    (4, 4, 192, 128, 512, 2048, 512),
+    (2, 4, 192, 128, 256, 4096, 512),
 ]
 
 
@@ -314,12 +319,34 @@ def test_generic_widths_and_tiles(cp, local_heads, dqk, dv, bq, bkv, bkv_compute
   assert str(program).count("name=mla_fused_dq_dkv_a2a") == 1
 
 
-@pytest.mark.parametrize("bq,bkv", [(512, 2048), (1024, 4096), (512, 8192)])
-def test_tile_ratio_other_than_eight_rejected(bq, bkv):
+@pytest.mark.parametrize("bq,bkv", [(2048, 1024), (4096, 2048)])
+def test_tile_ratio_not_a_multiple_rejected(bq, bkv):
   cfg = dataclasses.replace(config(), block_q_dkv=bq, block_kv_dkv=bkv, block_kv_dkv_compute=512)
   kernel = mla_sequence_attention.make_static_splash_kernel(sm.CausalMask((65536, 65536)), cfg)
-  with pytest.raises(ValueError, match="block_kv_dkv =="):
+  with pytest.raises(ValueError, match="positive multiple of block_q_dkv"):
     mla_fused_backward.make_backward(kernel, 8)
+
+
+@pytest.mark.parametrize("r", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("kv_steps", [2, 4, 16, 128])
+def test_causal_schedule_proof_any_tile_ratio(r, kv_steps):
+  # Diagonal finalization of K/V row J reads row J - 1's partial q_steps - r*J
+  # programs later; the minimum, at the last row, is r. Only r == 1 reads a
+  # partial whose store is still in flight, which output_kernel takes from VMEM.
+  _, proof = mla_fused_backward.causal_schedule_proof(kv_steps, r)
+  assert proof["q_tiles_per_kv"] == r and proof["q_steps"] == r * kv_steps
+  assert proof["minimum_final_other_partial_distance"] == r
+  assert proof["minimum_partial_revisit_distance"] is None or proof["minimum_partial_revisit_distance"] >= 6
+
+
+@pytest.mark.parametrize("bq,bkv", [(2048, 2048), (1024, 2048), (512, 2048)])
+@pytest.mark.parametrize("cp", [1, 2, 8])
+def test_metadata_matches_proof_for_tile_ratio(bq, bkv, cp):
+  cfg = dataclasses.replace(config(), block_q_dkv=bq, block_kv_dkv=bkv, block_kv_dkv_compute=512)
+  kernel = mla_sequence_attention.make_static_splash_kernel(sm.CausalMask((32768, 32768)), cfg)
+  mla_fused_backward.make_backward(kernel, cp)
+  proof = mla_fused_backward.validate_metadata(kernel, cp, 32768)
+  assert proof["concrete"] and proof["q_tiles_per_kv"] == bkv // bq and proof["kv_steps"] == 32768 // bkv
 
 
 @pytest.mark.skipif(len(jax.devices()) < 16, reason="Run with 16 logical CPU devices or on a 16-device slice")
