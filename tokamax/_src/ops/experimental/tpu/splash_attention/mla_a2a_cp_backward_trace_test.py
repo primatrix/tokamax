@@ -5,6 +5,7 @@ without re-running the forward kernel under a remat policy that saves only
 named residuals. Device numerics are validated separately.
 """
 
+import dataclasses
 import math
 import re
 
@@ -175,3 +176,61 @@ def test_invalid_backward_input_exchange_rejected(exchange, names):
         bwd_input_exchange=exchange,
         head_checkpoint_names=names,
     )
+
+
+# (CP, heads per sequence, local batch, block_q_dkv, block_kv_dkv). A local batch
+# is folded into the head axis, [B, H, S/CP, D] -> [B*H, S/CP, D], with one
+# segment-ID row per sequence. Tiny-VL is CP8, 16 heads, two sequences per
+# FSDP shard and 2048/2048 dKV tiles; CP2 with four sequences covers several
+# sequences on one rank.
+FOLDED = [(8, 16, 2, 2048, 2048), (8, 16, 2, 512, 4096), (8, 8, 4, 2048, 2048), (2, 4, 4, 2048, 2048)]
+
+
+@requires_devices
+@pytest.mark.parametrize("cp,heads,batch,bq,bkv", FOLDED)
+@pytest.mark.parametrize("exchange", ["head", "kv_hbm_prefetch", "a2a"])
+def test_batch_folded_into_heads(cp, heads, batch, bq, bkv, exchange):
+  folded = batch * heads
+  cfg = dataclasses.replace(config(), block_q_dkv=bq, block_kv_dkv=bkv, block_kv_dkv_compute=512)
+  with jax.ensure_compile_time_eval():
+    kernel = a2a.make_splash_mha_a2a_cp(
+        sm.CausalMask((SEQ, SEQ)), config=cfg, cp_size=cp, cp_axis="context", bwd_input_exchange=exchange
+    )
+  mesh = Mesh(np.asarray(jax.devices()[:cp]), ("context",))
+  mapped = jax.shard_map(
+      lambda q, k, v, ids: kernel(q, k, v, sk.SegmentIds(ids, ids)),
+      mesh=mesh,
+      in_specs=(P(None, "context", None),) * 3 + (P(None, None),),
+      out_specs=P(None, "context", None),
+      check_vma=False,
+  )
+  fn = jax.checkpoint(mapped, prevent_cse=True, policy=jax.checkpoint_policies.save_only_these_names(RESIDUALS))
+  args = [jax.ShapeDtypeStruct((folded, SEQ, d), jnp.bfloat16) for d in (192, 192, 128)]
+  args += [jax.ShapeDtypeStruct((batch, SEQ), jnp.int32), jax.ShapeDtypeStruct((folded, SEQ, 128), jnp.bfloat16)]
+  program = jax.make_jaxpr(cycle(fn))(*args)
+  assert [v.aval.shape for v in program.jaxpr.outvars] == [
+      (folded, SEQ, 128), (folded, SEQ, 192), (folded, SEQ, 192), (folded, SEQ, 128)
+  ]
+  text = str(program)
+  assert text.count("name=mla_fused_dq_dkv_a2a") == 1
+  assert text.count("all_to_all[") == {"head": 2, "kv_hbm_prefetch": 3, "a2a": 5}[exchange]
+  jax.jit(cycle(fn)).trace(*args).lower(lowering_platforms=("tpu",))
+
+
+@pytest.mark.parametrize("cp,heads,batch", [(8, 16, 3), (16, 4, 3)])
+def test_batch_fold_rejects_sequences_straddling_ranks(cp, heads, batch):
+  # Three 16-head sequences over CP8 put 6 folded heads on a rank, so a rank
+  # would hold parts of two sequences' segment IDs.
+  with jax.ensure_compile_time_eval():
+    kernel = a2a.make_splash_mha_a2a_cp(sm.CausalMask((SEQ, SEQ)), config=config(), cp_size=cp, cp_axis="context")
+  mesh = Mesh(np.asarray(jax.devices()[:cp]), ("context",))
+  mapped = jax.shard_map(
+      lambda q, k, v, ids: kernel(q, k, v, sk.SegmentIds(ids, ids)),
+      mesh=mesh,
+      in_specs=(P(None, "context", None),) * 3 + (P(None, None),),
+      out_specs=P(None, "context", None),
+      check_vma=False,
+  )
+  args = [jax.ShapeDtypeStruct((batch * heads, SEQ, d), jnp.bfloat16) for d in (192, 192, 128)]
+  with pytest.raises(ValueError, match="straddle|whole groups|must divide"):
+    jax.eval_shape(mapped, *args, jax.ShapeDtypeStruct((batch, SEQ), jnp.int32))
