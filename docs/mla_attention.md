@@ -67,7 +67,7 @@ selects how the backward gets head-layout Q/K/V:
 The backward's O residual is the sequence-layout output, already named with
 `residual_checkpoint_name` like the LSE, so O is saved once. The backward moves
 O and dO to the head layout and forms Di there, as the native backward does.
-dQ partials accumulate in FP32 with one BF16 cast at export. To avoid
+dQ partials are BF16, as in native Splash with `dq_reduction_steps=3`. To avoid
 re-running the forward kernel, the remat policy must save
 `residual_checkpoint_name`; with `kv_hbm_prefetch` or `a2a` that is the only
 extra residual.
@@ -85,8 +85,8 @@ requires explicit revalidation; do not simply refresh the expected hash.
 ## Migration and validation
 
 At migration, the backward implementation was byte-identical to MaxText commit
-`a4b23b5add26644bf39e2b620ce144d56d8e154e`; it has since gained FP32 dQ
-partials and a tile ratio taken from the Splash config. The sequence wrapper changes only
+`a4b23b5add26644bf39e2b620ce144d56d8e154e`; it has since gained a tile ratio
+taken from the Splash config. The sequence wrapper changes only
 its import of that implementation. Function/kernel names, checkpoint tags,
 forward sharding and backward dQ layout are preserved. The base is
 `d5edf54` on `epic/absorb_a2a_into_splash_mha_kernel-based-release-v0.2`;

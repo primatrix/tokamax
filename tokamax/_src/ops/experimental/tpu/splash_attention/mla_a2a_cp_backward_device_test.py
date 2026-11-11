@@ -1,12 +1,10 @@
 """Device check of the a2a-cp Splash fused MLA backward (TPU only).
 
 Runs at CP8 on 8 TPU devices (v7x 2x2x1). For every tile geometry and
-``bwd_input_exchange``, out, dk and dv must match native Splash with the same
-tiles and three dQ partials bit for bit. The fused backward keeps its dQ
-partials in FP32, so dq is compared with native Splash that keeps one FP32
-partial per K/V tile (``dq_reduction_steps=None``): its error must not exceed
-that of native's BF16 partials. A local batch folded into the head axis must
-match one call per sequence bit for bit, including max_logits.
+``bwd_input_exchange``, out, dq, dk and dv must match native Splash with the
+same tiles and three BF16 dQ partials bit for bit. A local batch folded into
+the head axis must match one call per sequence bit for bit, including
+max_logits.
 """
 
 import json
@@ -174,25 +172,20 @@ _REFERENCES = {}
 
 
 def references(tiles, data):
-  """Native Splash with three BF16 dQ partials, and with one FP32 partial per K/V tile."""
+  """Native Splash with the same tiles and three BF16 dQ partials."""
   if tiles not in _REFERENCES:
     q, k, v, ids, do = data
-    _REFERENCES[tiles] = tuple(native(tiles, steps, q, k, v, ids[0], do) for steps in (3, None))
+    _REFERENCES[tiles] = native(tiles, 3, q, k, v, ids[0], do)
   return _REFERENCES[tiles]
 
 
 @pytest.mark.parametrize("tiles,exchange,names,saved", CASES)
 def test_matches_native_splash(data, tiles, exchange, names, saved):
   q, k, v, ids, do = data
-  bf16_partials, fp32_partials = references(tiles, data)
   result = fused(tiles, exchange, names, saved, q, k, v, ids[0], do)
-  out = {name: report(a, b) for name, a, b in zip(("out", "dq", "dk", "dv"), result, bf16_partials)}
-  out["dq_vs_fp32_partials"] = report(result[1], fp32_partials[1])
-  out["native_dq_vs_fp32_partials"] = report(bf16_partials[1], fp32_partials[1])
+  out = {name: report(a, b) for name, a, b in zip(("out", "dq", "dk", "dv"), result, references(tiles, data))}
   print(json.dumps(dict(tiles=tiles, exchange=exchange, named=names is not None, saved=saved, **out)), flush=True)
-  assert all(out[name]["mismatches"] == 0 for name in ("out", "dk", "dv")), out
-  assert all(r["nonfinite"] == 0 for r in out.values()), out
-  assert out["dq_vs_fp32_partials"]["rel_l2"] <= out["native_dq_vs_fp32_partials"]["rel_l2"], out
+  assert all(r["mismatches"] == 0 and r["nonfinite"] == 0 for r in out.values()), out
 
 
 @pytest.mark.parametrize(

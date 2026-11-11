@@ -345,7 +345,7 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
     )
 
   # @reference.begin dq_independent_input_output
-  # dq_alias -> dq_ref update in FP32: every partial and stage is FP32.
+  # Pinned production dq_alias -> dq_ref update: same BF16 arithmetic.
   # Input slot g%2 is read only; output slot g%2 is a distinct allocation.
   # Prefetch g+1 after the old input consumer, without waiting on output.
   # Wait store g-2 before overwriting its output bank. Metadata requires
@@ -399,7 +399,7 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
   # On the causal diagonal, all contributions to Q tile i are complete.
   # Other partials' last stores were waited, except (r == 1 only) one stored
   # by the previous program, which is read from its VMEM output bank.
-  # FP32 partial updates, FP32 three-slot sum, then one BF16 cast.
+  # Preserve BF16 partial updates, FP32 three-slot sum, then one BF16 cast.
   @pl.when(final_q)
   def _():
     message = h * kv_steps + j
@@ -868,8 +868,7 @@ def fused_backward(
     dq_index_map = unravel(lambda h, i, j: from_head_minor((j % 3, h, i, 0), dq_layout))
     dq_spec = pl.BlockSpec(dq_block_shape, dq_index_map)
     dq_alias_spec = dq_spec
-    # FP32 partials: one BF16 rounding per KV tile compounds over long documents.
-    dq_shape = jax.ShapeDtypeStruct((3, *dq_output_shape), jnp.float32)
+    dq_shape = jax.ShapeDtypeStruct((3, *dq_output_shape), q.dtype)
     dq = jnp.zeros_like(dq_shape)
   else:
     dq_index_map = unravel(lambda h, i, j: from_head_minor((j, h, i, 0), dq_layout))
@@ -1022,11 +1021,11 @@ def fused_backward(
       pltpu.VMEM((1, bkv, head_dim_v), dv_type),
       pltpu.SemaphoreType.DMA((1, 2)),
       pltpu.SemaphoreType.DMA((cp, num_q_heads, kv_steps // cp, 2)),
-      pltpu.VMEM((2, bq, head_dim_qk), jnp.float32),
-      pltpu.VMEM((2, bq, head_dim_qk), jnp.float32),
+      pltpu.VMEM((2, bq, head_dim_qk), q.dtype),
+      pltpu.VMEM((2, bq, head_dim_qk), q.dtype),
       pltpu.SemaphoreType.DMA((2,)),
       pltpu.SemaphoreType.DMA((2,)),
-      pltpu.VMEM((3, bq, head_dim_qk), jnp.float32),
+      pltpu.VMEM((3, bq, head_dim_qk), q.dtype),
       pltpu.SemaphoreType.DMA((3,)),
       pltpu.VMEM((1, bkv, head_dim_qk), q.dtype),
       pltpu.SemaphoreType.DMA((1,)),
@@ -1132,8 +1131,7 @@ def fused_backward(
         prefetch=kv_hbm_prefetch,
     )
     out_shapes += [jax.ShapeDtypeStruct((num_q_heads, q_seq_len, d), jnp.bfloat16) for d in (head_dim_qk, head_dim_v)]
-    # The fence copies one FP32 dQ stage.
-    out_shapes.append(jax.ShapeDtypeStruct((bq, head_dim_qk), jnp.float32))
+    out_shapes.append(jax.ShapeDtypeStruct((bq, head_dim_qk), q.dtype))
     out_specs += [pl.BlockSpec(memory_space=pl.ANY) for _ in range(3)]
     scratch_shapes += [
         pltpu.VMEM((2, bkv, head_dim_qk), k.dtype),
