@@ -35,6 +35,9 @@ TILES = {
 # (tiles, bwd_input_exchange, head_checkpoint_names, names saved by the policy or None for no remat).
 CASES = [
     ("plus_vl_r8", "head", None, None),
+    # MaxText's Plus-VL default: the backward re-runs the forward kernel and
+    # forms Di from that kernel's head-layout o.
+    ("plus_vl_r8", "head", None, (RESIDUALS,)),
     ("plus_vl_r8", "head", NAMES, (RESIDUALS, *NAMES)),
     ("plus_vl_r8", "kv_hbm_prefetch", None, (RESIDUALS,)),
     ("plus_vl_r8", "a2a", None, (RESIDUALS,)),

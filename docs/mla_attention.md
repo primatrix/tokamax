@@ -67,6 +67,10 @@ selects how the backward gets head-layout Q/K/V:
 The backward's O residual is the sequence-layout output, already named with
 `residual_checkpoint_name` like the LSE, so O is saved once. The backward moves
 O and dO to the head layout and forms Di there, as the native backward does.
+The exception is `head` without `head_checkpoint_names`: the backward re-runs
+the forward kernel for Q/K/V and forms Di from that kernel's head-layout O, so
+Di and the backward's P come from the same Q/K/V. This is the program of
+Tokamax `f0686ad` (the MaxText Plus-VL route that passed the 1000-step gate).
 dQ partials are BF16, as in native Splash with `dq_reduction_steps=3`. To avoid
 re-running the forward kernel, the remat policy must save
 `residual_checkpoint_name`; with `kv_hbm_prefetch` or `a2a` that is the only
