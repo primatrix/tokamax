@@ -65,10 +65,21 @@ selects how the backward gets head-layout Q/K/V:
 - `a2a`: saves the sequence shards; Q/K/V use XLA all-to-alls.
 
 The backward's O residual is the sequence-layout output, already named with
-`residual_checkpoint_name` like the LSE. The backward forms Di there and
-exchanges only Di, so O is saved once. To avoid re-running the forward kernel,
-the remat policy must save `residual_checkpoint_name`; with `kv_hbm_prefetch`
-or `a2a` that is the only extra residual.
+`residual_checkpoint_name` like the LSE, so O is saved once. The backward moves
+O and dO to the head layout and forms Di there, as the native backward does.
+The exception is `head` without `head_checkpoint_names`: the backward re-runs
+the forward kernel for Q/K/V and forms Di from that kernel's head-layout O, so
+Di and the backward's P come from the same Q/K/V. This is the program of
+Tokamax `f0686ad` (the MaxText Plus-VL route that passed the 1000-step gate).
+dQ partials are BF16, as in native Splash with `dq_reduction_steps=3`. To avoid
+re-running the forward kernel, the remat policy must save
+`residual_checkpoint_name`; with `kv_hbm_prefetch` or `a2a` that is the only
+extra residual.
+
+A local batch can be folded into the head axis: `[B, H, S/CP, D]` becomes
+`[B*H, S/CP, D]` with `[B, S]` segment IDs, one row per sequence, in one call.
+`B*H` must be a multiple of CP, and the `B*H/CP` heads of a rank must not
+straddle two sequences: B divides CP or CP divides B.
 
 The whole-source SHA256 check against `splash_attention_kernel.py` protects
 private Ref ordering and buffer-lifetime assumptions. A Splash source change
@@ -77,8 +88,9 @@ requires explicit revalidation; do not simply refresh the expected hash.
 
 ## Migration and validation
 
-The backward implementation is byte-identical to MaxText commit
-`a4b23b5add26644bf39e2b620ce144d56d8e154e`. The sequence wrapper changes only
+At migration, the backward implementation was byte-identical to MaxText commit
+`a4b23b5add26644bf39e2b620ce144d56d8e154e`; it has since gained a tile ratio
+taken from the Splash config. The sequence wrapper changes only
 its import of that implementation. Function/kernel names, checkpoint tags,
 forward sharding and backward dQ layout are preserved. The base is
 `d5edf54` on `epic/absorb_a2a_into_splash_mha_kernel-based-release-v0.2`;
