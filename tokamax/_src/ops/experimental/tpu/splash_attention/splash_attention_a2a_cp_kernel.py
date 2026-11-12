@@ -1356,14 +1356,11 @@ def _splash_attention_forward(
       logsumexp = ad_checkpoint.checkpoint_name(
           logsumexp, name=config.residual_checkpoint_name
       )
-    if exchange_o:
-      # The backward's o residual. Unnamed, a remat policy could only
-      # rebuild it by re-running this whole kernel.
-      o_head = ad_checkpoint.checkpoint_name(
-          o_head, name=config.residual_checkpoint_name
-      )
-  # The backward's o residual is the head-sharded, normalized o.
-  o_res = out if cp_size == 1 or not exchange_o else o_head
+  # The backward's o residual is the named, normalized out: sequence sharded
+  # with the fused exchange (a copy of o_head; the backward forms Di there),
+  # head sharded otherwise (taken before the all-to-all below). The caller's
+  # downstream backward also keeps out, so naming o_head too would save o twice.
+  o_res = out
   if cp_size > 1 and not exchange_o:
     # Unfused reciprocal: the native caller divides, then the post-kernel
     # all-to-all moves o back to the sequence-sharded layout.
@@ -1594,10 +1591,17 @@ def _splash_attention_bwd(
     kv_hbm_prefetch = True
   elif bwd_input_exchange == "a2a":
     q, k, v = (to_head(x) for x in (q, k, v))
-  # dO arrives sequence sharded; move it to the head-sharded layout of o.
-  do = to_head(do)
+  # dO arrives sequence sharded; the kernel takes it in the head layout.
+  do_head = to_head(do)
   with jax.named_scope("splash_bwd_di"):
-    di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))
+    # In the VJP forward fuse_reciprocal is config.fuse_reciprocal, and with
+    # cp_size > 1 it fuses the o exchange: the saved o is sequence sharded
+    # like dO. Form Di from the head-layout o and dO that the kernel reads,
+    # as the native backward does.
+    o_head = to_head(o) if config.fuse_reciprocal else o
+    di = jnp.einsum(
+        "hsd,hsd->hs", o_head.astype(jnp.float32), do_head.astype(jnp.float32))
+  do = do_head
   # The kernel exports dq/dk/dv in the caller's sequence-sharded layout.
   dq, dk, dv = mla_fused_backward.fused_backward(
       q,

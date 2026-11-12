@@ -113,7 +113,7 @@ def test_saved_residuals(exchange, names, saved):
       if origin != "from a constant"
   )
   arguments = [("bfloat16", HEADS * SEQ * d, True) for d in (192, 192, 128)] + [("int32", SEQ, True)]
-  # Head-layout o and logsumexp of the local heads, gathered over CP.
+  # Sequence-layout o and the local heads' logsumexp, gathered over CP.
   splash = [("bfloat16", HEADS * SEQ * 128, False), ("float32", HEADS * SEQ, False)]
   head_qkv = [("bfloat16", HEADS * SEQ * d, False) for d in (192, 192, 128)] if names else []
   assert found == sorted(arguments + splash + head_qkv)
@@ -130,11 +130,15 @@ def test_backward_exchanges_and_forward_recompute(exchange, names, saved):
   assert outvars == [(HEADS, SEQ, 128), (HEADS, SEQ, 192), (HEADS, SEQ, 192), (HEADS, SEQ, 128)]
   text = str(program)
   assert text.count("name=mla_fused_dq_dkv_a2a") == 1
-  # dO always; q for kv_hbm_prefetch; q/k/v for a2a.
-  assert text.count("all_to_all[") == {"head": 1, "kv_hbm_prefetch": 2, "a2a": 4}[exchange]
+  # dO and Di always; q for kv_hbm_prefetch; q/k/v for a2a.
+  assert text.count("all_to_all[") == {"head": 2, "kv_hbm_prefetch": 3, "a2a": 5}[exchange]
   hlo = jax.jit(run).trace(*args).lower(lowering_platforms=("tpu",)).as_text()
   # Unnamed head buffers can only be rebuilt by re-running the forward kernel.
   assert live_forward_kernels(hlo) == (2 if exchange == "head" and names is None else 1)
+  # dq keeps the kernel's head-dimension-minor layout; XLA chooses the
+  # downstream projection layout.
+  dq_type = f"tensor<{HEADS}x{SEQ // CP}x192xbf16>"
+  assert not any("@LayoutConstraint" in line and dq_type in line for line in hlo.splitlines())
 
 
 def test_factory_under_jit_checks_concrete_metadata(monkeypatch):
