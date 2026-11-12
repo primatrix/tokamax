@@ -691,6 +691,84 @@ def _local_groups(x, rank, num_heads: int, heads_local: int):
   return lax.dynamic_slice_in_dim(x, first, rows, 0)
 
 
+def _segment_tile_bounds(ids, block):
+  """Nonzero segment-ID range of each ``block``-token tile, and whether it holds ID 0."""
+  tiles = ids.reshape(*ids.shape[:-1], ids.shape[-1] // block, block)
+  nonzero = tiles != 0
+  limits = jnp.iinfo(ids.dtype)
+  low = jnp.min(jnp.where(nonzero, tiles, limits.max), axis=-1)
+  high = jnp.max(jnp.where(nonzero, tiles, limits.min), axis=-1)
+  return low, high, jnp.any(nonzero, axis=-1), jnp.any(~nonzero, axis=-1)
+
+
+def _segment_tiles(q_ids, kv_ids, bq, bkv):
+  """[Q tiles, K/V tiles]: whether a Q and a K/V token of the tiles can share a segment.
+
+  Conservative for any IDs: an equal nonzero ID lies in both nonzero ranges,
+  and an ID-0 pair needs ID 0 in both tiles. Rows of grouped IDs are combined.
+  """
+  qlo, qhi, qnz, qzero = _segment_tile_bounds(q_ids, bq)
+  klo, khi, knz, kzero = _segment_tile_bounds(kv_ids, bkv)
+  overlap = (qlo[:, :, None] <= khi[:, None, :]) & (klo[:, None, :] <= qhi[:, :, None])
+  active = overlap & qnz[:, :, None] & knz[:, None, :]
+  active |= qzero[:, :, None] & kzero[:, None, :]
+  return jnp.any(active, axis=0)
+
+
+def _keep_schedule(info, active):
+  """The entries of a dynamic-grid schedule whose tile is active, in their order.
+
+  ``active`` is indexed [active_rows, active_cols]. Tiles crossing the causal
+  diagonal (block mask 1) are always kept, so every row keeps at least one
+  visit. The kernels derive row initialization and stores from the pruned
+  rows (``find_bounds``), so a row may start or end at a different tile.
+  """
+  if info.block_mask is None or info.block_mask.ndim != 1:
+    raise ValueError("Segment schedules need one shared causal block mask.")
+  size = info.active_rows.shape[0]
+  rows, cols = (jnp.maximum(to_i32(x), 0) for x in (info.active_rows, info.active_cols))
+  keep = active[rows, cols] | (info.block_mask == 1)
+  keep &= jnp.arange(size) < info.num_active_blocks[0]
+  (index,) = jnp.nonzero(keep, size=size, fill_value=size)
+  take = lambda x, fill: None if x is None else jnp.take(x, index, mode="fill", fill_value=fill)
+  count = jnp.sum(keep, dtype=info.num_active_blocks.dtype)
+  return info._replace(
+      active_rows=take(info.active_rows, -1),
+      active_cols=take(info.active_cols, -1),
+      mask_next=take(info.mask_next, -1),
+      block_mask=take(info.block_mask, 0),
+      num_active_blocks=count.reshape(info.num_active_blocks.shape),
+  )
+
+
+def _segment_schedules(fwd_info, dkv_info, segment_ids, config, *, num_heads, cp_size, cp_axis):
+  """The causal schedules without tiles whose Q and K/V tokens share no segment.
+
+  Every element of a skipped tile is masked, so it adds exactly zero to the
+  output and the gradients. In the dKV schedule each Q tile's visits are
+  closed into one run of K/V rows ending at its diagonal; with the diagonal
+  blocks kept this keeps dQ partial revisits at least 2 * r + 3 programs
+  apart for any IDs (``mla_fused_backward.segment_schedule_safety``).
+  """
+  q_ids, kv_ids = segment_ids.q, segment_ids.kv
+  if q_ids.ndim == 1:
+    q_ids, kv_ids = q_ids[None], kv_ids[None]
+  elif cp_size > 1:
+    # Grouped IDs: this rank's heads read only their groups' rows.
+    rank = lax.axis_index(cp_axis)
+    heads_local = num_heads // cp_size
+    q_ids = _local_groups(q_ids, rank, num_heads, heads_local)
+    kv_ids = _local_groups(kv_ids, rank, num_heads, heads_local)
+  fwd = _segment_tiles(q_ids, kv_ids, config.block_q, config.block_kv)
+  fwd_info = _keep_schedule(fwd_info, fwd)
+  if dkv_info is not None:
+    # [K/V rows, Q tiles], closed from each Q tile's first active row onward.
+    dkv = _segment_tiles(q_ids, kv_ids, config.block_q_dkv, config.block_kv_dkv).T
+    dkv = jnp.cumsum(dkv, axis=0, dtype=jnp.int32) > 0
+    dkv_info = _keep_schedule(dkv_info, dkv)
+  return fwd_info, dkv_info
+
+
 # How the MLA fused backward gets head-layout q/k/v when cp_size > 1:
 # * head: the forward's received buffers. A remat policy can save them only if
 #   they are named (``head_checkpoint_names``); otherwise rebuilding them
@@ -1404,6 +1482,7 @@ def _splash_attention_forward(
         "cp_axis",
         "bwd_input_exchange",
         "head_checkpoint_names",
+        "segment_schedule",
     ),
 )
 def _splash_attention_custom(
@@ -1425,6 +1504,7 @@ def _splash_attention_custom(
     cp_axis: str | None,
     bwd_input_exchange: str,
     head_checkpoint_names: tuple[str, str, str] | None,
+    segment_schedule: bool,
     max_logit_value: jax.Array | None = None,
 ) -> base.SplashCustomReturnType:
   # The forward function does not use the dq and dkv MaskInfos, it just forwards
@@ -1437,7 +1517,7 @@ def _splash_attention_custom(
   # mask then we would not work with the MaskInfo slice relevant to the current
   # device.
   del dkv_mask_info
-  del bwd_input_exchange, head_checkpoint_names  # Backward residuals only.
+  del bwd_input_exchange, head_checkpoint_names, segment_schedule  # Backward only.
 
   out, stats, _ = _splash_attention_forward(  # pytype: disable=wrong-arg-types
       fwd_mask_info,
@@ -1484,12 +1564,14 @@ def _splash_attention_fwd(
     cp_axis: str | None,
     bwd_input_exchange: str,
     head_checkpoint_names: tuple[str, str, str] | None,
+    segment_schedule: bool,
     max_logit_value: jax.Array | None = None,
 ) -> tuple[tuple[jax.Array], base.SplashResidualsType]:
 
   # TODO: add some higher order AD check that isn't save_residuals based.
   # if save_residuals:
   #   raise NotImplementedError("Higher-order AD not supported.")
+  del segment_schedule  # Backward only.
   _check_bwd_input_exchange(bwd_input_exchange, head_checkpoint_names)
   if bwd_input_exchange == "kv_hbm_prefetch" and k.shape[0] != q.shape[0]:
     raise ValueError("kv_hbm_prefetch imports one k/v head per q head; no GQA.")
@@ -1579,6 +1661,7 @@ def _splash_attention_bwd(
     cp_axis: str | None,
     bwd_input_exchange: str,
     head_checkpoint_names: tuple[str, str, str] | None,
+    segment_schedule: bool,
     res: base.SplashResidualsType,
     grads: jax.Array | tuple[jax.Array, dict[str, jax.Array]],
 ):
@@ -1645,6 +1728,7 @@ def _splash_attention_bwd(
       mask_function=mask_function,
       config=config,
       dkv_mask_sparsity=dkv_mask_sparsity,
+      segment_schedule=segment_schedule,
   )
   return (
       None,  # fwd_mask_info
@@ -1675,6 +1759,7 @@ _splash_attention_custom.defvjp(_splash_attention_fwd, _splash_attention_bwd)
         "cp_axis",
         "bwd_input_exchange",
         "head_checkpoint_names",
+        "segment_schedule",
     ],
 )
 def _splash_attention(
@@ -1698,7 +1783,15 @@ def _splash_attention(
     cp_axis: str | None,
     bwd_input_exchange: str = "head",
     head_checkpoint_names: tuple[str, str, str] | None = None,
+    segment_schedule: bool = False,
 ) -> base.SplashCustomReturnType:
+  if segment_schedule and segment_ids is not None:
+    # Pruned once here, so the forward, a remat replay and the backward all
+    # read the same schedules.
+    fwd_mask_info, dkv_mask_info = _segment_schedules(
+        fwd_mask_info, dkv_mask_info, segment_ids, config,
+        num_heads=q.shape[0], cp_size=cp_size, cp_axis=cp_axis,
+    )
   return _splash_attention_custom(
       fwd_mask_info,
       dkv_mask_info,
@@ -1719,6 +1812,7 @@ def _splash_attention(
       cp_axis=cp_axis,
       bwd_input_exchange=bwd_input_exchange,
       head_checkpoint_names=head_checkpoint_names,
+      segment_schedule=segment_schedule,
   )
 
 
@@ -1825,11 +1919,16 @@ def _make_splash_attention(
     cp_axis: str | None = None,
     bwd_input_exchange: str = "head",
     head_checkpoint_names: tuple[str, str, str] | None = None,
+    segment_schedule: bool = False,
 ):
   # After the fused exchange every rank attends the full sequence, so the mask
   # is never sequence sharded.
   if q_seq_shards != 1:
     raise ValueError(f"{q_seq_shards=} must be 1; the a2a exchange is fused.")
+  if segment_schedule and not isinstance(mask, mask_lib.CausalMask):
+    # The pruned schedules keep the causal diagonal of every row; see
+    # _segment_schedules and mla_fused_backward.segment_schedule_safety.
+    raise ValueError("segment_schedule needs a causal mask.")
   if head_checkpoint_names is not None:
     head_checkpoint_names = tuple(head_checkpoint_names)
   _check_bwd_input_exchange(bwd_input_exchange, head_checkpoint_names)
@@ -1904,6 +2003,7 @@ def _make_splash_attention(
       cp_axis=cp_axis,
       bwd_input_exchange=bwd_input_exchange,
       head_checkpoint_names=head_checkpoint_names,
+      segment_schedule=segment_schedule,
   )
 
 

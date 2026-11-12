@@ -128,6 +128,39 @@ def causal_schedule_proof(kv_steps, r):
   )
 
 
+def segment_schedule_safety(rows, cols, r):
+  """dQ partial-buffer safety of a pruned (K/V row, Q tile) schedule.
+
+  ``rows``/``cols`` are one head's active entries, ordered as the kernel
+  visits them. Pruning keeps every diagonal block and closes each Q tile's
+  visits into consecutive K/V rows ending at its diagonal, so a partial slot
+  of a Q tile is revisited only three rows later: at least 2 * r + 3
+  programs. A diagonal finalization can read, at distance 1, only the slot
+  of the previous row, which output_kernel takes from the previous VMEM bank.
+  Raises if a schedule breaks either bound; returns both minimum distances.
+  """
+  last, previous, revisits, final_reads = {}, {}, [], []
+  for g, (j, i) in enumerate(zip(rows, cols)):
+    j, i = int(j), int(i)
+    if j == i // r:
+      for s in range(3):
+        if s != j % 3 and (s, i) in previous:
+          distance = g - previous[s, i]
+          if distance == 1 and s != (j - 1) % 3:
+            raise ValueError("MLA final reduction can read an outstanding partial store")
+          final_reads.append(distance)
+    key = (j % 3, i)
+    if key in last:
+      revisits.append(g - last[key])
+    last[key] = previous[key] = g
+  if revisits and min(revisits) <= 3:
+    raise ValueError("MLA dQ partial buffers can revisit an outstanding store")
+  return dict(
+      minimum_partial_revisit_distance=min(revisits) if revisits else None,
+      minimum_final_other_partial_distance=min(final_reads) if final_reads else None,
+  )
+
+
 def validate_metadata(kernel, cp, sequence=None):
   """Bind early-finalization and prefetch safety to the dKV mask metadata.
 
@@ -307,7 +340,7 @@ def dkv_output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv
     lax.fori_loop(0, cp * heads * tiles_per_peer, receive_one, None, unroll=False)
 
 
-def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_steps, dq_pipeline, **params):
+def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_steps, dq_pipeline, pruned=False, **params):
   assert len(refs) == 39
   # Added output at index22 shifts original scratch and dKV scratch by one.
   original = list(refs[:22]) + list(refs[23:26])
@@ -320,8 +353,11 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
   bq, bkv = params["bq"], params["bkv"]
   r = bkv // bq
   assert r >= 1 and bkv == r * bq
-  # See causal_schedule_proof: only r == 1 finalizes on a partial whose store is in flight.
-  previous_bank = dq_pipeline and r == 1
+  # See causal_schedule_proof: only r == 1 finalizes on a partial whose store is
+  # in flight. A segment-pruned schedule can do so for any r: a Q tile whose
+  # previous visit is the last tile of the previous row
+  # (segment_schedule_safety).
+  previous_bank = dq_pipeline and (r == 1 or pruned)
   slot = lax.rem(g, 2) if dq_pipeline else jnp.int32(0)
   j, i = sk.to_i32(original[0][g]), sk.to_i32(original[1][g])
   final_q = j == lax.div(i, r)
@@ -413,7 +449,9 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
     current = lax.rem(j, 3)
     partials[current] = output_stage[slot]
     if previous_bank:
-      # Same head and Q tile at g - 1 means K/V row j - 1; its slot differs from current.
+      # Same head and Q tile at g - 1 means K/V row j - 1 (the full schedule, or
+      # a pruned one whose Q tile visits are consecutive rows); its slot
+      # differs from current.
       previous_j, previous_i = address(jnp.maximum(g - 1, 0))
       in_flight = jnp.logical_and(g > 0, previous_i == i)
       in_flight_slot = lax.rem(previous_j, 3)
@@ -643,6 +681,7 @@ def fused_backward(
     mask_function: MaskFunctionType | None,
     config: SplashConfig,
     dkv_mask_sparsity: float,
+    segment_schedule: bool = False,
 ):
   # HBM K/V staging is the only in-kernel input exchange. Q and dO arrive in
   # head layout; K/V arrive sequence-owned and are imported per head.
@@ -925,6 +964,8 @@ def fused_backward(
       heads=num_q_heads,
       kv_steps=kv_steps,
       dq_pipeline=True,
+      # A segment-pruned schedule (see segment_schedule_safety).
+      pruned=segment_schedule,
       mask_value=mask_value,
       q_steps=q_steps,
       bq=bq,
