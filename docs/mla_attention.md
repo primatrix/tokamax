@@ -51,8 +51,20 @@ traced HBM regions) were removed. The forward remote-DMA input/output exchanges
 (`fwd_input_exchange`/`fwd_output_exchange`) were also removed: production uses
 the external all-to-all, and the full-model output remote DMA measured +6.8 ms
 per step, within run-to-run spread.
-The existing forward-only `splash_attention_a2a_cp_kernel` is an independent
-implementation and is not used by this API.
+`make_splash_mha_a2a_cp` (`splash_attention_a2a_cp_kernel.py`) is a separate
+entry point: its forward fuses the Q/K/V and O exchanges into one Pallas call,
+and its backward uses the same fused MLA backward. Its `bwd_input_exchange`
+selects how the backward gets head-layout Q/K/V:
+
+- `head` (default): the forward's received buffers. Pass
+  `head_checkpoint_names=(q, k, v)` so a remat policy can save them; unnamed
+  buffers can only be rebuilt by re-running the forward kernel.
+- `kv_hbm_prefetch`: saves the sequence shards; Q uses an XLA all-to-all and
+  the kernel imports K/V. No GQA.
+- `a2a`: saves the sequence shards; Q/K/V use XLA all-to-alls.
+
+The head-layout O residual is named with `residual_checkpoint_name`, like the
+output and LSE.
 
 The whole-source SHA256 check against `splash_attention_kernel.py` protects
 private Ref ordering and buffer-lifetime assumptions. A Splash source change
@@ -88,7 +100,8 @@ metadata and DMA boundary contracts:
 
 ```sh
 XLA_FLAGS=--xla_force_host_platform_device_count=16 python -m pytest -q \
-  tokamax/_src/ops/experimental/tpu/splash_attention/mla_fused_backward_trace_test.py
+  tokamax/_src/ops/experimental/tpu/splash_attention/mla_fused_backward_trace_test.py \
+  tokamax/_src/ops/experimental/tpu/splash_attention/mla_a2a_cp_backward_trace_test.py
 ```
 
 These CPU checks do not execute TPU remote DMA or establish device accuracy.
