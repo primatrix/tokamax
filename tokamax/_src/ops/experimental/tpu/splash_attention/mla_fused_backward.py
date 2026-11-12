@@ -58,8 +58,12 @@ mask_info_lib = sk.mask_info_lib
 to_i32 = sk.to_i32
 
 
-# Q tiles per K/V tile; output_kernel's diagonal finalization relies on it.
-Q_TILES_PER_KV = 8
+def q_tiles_per_kv(config):
+  """Q tiles per K/V tile, r = block_kv_dkv / block_q_dkv; diagonal finalization uses it."""
+  bq, bkv = config.block_q_dkv, config.block_kv_dkv
+  if not bq or not bkv or bkv % bq:
+    raise ValueError(f"MLA fused backward needs block_kv_dkv a positive multiple of block_q_dkv; got {bq=}, {bkv=}")
+  return bkv // bq
 
 
 def _host_metadata(x):
@@ -81,12 +85,14 @@ def _host_metadata(x):
 
 
 @functools.lru_cache(maxsize=None)
-def causal_schedule_proof(kv_steps):
+def causal_schedule_proof(kv_steps, r):
   """dQ partial-buffer safety of the ordered causal (K/V row, Q tile) schedule.
 
-  A pure function of the static geometry, so it holds for traced metadata.
+  r is the number of Q tiles per K/V tile. A pure function of the static
+  geometry, so it holds for traced metadata. At program g, output_kernel
+  issues the load for g + 1 while the stores of g - 2 and g - 1 are in flight,
+  then waits store g - 2; diagonal finalization runs after that wait.
   """
-  r = Q_TILES_PER_KV
   expected = [(j, i) for j in range(kv_steps) for i in range(r * j, r * kv_steps)]
   last, distances = {}, []
   for g, (j, i) in enumerate(expected):
@@ -94,8 +100,11 @@ def causal_schedule_proof(kv_steps):
     if key in last:
       distances.append(g - last[key])
     last[key] = g
-  # Other partials read by diagonal finalization must be older than the
-  # two outstanding output generations, independently of same-slot reuse.
+  # Diagonal finalization reads the other partials of its Q tile. A partial
+  # stored two or more programs earlier has been waited. One stored by the
+  # previous program is still in flight; output_kernel reads it from that
+  # program's VMEM output bank. The distance to row J - 1 is q_steps - r*J,
+  # so distance 1 occurs only for r == 1, the only case that reuses the bank.
   previous, final_read_distances = {}, []
   for g, (j, i) in enumerate(expected):
     if j == i // r:
@@ -103,14 +112,15 @@ def causal_schedule_proof(kv_steps):
         if partial != j % 3 and (partial, i) in previous:
           final_read_distances.append(g - previous[partial, i])
     previous[j % 3, i] = g
-  if final_read_distances and min(final_read_distances) <= 2:
+  if final_read_distances and min(final_read_distances) < (1 if r == 1 else 2):
     raise ValueError("MLA final reduction can read an outstanding partial store")
-  # Same-address lookahead must not race an outstanding partial store.
-  if distances and min(distances) <= 2:
+  # The lookahead load of g + 1 must not alias stores g - 2 or g - 1.
+  if distances and min(distances) <= 3:
     raise ValueError("MLA dQ partial buffers can revisit an outstanding store")
   return expected, dict(
       programs_per_head=len(expected),
       kv_steps=kv_steps,
+      q_tiles_per_kv=r,
       q_steps=r * kv_steps,
       export_writes_per_head=kv_steps,
       minimum_partial_revisit_distance=min(distances) if distances else None,
@@ -137,14 +147,15 @@ def validate_metadata(kernel, cp, sequence=None):
       or not all(jnp.issubdtype(x.dtype, jnp.integer) for x in leaves)
   ):
     raise ValueError("MLA export requires one static integer causal schedule")
+  config = getattr(kernel, "kwargs", {}).get("config")
   values = tuple(_host_metadata(x) for x in leaves)
   if any(x is None for x in values):
     if sequence is None:
       return None
-    kv_steps = sequence // kernel.kwargs["config"].block_kv_dkv
+    kv_steps = sequence // config.block_kv_dkv
     if kv_steps % cp:
       raise ValueError("MLA export requires complete CP partitions of K/V tiles")
-    _, proof = causal_schedule_proof(kv_steps)
+    _, proof = causal_schedule_proof(kv_steps, q_tiles_per_kv(config))
     if np.shape(leaves[1])[0] != proof["programs_per_head"]:
       raise ValueError("Traced MLA schedule length does not match the causal geometry")
     return dict(proof, concrete=False)
@@ -155,11 +166,14 @@ def validate_metadata(kernel, cp, sequence=None):
   rows, cols = raw_rows[:n], raw_cols[:n]
   kv_steps = len(np.unique(rows))
   q_steps = int(cols.max()) + 1
-  if q_steps != kv_steps * Q_TILES_PER_KV or kv_steps % cp:
-    raise ValueError("MLA export requires eight Q tiles per KV tile and complete CP partitions")
-  if sequence is not None and kv_steps * kernel.kwargs["config"].block_kv_dkv != sequence:
+  r = q_steps // kv_steps
+  if r < 1 or q_steps != r * kv_steps or (config is not None and r != q_tiles_per_kv(config)):
+    raise ValueError("MLA export requires block_kv_dkv / block_q_dkv Q tiles per KV tile")
+  if kv_steps % cp:
+    raise ValueError("MLA export requires complete CP partitions of K/V tiles")
+  if sequence is not None and kv_steps * config.block_kv_dkv != sequence:
     raise ValueError("MLA schedule does not cover the sequence")
-  expected, proof = causal_schedule_proof(kv_steps)
+  expected, proof = causal_schedule_proof(kv_steps, r)
   if n != len(expected) or not (
       np.array_equal(rows, [j for j, _ in expected]) and np.array_equal(cols, [i for _, i in expected])
   ):
@@ -304,10 +318,13 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
   h, g = pl.program_id(0), pl.program_id(1)
   n = pl.num_programs(1)
   bq, bkv = params["bq"], params["bkv"]
-  assert bkv == Q_TILES_PER_KV * bq
+  r = bkv // bq
+  assert r >= 1 and bkv == r * bq
+  # See causal_schedule_proof: only r == 1 finalizes on a partial whose store is in flight.
+  previous_bank = dq_pipeline and r == 1
   slot = lax.rem(g, 2) if dq_pipeline else jnp.int32(0)
   j, i = sk.to_i32(original[0][g]), sk.to_i32(original[1][g])
-  final_q = j == lax.div(i, Q_TILES_PER_KV)
+  final_q = j == lax.div(i, r)
   sender = lax.axis_index(axis_name)
   per_peer = kv_steps // cp
 
@@ -380,12 +397,13 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
 
   # @reference.begin dq_final_reduction_and_export
   # On the causal diagonal, all contributions to Q tile i are complete.
-  # Other partials' last stores occurred >1 program ago, hence were waited.
+  # Other partials' last stores were waited, except (r == 1 only) one stored
+  # by the previous program, which is read from its VMEM output bank.
   # Preserve BF16 partial updates, FP32 three-slot sum, then one BF16 cast.
   @pl.when(final_q)
   def _():
     message = h * kv_steps + j
-    sub = lax.rem(i, Q_TILES_PER_KV)
+    sub = lax.rem(i, r)
     if dq_pipeline:
 
       @pl.when(jnp.logical_and(sub == 0, message > 0))
@@ -394,15 +412,33 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
 
     current = lax.rem(j, 3)
     partials[current] = output_stage[slot]
+    if previous_bank:
+      # Same head and Q tile at g - 1 means K/V row j - 1; its slot differs from current.
+      previous_j, previous_i = address(jnp.maximum(g - 1, 0))
+      in_flight = jnp.logical_and(g > 0, previous_i == i)
+      in_flight_slot = lax.rem(previous_j, 3)
+
+    def from_hbm(s):
+      if previous_bank:
+        return jnp.logical_and(current != s, jnp.logical_not(jnp.logical_and(in_flight, in_flight_slot == s)))
+      return current != s
+
     for s in range(3):
 
-      @pl.when(current != s)
+      @pl.when(from_hbm(s))
       def _():
         pltpu.make_async_copy(dq_input.at[s, h, pl.ds(i * bq, bq), :], partials.at[s], partial_sem.at[s]).start()
 
+    if previous_bank:
+      for s in range(3):
+
+        @pl.when(jnp.logical_and(in_flight, in_flight_slot == s))
+        def _():
+          partials[s] = output_stage[1 - slot]
+
     for s in range(3):
 
-      @pl.when(current != s)
+      @pl.when(from_hbm(s))
       def _():
         pltpu.make_async_copy(dq_input.at[s, h, pl.ds(i * bq, bq), :], partials.at[s], partial_sem.at[s]).wait()
 
@@ -410,7 +446,7 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
         export_stage.dtype
     )
 
-    @pl.when(sub == 7)
+    @pl.when(sub == r - 1)
     def _():
       transfer(message).start()
       if not dq_pipeline:
@@ -445,7 +481,7 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
     lax.fori_loop(0, cp * heads * per_peer, drain, None, unroll=False)
 
 
-def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, prefetch):
+def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bkv, prefetch):
   """Import into unique HBM head slots, then explicitly load two VMEM banks.
 
   Experimental only. Each sender writes its disjoint sequence chunk once per
@@ -466,7 +502,7 @@ def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, pre
   row = sk.to_i32(original[0][program])
   first = original[3][program].astype(jnp.bool_)
   last = original[4][program].astype(jnp.bool_)
-  per_owner, block = rows // cp, Q_TILES_PER_KV * bq
+  per_owner, block = rows // cp, bkv
   length = per_owner * block
   bank = lax.rem(row, 2)
 
@@ -1091,7 +1127,7 @@ def fused_backward(
         axis_name=axis_name,
         heads=num_q_heads,
         rows=kv_steps,
-        bq=bq,
+        bkv=bkv,
         prefetch=kv_hbm_prefetch,
     )
     out_shapes += [jax.ShapeDtypeStruct((num_q_heads, q_seq_len, d), jnp.bfloat16) for d in (head_dim_qk, head_dim_v)]
@@ -1161,17 +1197,15 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
 
   Local heads are ``q.shape[0]``; global heads are ``CP * local heads``. Head
   widths and tile sizes come from the inputs and the Splash config; Splash and
-  Pallas enforce TPU block alignment. Diagonal dQ finalization fixes the tile
-  ratio: block_kv_dkv must be Q_TILES_PER_KV * block_q_dkv, with three dQ
-  partial slots.
+  Pallas enforce TPU block alignment. block_kv_dkv must be a positive multiple
+  of block_q_dkv (r Q tiles per K/V tile, any r >= 1), with the three dQ
+  partial slots of the pinned Splash dynamic grid.
   """
   validate_source()
   cfg = kernel.kwargs["config"]
-  if cfg.dq_reduction_steps != 3 or cfg.block_q_dkv is None or cfg.block_kv_dkv != Q_TILES_PER_KV * cfg.block_q_dkv:
-    raise ValueError(
-        f"MLA fused backward needs dq_reduction_steps=3 and block_kv_dkv == {Q_TILES_PER_KV} * block_q_dkv; got "
-        f"{cfg.dq_reduction_steps=}, {cfg.block_q_dkv=}, {cfg.block_kv_dkv=}"
-    )
+  if cfg.dq_reduction_steps != 3:
+    raise ValueError(f"MLA fused backward needs dq_reduction_steps=3; got {cfg.dq_reduction_steps=}")
+  q_tiles_per_kv(cfg)
   if (
       type(cp) is not int
       or cp < 1

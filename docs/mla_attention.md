@@ -16,8 +16,9 @@ The geometry is derived from the call: CP is the mesh context size, local
 heads are global heads / CP (any positive count), head widths are the Q/K and
 V input widths, and the sequence must be a multiple of CP x `block_kv_dkv` so
 every rank owns whole K/V tiles. Tile sizes come from the Splash config; Splash
-and Pallas enforce TPU block alignment. Diagonal dQ finalization requires
-`block_kv_dkv == 8 * block_q_dkv` and three dQ partials. Inputs are BF16 with
+and Pallas enforce TPU block alignment. `block_kv_dkv` must be a positive
+multiple of `block_q_dkv` (r Q tiles per K/V tile, e.g. 8 for 512/4096 and 1
+for 2048/2048), with three dQ partials. Inputs are BF16 with
 int32 segment IDs, causal attention, natural-log softmax, HEAD_DIM_MINOR
 layouts and cast-before-transpose. Mask
 metadata may be concrete NumPy (checked element-wise) or traced, e.g. when the
