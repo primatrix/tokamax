@@ -15,7 +15,7 @@
 
 """MLA backward with tile-ready dK/dV and dQ reduction/export.
 
-Derived from the C14/P18 numerically qualified CP8/CP16 allwrite candidate.
+Derived from the C14/P18 allwrite candidate; any CP that partitions the K/V tiles.
 Arithmetic is delegated to the pinned Tokamax inner kernel. The caller is
 vendored as ordinary source so production never rewrites or executes strings.
 Keep the upstream source hash check when changing Tokamax: these Ref positions
@@ -24,9 +24,9 @@ and partial-buffer lifetimes are an internal ABI, not a public API.
 from __future__ import annotations
 
 import functools
-import contextlib
 import hashlib
 import inspect
+import math
 from pathlib import Path
 
 import jax
@@ -58,32 +58,125 @@ mask_info_lib = sk.mask_info_lib
 to_i32 = sk.to_i32
 
 
-def validate_metadata(kernel, cp):
-  """Bind early-finalization and prefetch safety to actual static metadata."""
+def q_tiles_per_kv(config):
+  """Q tiles per K/V tile, r = block_kv_dkv / block_q_dkv; diagonal finalization uses it."""
+  bq, bkv = config.block_q_dkv, config.block_kv_dkv
+  if not bq or not bkv or bkv % bq:
+    raise ValueError(f"MLA fused backward needs block_kv_dkv a positive multiple of block_q_dkv; got {bq=}, {bkv=}")
+  return bkv // bq
+
+
+def _host_metadata(x):
+  """Concrete NumPy value of static mask metadata, or None while traced.
+
+  Kernels built by make_static_splash_kernel hold NumPy leaves. The public
+  Tokamax factory holds jax.Arrays, which become tracers (or topology-only
+  device buffers) when the kernel is created inside a traced AOT function.
+  """
+  if isinstance(x, np.ndarray):
+    return x
+  if isinstance(x, jax.core.Tracer):
+    return None
+  try:
+    return np.asarray(x)
+  except (RuntimeError, TypeError, jax.errors.JAXTypeError):
+    # Topology-only AOT buffers cannot be copied to the host.
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def causal_schedule_proof(kv_steps, r):
+  """dQ partial-buffer safety of the ordered causal (K/V row, Q tile) schedule.
+
+  r is the number of Q tiles per K/V tile. A pure function of the static
+  geometry, so it holds for traced metadata. At program g, output_kernel
+  issues the load for g + 1 while the stores of g - 2 and g - 1 are in flight,
+  then waits store g - 2; diagonal finalization runs after that wait.
+  """
+  expected = [(j, i) for j in range(kv_steps) for i in range(r * j, r * kv_steps)]
+  last, distances = {}, []
+  for g, (j, i) in enumerate(expected):
+    key = (j % 3, i)
+    if key in last:
+      distances.append(g - last[key])
+    last[key] = g
+  # Diagonal finalization reads the other partials of its Q tile. A partial
+  # stored two or more programs earlier has been waited. One stored by the
+  # previous program is still in flight; output_kernel reads it from that
+  # program's VMEM output bank. The distance to row J - 1 is q_steps - r*J,
+  # so distance 1 occurs only for r == 1, the only case that reuses the bank.
+  previous, final_read_distances = {}, []
+  for g, (j, i) in enumerate(expected):
+    if j == i // r:
+      for partial in range(3):
+        if partial != j % 3 and (partial, i) in previous:
+          final_read_distances.append(g - previous[partial, i])
+    previous[j % 3, i] = g
+  if final_read_distances and min(final_read_distances) < (1 if r == 1 else 2):
+    raise ValueError("MLA final reduction can read an outstanding partial store")
+  # The lookahead load of g + 1 must not alias stores g - 2 or g - 1.
+  if distances and min(distances) <= 3:
+    raise ValueError("MLA dQ partial buffers can revisit an outstanding store")
+  return expected, dict(
+      programs_per_head=len(expected),
+      kv_steps=kv_steps,
+      q_tiles_per_kv=r,
+      q_steps=r * kv_steps,
+      export_writes_per_head=kv_steps,
+      minimum_partial_revisit_distance=min(distances) if distances else None,
+      minimum_final_other_partial_distance=min(final_read_distances) if final_read_distances else None,
+  )
+
+
+def validate_metadata(kernel, cp, sequence=None):
+  """Bind early-finalization and prefetch safety to the dKV mask metadata.
+
+  Shape and dtype checks are static. Concrete metadata is compared with the
+  ordered causal schedule. Traced metadata cannot be read on the host; then
+  the schedule length is checked against ``sequence`` and the static proof
+  is used. Returns None when traced and ``sequence`` is not yet known.
+  """
   info = kernel.dkv_mask_info
-  count = np.asarray(info.num_active_blocks)
-  raw_rows, raw_cols = np.asarray(info.active_rows), np.asarray(info.active_cols)
+  leaves = (info.num_active_blocks, info.active_rows, info.active_cols)
   if (
-      cp not in (8, 16)
-      or count.size != 1
-      or not np.issubdtype(count.dtype, np.integer)
-      or raw_rows.ndim != 1
-      or raw_cols.ndim != 1
-      or raw_rows.shape != raw_cols.shape
-      or not np.issubdtype(raw_rows.dtype, np.integer)
-      or not np.issubdtype(raw_cols.dtype, np.integer)
+      cp < 1
+      or any(x is None for x in leaves)
+      or math.prod(np.shape(leaves[0])) != 1
+      or np.ndim(leaves[1]) != 1
+      or np.shape(leaves[1]) != np.shape(leaves[2])
+      or not all(jnp.issubdtype(x.dtype, jnp.integer) for x in leaves)
   ):
-    raise ValueError("MLA export requires one static integer causal schedule and CP8/CP16")
+    raise ValueError("MLA export requires one static integer causal schedule")
+  config = getattr(kernel, "kwargs", {}).get("config")
+  values = tuple(_host_metadata(x) for x in leaves)
+  if any(x is None for x in values):
+    if sequence is None:
+      return None
+    kv_steps = sequence // config.block_kv_dkv
+    if kv_steps % cp:
+      raise ValueError("MLA export requires complete CP partitions of K/V tiles")
+    _, proof = causal_schedule_proof(kv_steps, q_tiles_per_kv(config))
+    if np.shape(leaves[1])[0] != proof["programs_per_head"]:
+      raise ValueError("Traced MLA schedule length does not match the causal geometry")
+    return dict(proof, concrete=False)
+  count, raw_rows, raw_cols = values
   n = int(count.reshape(-1)[0])
   if not 0 < n <= raw_rows.size:
     raise ValueError("MLA active program count is outside the static schedule")
   rows, cols = raw_rows[:n], raw_cols[:n]
   kv_steps = len(np.unique(rows))
   q_steps = int(cols.max()) + 1
-  if q_steps != kv_steps * 8 or kv_steps % cp:
-    raise ValueError("MLA export requires eight Q tiles per KV tile and complete CP partitions")
-  expected = [(j, i) for j in range(kv_steps) for i in range(8 * j, q_steps)]
-  if list(zip(rows.tolist(), cols.tolist())) != expected:
+  r = q_steps // kv_steps
+  if r < 1 or q_steps != r * kv_steps or (config is not None and r != q_tiles_per_kv(config)):
+    raise ValueError("MLA export requires block_kv_dkv / block_q_dkv Q tiles per KV tile")
+  if kv_steps % cp:
+    raise ValueError("MLA export requires complete CP partitions of K/V tiles")
+  if sequence is not None and kv_steps * config.block_kv_dkv != sequence:
+    raise ValueError("MLA schedule does not cover the sequence")
+  expected, proof = causal_schedule_proof(kv_steps, r)
+  if n != len(expected) or not (
+      np.array_equal(rows, [j for j, _ in expected]) and np.array_equal(cols, [i for _, i in expected])
+  ):
     raise ValueError("MLA export requires the complete ordered causal tile schedule")
   # Mirror the pinned find_bounds end predicate on the *whole* metadata
   # array, including padding outside the dynamic grid. Interior Q programs
@@ -95,34 +188,7 @@ def validate_metadata(kernel, cp):
   written_tiles = rows[write_end[:n]]
   if not np.array_equal(written_tiles, np.arange(kv_steps)):
     raise ValueError("MLA export requires exactly one final write per consecutive KV tile")
-  last, distances = {}, []
-  for g, (j, i) in enumerate(expected):
-    key = (j % 3, i)
-    if key in last:
-      distances.append(g - last[key])
-    last[key] = g
-  # Other partials read by diagonal finalization must be older than the
-  # two outstanding output generations, independently of same-slot reuse.
-  previous, final_read_distances = {}, []
-  for g, (j, i) in enumerate(expected):
-    if j == i // 8:
-      for partial in range(3):
-        if partial != j % 3 and (partial, i) in previous:
-          final_read_distances.append(g - previous[partial, i])
-    previous[j % 3, i] = g
-  if final_read_distances and min(final_read_distances) <= 2:
-    raise ValueError("MLA final reduction can read an outstanding partial store")
-  # Same-address lookahead must not race an outstanding partial store.
-  if distances and min(distances) <= 2:
-    raise ValueError("MLA dQ partial buffers can revisit an outstanding store")
-  return dict(
-      programs_per_head=n,
-      kv_steps=kv_steps,
-      q_steps=q_steps,
-      export_writes_per_head=len(written_tiles),
-      minimum_partial_revisit_distance=min(distances) if distances else None,
-      minimum_final_other_partial_distance=min(final_read_distances) if final_read_distances else None,
-  )
+  return dict(proof, concrete=True)
 
 
 def dkv_output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_steps, **params):
@@ -165,8 +231,8 @@ def dkv_output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv
   slot = lax.rem(ordinal, depth)
 
   # @reference.begin dkv_export_mapping
-  # All logical output elements: source[c,h,j*4096+u,d] ->
-  # destination[j//T,c*4+h,(j%T)*4096+u,d]. No arithmetic or reduction here.
+  # All logical output elements: source[c,h,j*bkv+u,d] ->
+  # destination[j//T,c*H+h,(j%T)*bkv+u,d]. No arithmetic or reduction here.
   def copies(message):
     mh, mj = lax.div(message, kv_steps), lax.rem(message, kv_steps)
     ms = lax.rem(message, depth)
@@ -252,10 +318,13 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
   h, g = pl.program_id(0), pl.program_id(1)
   n = pl.num_programs(1)
   bq, bkv = params["bq"], params["bkv"]
-  assert bkv == 8 * bq
+  r = bkv // bq
+  assert r >= 1 and bkv == r * bq
+  # See causal_schedule_proof: only r == 1 finalizes on a partial whose store is in flight.
+  previous_bank = dq_pipeline and r == 1
   slot = lax.rem(g, 2) if dq_pipeline else jnp.int32(0)
   j, i = sk.to_i32(original[0][g]), sk.to_i32(original[1][g])
-  final_q = j == lax.div(i, 8)
+  final_q = j == lax.div(i, r)
   sender = lax.axis_index(axis_name)
   per_peer = kv_steps // cp
 
@@ -328,12 +397,13 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
 
   # @reference.begin dq_final_reduction_and_export
   # On the causal diagonal, all contributions to Q tile i are complete.
-  # Other partials' last stores occurred >1 program ago, hence were waited.
+  # Other partials' last stores were waited, except (r == 1 only) one stored
+  # by the previous program, which is read from its VMEM output bank.
   # Preserve BF16 partial updates, FP32 three-slot sum, then one BF16 cast.
   @pl.when(final_q)
   def _():
     message = h * kv_steps + j
-    sub = lax.rem(i, 8)
+    sub = lax.rem(i, r)
     if dq_pipeline:
 
       @pl.when(jnp.logical_and(sub == 0, message > 0))
@@ -342,15 +412,33 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
 
     current = lax.rem(j, 3)
     partials[current] = output_stage[slot]
+    if previous_bank:
+      # Same head and Q tile at g - 1 means K/V row j - 1; its slot differs from current.
+      previous_j, previous_i = address(jnp.maximum(g - 1, 0))
+      in_flight = jnp.logical_and(g > 0, previous_i == i)
+      in_flight_slot = lax.rem(previous_j, 3)
+
+    def from_hbm(s):
+      if previous_bank:
+        return jnp.logical_and(current != s, jnp.logical_not(jnp.logical_and(in_flight, in_flight_slot == s)))
+      return current != s
+
     for s in range(3):
 
-      @pl.when(current != s)
+      @pl.when(from_hbm(s))
       def _():
         pltpu.make_async_copy(dq_input.at[s, h, pl.ds(i * bq, bq), :], partials.at[s], partial_sem.at[s]).start()
 
+    if previous_bank:
+      for s in range(3):
+
+        @pl.when(jnp.logical_and(in_flight, in_flight_slot == s))
+        def _():
+          partials[s] = output_stage[1 - slot]
+
     for s in range(3):
 
-      @pl.when(current != s)
+      @pl.when(from_hbm(s))
       def _():
         pltpu.make_async_copy(dq_input.at[s, h, pl.ds(i * bq, bq), :], partials.at[s], partial_sem.at[s]).wait()
 
@@ -358,7 +446,7 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
         export_stage.dtype
     )
 
-    @pl.when(sub == 7)
+    @pl.when(sub == r - 1)
     def _():
       transfer(message).start()
       if not dq_pipeline:
@@ -393,169 +481,7 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
     lax.fori_loop(0, cp * heads * per_peer, drain, None, unroll=False)
 
 
-def import_output_kernel(*refs, base_kernel, n_pre, n_scratch, cp, axis_name, import_head, length):
-  """Import the next head while the unchanged backward/export kernel runs.
-
-  The compiler entry barrier makes fresh remote destinations valid (device
-  probe P1a). Drain imports after base exports so all semaphores are empty
-  before the next call consumes the fresh outputs.
-  """
-  assert n_pre == 19 and n_scratch == 16 and len(refs) == 49
-  assert pl.num_programs(0) == 1
-  sources = refs[n_pre : n_pre + 4]
-  output_start = n_pre + 4
-  outputs = refs[output_start + 4 : output_start + 8]
-  scratch_start = output_start + 8
-  original = refs[:n_pre] + refs[output_start : output_start + 4] + refs[scratch_start : scratch_start + n_scratch]
-  send, recv = refs[-2:]
-  assert len(original) == 39 and len(sources) == len(outputs) == 4
-  sender = lax.axis_index(axis_name)
-
-  def copies(peer):
-    return tuple(
-        pltpu.make_async_remote_copy(
-            sources[t].at[peer * 4 + import_head],
-            outputs[t].at[0, pl.ds(sender * length, length), :],
-            send.at[t],
-            recv.at[sender, t],
-            device_id={axis_name: peer},
-        )
-        for t in range(4)
-    )
-
-  @pl.when(jnp.logical_and(pl.program_id(0) == 0, pl.program_id(1) == 0))
-  def launch():
-    def start_peer(peer, _):
-      for transfer in copies(peer):
-        transfer.start()
-
-    lax.fori_loop(0, cp, start_peer, None, unroll=False)
-
-  base_kernel(*original)
-
-  # The original kernel drains its dQ/dKV exports before these imports.
-  @pl.when(
-      jnp.logical_and(
-          pl.program_id(0) == pl.num_programs(0) - 1,
-          pl.program_id(1) == pl.num_programs(1) - 1,
-      )
-  )
-  def drain():
-    def wait_peer(peer, _):
-      for transfer in copies(peer):
-        transfer.wait_send()
-
-    lax.fori_loop(0, cp, wait_peer, None, unroll=False)
-
-    def wait_source(source, _):
-      for t in range(4):
-        # Wait-only descriptor: source shape determines the received byte count.
-        pltpu.make_async_copy(
-            sources[t].at[import_head],
-            outputs[t].at[0, pl.ds(source * length, length), :],
-            recv.at[source, t],
-        ).wait()
-
-    lax.fori_loop(0, cp, wait_source, None, unroll=False)
-
-
-def kv_shadow_output_kernel(*refs, base_kernel, n_pre, cp, axis_name, heads, length, prefetch):
-  """Diagnostic K/V traffic alongside unchanged separate-input arithmetic.
-
-  Each (source rank, head, destination rank, tensor) has unique source and
-  receive counters. Fresh HBM outputs never feed arithmetic or reuse storage.
-  The compiler global entry barrier establishes remote buffer availability.
-  This intentionally duplicates input traffic; it is not a production path.
-  """
-  assert n_pre == 19 and len(refs) == n_pre + 26
-  sources, outputs = refs[n_pre : n_pre + 2], refs[n_pre + 6 : n_pre + 8]
-  original = refs[:n_pre] + refs[n_pre + 2 : n_pre + 6] + refs[n_pre + 8 : n_pre + 24]
-  send, recv = refs[-2:]
-  rank = lax.axis_index(axis_name)
-  head, program = pl.program_id(0), pl.program_id(1)
-
-  # @reference.begin kv_shadow_ownership
-  # Diagnostic only: source[peer*heads+h, u, d] on rank c is copied to
-  # output[h, c*length+u, d] on peer. Each complete target is written once.
-  # There is no arithmetic consumer and no buffer/semaphore reuse.
-  def copies(h, peer):
-    return tuple(
-        pltpu.make_async_remote_copy(
-            sources[t].at[peer * heads + h],
-            outputs[t].at[h, pl.ds(rank * length, length), :],
-            send.at[h, peer, t],
-            recv.at[h, rank, t],
-            device_id={axis_name: peer},
-        )
-        for t in range(2)
-    )
-
-  def launch(h):
-    def push(offset, _):
-      peer = lax.rem(rank + offset, cp)
-      for transfer in copies(h, peer):
-        transfer.start()
-
-    lax.fori_loop(0, cp, push, None, unroll=False)
-
-  def drain(h):
-    def wait_peer(peer, _):
-      for transfer in copies(h, peer):
-        transfer.wait_send()
-      for t in range(2):
-        pltpu.make_async_copy(
-            sources[t].at[rank * heads + h],
-            outputs[t].at[h, pl.ds(peer * length, length), :],
-            recv.at[h, peer, t],
-        ).wait()
-
-    lax.fori_loop(0, cp, wait_peer, None, unroll=False)
-
-  @pl.when(program == 0)
-  def start_head():
-    if prefetch:
-
-      @pl.when(head == 0)
-      def bootstrap():
-        launch(jnp.int32(0))
-
-      @pl.when(head + 1 < heads)
-      def next_head():
-        launch(head + 1)
-
-    else:
-      launch(head)
-      drain(head)
-
-  base_kernel(*original)
-
-  if prefetch:
-
-    @pl.when(jnp.logical_and(head == heads - 1, program == pl.num_programs(1) - 1))
-    def drain_all():
-      lax.fori_loop(0, heads, lambda h, _: drain(h), None, unroll=False)
-
-  # @reference.end kv_shadow_ownership
-
-
-def kv_previous_send(generation, *, rows, cp):
-  """Previous generation using this producer's same-parity send semaphore.
-
-  Each owner has a contiguous row interval in each head. At its first two
-  rows the predecessor belongs to the previous head, not the previous owner.
-  A negative result means this slot has not sent anything in this invocation.
-  Even rows keep each owner's bank parity unchanged across head boundaries.
-  """
-  if cp <= 0 or rows < cp or rows % cp or rows % 2:
-    raise ValueError("K/V send predecessors require even rows and complete owner partitions")
-  per_owner = rows // cp
-  offset = generation % per_owner
-  previous_head_end = generation - offset - rows + per_owner - 1
-  previous_head = previous_head_end - (previous_head_end - generation) % 2
-  return jnp.where(offset >= 2, generation - 2, previous_head)
-
-
-def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, prefetch, trace_regions=False):
+def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bkv, prefetch):
   """Import into unique HBM head slots, then explicitly load two VMEM banks.
 
   Experimental only. Each sender writes its disjoint sequence chunk once per
@@ -564,7 +490,7 @@ def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, pre
   local copy fences the old bank's arithmetic before subsequent row loads.
   Hardware visibility and that last-read dependency need device acceptance.
   """
-  assert len(refs) == 48 and heads == 4 and rows % cp == 0 and rows % 2 == 0
+  assert len(refs) == 48 and rows % cp == 0
   original = list(refs[:23]) + list(refs[26:42])
   destinations, fence_output = refs[23:25], refs[25]
   k_bank, v_bank, send, recv, load_sem, fence_sem = refs[42:]
@@ -576,12 +502,9 @@ def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, pre
   row = sk.to_i32(original[0][program])
   first = original[3][program].astype(jnp.bool_)
   last = original[4][program].astype(jnp.bool_)
-  per_owner, block = rows // cp, 8 * bq
+  per_owner, block = rows // cp, bkv
   length = per_owner * block
   bank = lax.rem(row, 2)
-
-  def scope(name):
-    return jax.named_scope(name) if trace_regions else contextlib.nullcontext()
 
   # @reference.begin kv_hbm_supply
   def transfers(h, peer):
@@ -604,18 +527,17 @@ def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, pre
 
     lax.fori_loop(0, cp, push, None, unroll=False)
 
-  def receive(h, r, region):
+  def receive(h, r):
     @pl.when(lax.rem(r, per_owner) == 0)
     def owner_first_use():
       owner = lax.div(r, per_owner)
-      with scope(region):
-        for t in range(2):
-          # Wait-only descriptor: same complete owner chunk as the remote DMA.
-          pltpu.make_async_copy(
-              sources[t].at[rank * heads + h],
-              destinations[t].at[h, pl.ds(owner * length, length), :],
-              recv.at[h, owner, t],
-          ).wait()
+      for t in range(2):
+        # Wait-only descriptor: same complete owner chunk as the remote DMA.
+        pltpu.make_async_copy(
+            sources[t].at[rank * heads + h],
+            destinations[t].at[h, pl.ds(owner * length, length), :],
+            recv.at[h, owner, t],
+        ).wait()
 
   def loads(h, r):
     slot = lax.rem(r, 2)
@@ -638,7 +560,7 @@ def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, pre
 
     else:
       launch(head)
-    receive(head, jnp.int32(0), "mla_hbm_head_recv")
+    receive(head, jnp.int32(0))
     for transfer in loads(head, jnp.int32(0)):
       transfer.start()
     # Supply the next head only after this head's first owner has arrived.
@@ -658,18 +580,17 @@ def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, pre
 
       @pl.when(row > 0)
       def serial_load():
-        receive(head, row, "mla_hbm_owner_recv")
+        receive(head, row)
         for transfer in loads(head, row):
           transfer.start()
 
-    with scope("mla_hbm_load_wait"):
-      for transfer in loads(head, row):
-        transfer.wait()
+    for transfer in loads(head, row):
+      transfer.wait()
     if prefetch:
 
       @pl.when(row + 1 < rows)
       def next_row():
-        receive(head, row + 1, "mla_hbm_owner_recv")
+        receive(head, row + 1)
         for transfer in loads(head, row + 1):
           transfer.start()
 
@@ -681,10 +602,9 @@ def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, pre
     # Keep the entire last Q-program's dQ payload as the local dependency.
     # Waiting on the local DMA also protects this stage and fence destination
     # before their next reuse. Do not replace it with a scalar signal.
-    with scope("mla_hbm_row_fence"):
-      fence = pltpu.make_async_copy(dq_stage.at[lax.rem(program, 2)], fence_output, fence_sem.at[0])
-      fence.start()
-      fence.wait()
+    fence = pltpu.make_async_copy(dq_stage.at[lax.rem(program, 2)], fence_output, fence_sem.at[0])
+    fence.start()
+    fence.wait()
 
   # @reference.end kv_hbm_consumer_banks
   # Base gradient exports have already drained before the final invocation
@@ -698,165 +618,7 @@ def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bq, pre
 
       lax.fori_loop(0, cp, wait_peer, None, unroll=False)
 
-    with scope("mla_hbm_send_drain"):
-      lax.fori_loop(0, heads, wait_head, None, unroll=False)
-
-
-def kv_import_output_kernel(
-    *refs, base_kernel, cp, axis_name, heads, rows, bq, prefetch, defer_send=False, launch_after_credit=False
-):
-  """Import each K/V row once, with a full-dQ DMA as its consumer credit.
-
-  This experimental wrapper preserves the pinned arithmetic. Its credit DMA
-  reads the entire last Q-program's dQ output, so releasing a bank depends on
-  the dQ path's K/V reads as well as dK/dV. The mailbox payload is discarded;
-  receive completion grants ownership. No scalar credit-signal fence is used.
-  """
-  assert len(refs) == 46
-  # One extra HBM output precedes the original sixteen scratch operands.
-  original = list(refs[:23]) + list(refs[24:40])
-  mailbox = refs[23]
-  k_bank, v_bank, send, recv, credit_send, credit_recv = refs[40:]
-  k_source, v_source = original[7:9]
-  dq_stage = original[31]
-  rank = lax.axis_index(axis_name)
-  head, program = pl.program_id(0), pl.program_id(1)
-  row_index = sk.to_i32(original[0][program])
-  generation = head * rows + row_index
-  bank = lax.rem(generation, 2)
-  first = original[3][program].astype(jnp.bool_)
-  last = original[4][program].astype(jnp.bool_)
-  generations, per_owner, block = heads * rows, rows // cp, 8 * bq
-
-  def owner(g):
-    return lax.div(lax.rem(g, rows), per_owner)
-
-  def source(ref, g, peer):
-    return ref.at[peer * heads + lax.div(g, rows), pl.ds(lax.rem(g, per_owner) * block, block), :]
-
-  def remote(g, peer, tensor):
-    src, dst = (k_source, k_bank) if tensor == 0 else (v_source, v_bank)
-    slot = lax.rem(g, 2)
-    return pltpu.make_async_remote_copy(
-        source(src, g, peer),
-        dst.at[slot],
-        send.at[slot, peer, tensor],
-        recv.at[slot, tensor],
-        device_id={axis_name: peer},
-    )
-
-  def launch(g):
-    @pl.when(rank == owner(g))
-    def producer():
-      slot = lax.rem(g, 2)
-      if defer_send:
-        previous = kv_previous_send(g, rows=rows, cp=cp)
-
-        @pl.when(previous >= 0)
-        def reuse_send_slot():
-          wait_send(previous)
-
-      @pl.when(g >= 2)
-      def acquire():
-        def wait_peer(peer, _):
-          # Wait-only descriptor, sized exactly like the full dQ credit.
-          pltpu.make_async_copy(dq_stage.at[0], mailbox.at[slot, peer], credit_recv.at[slot, peer]).wait()
-
-        lax.fori_loop(0, cp, wait_peer, None, unroll=False)
-
-      def push(peer, _):
-        @pl.when(peer == rank)
-        def loopback():
-          pltpu.make_async_copy(source(k_source, g, peer), k_bank.at[slot], recv.at[slot, 0]).start()
-          pltpu.make_async_copy(source(v_source, g, peer), v_bank.at[slot], recv.at[slot, 1]).start()
-
-        @pl.when(peer != rank)
-        def peer_copy():
-          remote(g, peer, 0).start()
-          remote(g, peer, 1).start()
-
-      lax.fori_loop(0, cp, push, None, unroll=False)
-
-  def wait_send(g):
-    @pl.when(rank == owner(g))
-    def producer():
-      def peer_wait(peer, _):
-        @pl.when(peer != rank)
-        def wait_remote():
-          remote(g, peer, 0).wait_send()
-          remote(g, peer, 1).wait_send()
-
-      lax.fori_loop(0, cp, peer_wait, None, unroll=False)
-
-  @pl.when(jnp.logical_and(head == 0, program == 0))
-  def bootstrap():
-    launch(jnp.int32(0))
-    if not defer_send:
-      wait_send(jnp.int32(0))
-    if launch_after_credit:
-      launch(jnp.int32(1))
-
-  @pl.when(first)
-  def receive_row():
-    pltpu.make_async_copy(k_bank.at[bank], k_bank.at[bank], recv.at[bank, 0]).wait()
-    pltpu.make_async_copy(v_bank.at[bank], v_bank.at[bank], recv.at[bank, 1]).wait()
-    if prefetch and not launch_after_credit:
-
-      @pl.when(generation + 1 < generations)
-      def next_row():
-        launch(generation + 1)
-
-  original[7], original[8] = k_bank.at[bank], v_bank.at[bank]
-  base_kernel(*original)
-
-  @pl.when(last)
-  def release_row():
-    if prefetch and not defer_send:
-
-      @pl.when(generation + 1 < generations)
-      def drain_source():
-        wait_send(generation + 1)
-
-    @pl.when(generation + 2 < generations)
-    def credit():
-      # output_stage is indexed by Q-program parity, not KV-row parity.
-      # Addressed remote copy also handles self, as in gradient export. Its
-      # source wait protects this stage before the next program may reuse it.
-      copy = pltpu.make_async_remote_copy(
-          dq_stage.at[lax.rem(program, 2)],
-          mailbox.at[bank, rank],
-          credit_send.at[0],
-          credit_recv.at[bank, rank],
-          device_id={axis_name: owner(generation + 2)},
-      )
-      copy.start()
-      copy.wait_send()
-      if launch_after_credit:
-        # All ranks release their local last read before the next producer
-        # waits for every credit. Enqueue need not wait for receive(g + 1).
-        launch(generation + 2)
-
-    if not prefetch:
-
-      @pl.when(generation + 1 < generations)
-      def serial_next():
-        launch(generation + 1)
-        wait_send(generation + 1)
-
-    if defer_send:
-
-      @pl.when(generation == generations - 1)
-      def drain_final_sends():
-        # The final head contains the last use of every producer's live slot.
-        # One-row owners only use one parity; do not wait on their other slot.
-        start = (heads - 1) * rows + rank * per_owner
-        end = start + per_owner - 1
-        for slot in range(2):
-          final = end - (end - slot) % 2
-
-          @pl.when(final >= start)
-          def drain():
-            wait_send(final)
+    lax.fori_loop(0, heads, wait_head, None, unroll=False)
 
 
 def fused_backward(
@@ -871,15 +633,7 @@ def fused_backward(
     cp: int,
     axis_name: str,
     cp_barrier: bool = False,
-    import_head: int | None = None,
-    imports: tuple | None = None,
-    kv_import_prefetch: bool | None = None,
-    kv_import_defer_send: bool = False,
-    kv_import_launch_after_credit: bool = False,
     kv_hbm_prefetch: bool | None = None,
-    kv_hbm_trace: bool = False,
-    shadow_imports: tuple | None = None,
-    shadow_prefetch: bool = False,
     bq: int,
     bkv: int,
     bkv_compute: int,
@@ -890,18 +644,11 @@ def fused_backward(
     config: SplashConfig,
     dkv_mask_sparsity: float,
 ):
-  kv_hbm = kv_hbm_prefetch is not None
-  if type(kv_hbm_trace) is not bool or (kv_hbm_trace and kv_hbm_prefetch is not True):
-    raise ValueError("HBM region tracing requires prefetched HBM K/V imports")
-  if kv_hbm and (type(kv_hbm_prefetch) is not bool or kv_import_prefetch is not None):
-    raise ValueError("HBM K/V staging requires a static selector and no row-credit import")
-  if kv_hbm and (k.dtype != jnp.bfloat16 or v.dtype != jnp.bfloat16):
-    raise ValueError("HBM K/V staging requires BF16 sources")
-  kv_import = kv_import_prefetch is not None or kv_hbm
-  if kv_import_defer_send and kv_import_prefetch is not True:
-    raise ValueError("Deferred K/V send waits require row prefetch")
-  if kv_import_launch_after_credit and not kv_import_defer_send:
-    raise ValueError("Launching after credit requires deferred K/V send waits")
+  # HBM K/V staging is the only in-kernel input exchange. Q and dO arrive in
+  # head layout; K/V arrive sequence-owned and are imported per head.
+  kv_import = kv_hbm = kv_hbm_prefetch is not None
+  if kv_hbm and (type(kv_hbm_prefetch) is not bool or k.dtype != jnp.bfloat16 or v.dtype != jnp.bfloat16):
+    raise ValueError("HBM K/V staging requires a static prefetch selector and BF16 sources")
   native_layout = (
       not kv_import
       and _use_native_layout(config, q, k, v, segment_ids, mask_info, mask_function, is_mqa=is_mqa)
@@ -909,38 +656,11 @@ def fused_backward(
       and do.dtype == q.dtype
   )
   num_q_heads, q_seq_len, head_dim_qk = q.shape
-  if shadow_imports is not None:
-    if kv_import or import_head is not None or imports is not None or cp_barrier or num_q_heads != 4:
-      raise ValueError("Shadow K/V traffic requires separate four-head inputs and the global barrier")
-    if len(shadow_imports) != 2 or type(shadow_prefetch) is not bool:
-      raise ValueError("Shadow K/V traffic requires two sources and a static prefetch selector")
-    for source, width in zip(shadow_imports, (192, 128), strict=True):
-      if source.shape != (cp * 4, q_seq_len // cp, width) or source.dtype != jnp.bfloat16:
-        raise ValueError("Shadow K/V sources require BF16 [CP*4,S/CP,D]")
-  elif shadow_prefetch:
-    raise ValueError("Shadow prefetch requires K/V sources")
   if kv_import:
-    if (
-        (not kv_hbm and type(kv_import_prefetch) is not bool)
-        or num_q_heads != 4
-        or cp_barrier
-        or import_head is not None
-        or imports is not None
-    ):
-      raise ValueError("K/V row import requires four heads, global barrier and no per-head import")
-    if k.shape != (cp * 4, q_seq_len // cp, 192) or v.shape != (cp * 4, q_seq_len // cp, 128):
-      raise ValueError("K/V row import requires sequence-owned [CP*4,S/CP,D] sources")
-  if import_head is None:
-    if imports is not None:
-      raise ValueError("Import sources require import_head")
-  else:
-    if num_q_heads != 1 or cp_barrier or type(import_head) is not int or import_head not in (1, 2, 3):
-      raise ValueError("Next-head import requires one head, global barrier, and import_head in (1,2,3)")
-    if q_seq_len % cp or imports is None or len(imports) != 4:
-      raise ValueError("Next-head import requires four sequence-sharded sources")
-    for source, width in zip(imports, (192, 192, 128, 128), strict=True):
-      if source.shape != (cp * 4, q_seq_len // cp, width) or source.dtype != jnp.bfloat16:
-        raise ValueError("Next-head import sources must be BF16 [CP*4,S/CP,D]")
+    if cp_barrier:
+      raise ValueError("HBM K/V staging requires the compiler global barrier")
+    if k.shape != (cp * num_q_heads, q_seq_len // cp, head_dim_qk) or v.shape[:2] != (cp * num_q_heads, q_seq_len // cp):
+      raise ValueError("HBM K/V staging requires sequence-owned [CP*H,S/CP,D] sources")
   kv_seq_len, head_dim_v = v.shape[-2:]
   num_kv_heads = 1 if is_mqa else k.shape[0]
   if kv_import:
@@ -1189,7 +909,7 @@ def fused_backward(
       jax.ShapeDtypeStruct(dk_shape, dk_type),
       jax.ShapeDtypeStruct(dv_shape, dv_type),
   ]
-  assert q_heads_per_kv_head == 1 and num_q_heads in (1, 4)
+  assert q_heads_per_kv_head == 1
   out_shapes[1] = jax.ShapeDtypeStruct((num_q_heads * cp, kv_seq_len // cp, head_dim_qk), dk_type)
   out_shapes[2] = jax.ShapeDtypeStruct((num_q_heads * cp, kv_seq_len // cp, head_dim_v), dv_type)
   out_shapes.append(jax.ShapeDtypeStruct((num_q_heads * cp, q_seq_len // cp, head_dim_qk), q.dtype))
@@ -1397,7 +1117,6 @@ def fused_backward(
         *(False for value in (dq, dk, dv) if value is not None),
     )
 
-  import_args = ()
   if kv_hbm:
     assert num_args == 14 and input_output_aliases == {14: 0} and len(scratch_shapes) == 16
     assert dynamic_grid and not native_layout and 6 + len(in_specs) == 19
@@ -1408,11 +1127,10 @@ def fused_backward(
         axis_name=axis_name,
         heads=num_q_heads,
         rows=kv_steps,
-        bq=bq,
+        bkv=bkv,
         prefetch=kv_hbm_prefetch,
-        trace_regions=kv_hbm_trace,
     )
-    out_shapes += [jax.ShapeDtypeStruct((num_q_heads, q_seq_len, d), jnp.bfloat16) for d in (192, 128)]
+    out_shapes += [jax.ShapeDtypeStruct((num_q_heads, q_seq_len, d), jnp.bfloat16) for d in (head_dim_qk, head_dim_v)]
     out_shapes.append(jax.ShapeDtypeStruct((bq, head_dim_qk), q.dtype))
     out_specs += [pl.BlockSpec(memory_space=pl.ANY) for _ in range(3)]
     scratch_shapes += [
@@ -1423,71 +1141,6 @@ def fused_backward(
         pltpu.SemaphoreType.DMA((2, 2)),
         pltpu.SemaphoreType.DMA((1,)),
     ]
-  elif kv_import:
-    assert num_args == 14 and input_output_aliases == {14: 0} and len(scratch_shapes) == 16
-    kernel = functools.partial(
-        kv_import_output_kernel,
-        base_kernel=kernel,
-        cp=cp,
-        axis_name=axis_name,
-        heads=num_q_heads,
-        rows=kv_steps,
-        bq=bq,
-        prefetch=kv_import_prefetch,
-        defer_send=kv_import_defer_send,
-        launch_after_credit=kv_import_launch_after_credit,
-    )
-    out_shapes.append(jax.ShapeDtypeStruct((2, cp, bq, head_dim_qk), q.dtype))
-    out_specs.append(pl.BlockSpec(memory_space=pl.ANY))
-    scratch_shapes += [
-        pltpu.VMEM((2, bkv, head_dim_qk), k.dtype),
-        pltpu.VMEM((2, bkv, head_dim_v), v.dtype),
-        pltpu.SemaphoreType.DMA((2, cp, 2)),
-        pltpu.SemaphoreType.DMA((2, 2)),
-        pltpu.SemaphoreType.DMA((1,)),
-        pltpu.SemaphoreType.DMA((2, cp)),
-    ]
-  if import_head is not None:
-    # Append sources after the dQ alias, preserving flattened alias index 14.
-    assert num_args == 14 and input_output_aliases == {14: 0}
-    n_pre, n_scratch = 6 + len(in_specs), len(scratch_shapes)
-    kernel = functools.partial(
-        import_output_kernel,
-        base_kernel=kernel,
-        n_pre=n_pre,
-        n_scratch=n_scratch,
-        cp=cp,
-        axis_name=axis_name,
-        import_head=import_head,
-        length=q_seq_len // cp,
-    )
-    import_args = tuple(imports)
-    in_specs += [pl.BlockSpec(memory_space=pl.ANY) for _ in range(4)]
-    out_shapes += [jax.ShapeDtypeStruct((1, q_seq_len, d), jnp.bfloat16) for d in (192, 192, 128, 128)]
-    out_specs += [pl.BlockSpec(memory_space=pl.ANY) for _ in range(4)]
-    scratch_shapes += [pltpu.SemaphoreType.DMA((4,)), pltpu.SemaphoreType.DMA((cp, 4))]
-
-  if shadow_imports is not None:
-    assert num_args == 14 and len(scratch_shapes) == 16 and not native_layout
-    assert dynamic_grid and input_output_aliases == {14: 0}
-    n_pre = 6 + len(in_specs)
-    assert n_pre == 19
-    kernel = functools.partial(
-        kv_shadow_output_kernel,
-        base_kernel=kernel,
-        n_pre=n_pre,
-        cp=cp,
-        axis_name=axis_name,
-        heads=num_q_heads,
-        length=q_seq_len // cp,
-        prefetch=shadow_prefetch,
-    )
-    import_args = tuple(shadow_imports)
-    in_specs += [pl.BlockSpec(memory_space=pl.ANY) for _ in range(2)]
-    out_shapes += [jax.ShapeDtypeStruct((num_q_heads, q_seq_len, d), jnp.bfloat16) for d in (192, 128)]
-    out_specs += [pl.BlockSpec(memory_space=pl.ANY) for _ in range(2)]
-    scratch_shapes += [pltpu.SemaphoreType.DMA((num_q_heads, cp, 2)) for _ in range(2)]
-
   with jax.named_scope(kernel_name):
     results = pl.pallas_call(
         kernel,
@@ -1519,7 +1172,7 @@ def fused_backward(
         cost_estimate=cost_estimate,
         interpret=config.interpret,
         metadata=metadata,
-    )(*args, dq, dk, dv, *import_args)
+    )(*args, dq, dk, dv)
     dq_unreduced, dk, dv, dq_final = results[:4]
   with jax.named_scope("splash_bwd_epilogue"):
     dq = dq_final
@@ -1529,8 +1182,6 @@ def fused_backward(
       dv = dv.mT
     dk = dk.astype(k.dtype)
     dv = dv.astype(v.dtype)
-  if import_head is not None:
-    return dq, dk, dv, *results[4:]
   return dq, dk, dv
 
 
@@ -1542,12 +1193,23 @@ def validate_source():
 
 
 def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
+  """Fused dQ/dK/dV backward for any CP that evenly partitions the K/V tiles.
+
+  Local heads are ``q.shape[0]``; global heads are ``CP * local heads``. Head
+  widths and tile sizes come from the inputs and the Splash config; Splash and
+  Pallas enforce TPU block alignment. block_kv_dkv must be a positive multiple
+  of block_q_dkv (r Q tiles per K/V tile, any r >= 1), with the three dQ
+  partial slots of the pinned Splash dynamic grid.
+  """
   validate_source()
   cfg = kernel.kwargs["config"]
+  if cfg.dq_reduction_steps != 3:
+    raise ValueError(f"MLA fused backward needs dq_reduction_steps=3; got {cfg.dq_reduction_steps=}")
+  q_tiles_per_kv(cfg)
   if (
-      cp not in (8, 16)
+      type(cp) is not int
+      or cp < 1
       or kernel.kwargs["is_mqa"]
-      or (cfg.block_q_dkv, cfg.block_kv_dkv, cfg.block_kv_dkv_compute, cfg.dq_reduction_steps) != (512, 4096, 512, 3)
       or not cfg.bwd_kv_unroll
       or cfg.bwd_scheduler is not None
       or not cfg.bwd_cast_before_transpose
@@ -1558,45 +1220,24 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
       or any(layout != sk.QKVLayout.HEAD_DIM_MINOR for layout in (cfg.q_layout, cfg.k_layout, cfg.v_layout))
   ):
     raise ValueError("Unsupported MLA fused backward configuration")
+  # Concrete metadata is checked now; traced metadata once S is known.
   validate_metadata(kernel, cp)
 
-  def backward(
-      q,
-      k,
-      v,
-      ids,
-      o,
-      lse,
-      do,
-      *,
-      di=None,
-      import_head=None,
-      imports=None,
-      kv_import_prefetch=None,
-      kv_import_defer_send=False,
-      kv_import_launch_after_credit=False,
-      kv_hbm_prefetch=None,
-      kv_hbm_trace=False,
-      shadow_imports=None,
-      shadow_prefetch=False,
-  ):
-    heads, sequence, _ = q.shape
-    kv_import = kv_import_prefetch is not None or kv_hbm_prefetch is not None
-    k_shape = (cp * heads, sequence // cp, 192) if kv_import else q.shape
-    v_shape = (cp * heads, sequence // cp, 128) if kv_import else (heads, sequence, 128)
-    if heads not in (1, 4) or k.shape != k_shape or q.shape != (heads, sequence, 192):
-      raise ValueError("MLA backward requires one or four matching Q/K heads of width 192")
-    if v.shape != v_shape or o.shape != (heads, sequence, 128) or do.shape != o.shape:
-      raise ValueError("MLA backward V/O/dO must match the head count and sequence, with width 128")
+  def backward(q, k, v, ids, o, lse, do, *, kv_hbm_prefetch=None):
+    heads, sequence, dqk = q.shape
+    dv = v.shape[-1]
+    validate_metadata(kernel, cp, sequence)
+    kv_import = kv_hbm_prefetch is not None
+    k_shape = (cp * heads, sequence // cp, dqk) if kv_import else q.shape
+    v_shape = (cp * heads, sequence // cp, dv) if kv_import else (heads, sequence, dv)
+    if heads < 1 or sequence % (cp * cfg.block_kv_dkv) or k.shape != k_shape or v.shape != v_shape:
+      raise ValueError("MLA backward requires matching Q/K/V heads and complete CP partitions of K/V tiles")
+    if o.shape != (heads, sequence, dv) or do.shape != o.shape:
+      raise ValueError("MLA backward O/dO must match the head count, sequence and value width")
     if ids.shape != (sequence,) or lse.shape != (heads, sequence):
       raise ValueError("MLA backward requires shared sequence IDs and per-head LSE")
-    if heads == 1 and cp_barrier:
-      raise ValueError("Per-head MLA backward requires the compiler global barrier")
-    if di is None:
-      with jax.named_scope("splash_bwd_di"):
-        di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))
-    elif di.shape != (heads, sequence) or di.dtype != jnp.float32:
-      raise ValueError("Explicit MLA di must be FP32 with matching heads and sequence")
+    with jax.named_scope("splash_bwd_di"):
+      di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))
     return fused_backward(
         q,
         k,
@@ -1608,15 +1249,7 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
         cp=cp,
         axis_name=axis_name,
         cp_barrier=cp_barrier,
-        import_head=import_head,
-        imports=imports,
-        kv_import_prefetch=kv_import_prefetch,
-        kv_import_defer_send=kv_import_defer_send,
-        kv_import_launch_after_credit=kv_import_launch_after_credit,
         kv_hbm_prefetch=kv_hbm_prefetch,
-        kv_hbm_trace=kv_hbm_trace,
-        shadow_imports=shadow_imports,
-        shadow_prefetch=shadow_prefetch,
         bq=cfg.block_q_dkv,
         bkv=cfg.block_kv_dkv,
         bkv_compute=cfg.block_kv_dkv_compute,

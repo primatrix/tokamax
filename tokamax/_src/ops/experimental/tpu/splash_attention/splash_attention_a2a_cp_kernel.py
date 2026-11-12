@@ -29,7 +29,10 @@ With ``cp_size == 1`` the same block loop runs without any exchange.
 
 The backward is ``mla_fused_backward``: dO is exchanged to the head layout with
 ``lax.all_to_all`` and the kernel exports dq/dk/dv back to sequence shards.  It
-supports cp 8/16, a static mask schedule and the qualified MLA configuration.
+needs cp_size > 1 dividing the K/V tile count, a static causal mask schedule
+and the MLA backward configuration checked by ``make_backward``.
+``bwd_input_exchange`` selects how the backward gets head-layout q/k/v
+(``head``, ``kv_hbm_prefetch`` or ``a2a``; see ``BWD_INPUT_EXCHANGES``).
 
 Calling convention for ``cp_size > 1`` (inside the caller's ``shard_map`` over
 ``cp_axis``): q/k/v are the local sequence shards ``[heads, N / cp, d]``,
@@ -688,6 +691,42 @@ def _local_groups(x, rank, num_heads: int, heads_local: int):
   return lax.dynamic_slice_in_dim(x, first, rows, 0)
 
 
+# How the MLA fused backward gets head-layout q/k/v when cp_size > 1:
+# * head: the forward's received buffers. A remat policy can save them only if
+#   they are named (``head_checkpoint_names``); otherwise rebuilding them
+#   re-runs this whole forward kernel.
+# * kv_hbm_prefetch: the sequence shards. q is exchanged with lax.all_to_all;
+#   the backward kernel imports each k/v row while computing the previous one.
+# * a2a: the sequence shards; q/k/v are all exchanged with lax.all_to_all.
+BWD_INPUT_EXCHANGES = ("head", "kv_hbm_prefetch", "a2a")
+
+
+def _di_from_kernel_o(bwd_input_exchange, head_checkpoint_names):
+  """Whether the backward forms Di from the forward kernel's head-layout o.
+
+  Unnamed head buffers are rebuilt by re-running the forward kernel, which
+  rebuilds its o as well; Di then pairs o with the q/k/v of the backward's P.
+  Otherwise Di uses the named, saved output.
+  """
+  return bwd_input_exchange == "head" and head_checkpoint_names is None
+
+
+def _check_bwd_input_exchange(bwd_input_exchange, head_checkpoint_names):
+  if bwd_input_exchange not in BWD_INPUT_EXCHANGES:
+    raise ValueError(
+        f"{bwd_input_exchange=} must be one of {BWD_INPUT_EXCHANGES}."
+    )
+  if head_checkpoint_names is not None and (
+      bwd_input_exchange != "head"
+      or len(head_checkpoint_names) != 3
+      or not all(isinstance(n, str) for n in head_checkpoint_names)
+  ):
+    raise ValueError(
+        "head_checkpoint_names needs three names (q, k, v) and"
+        " bwd_input_exchange='head'."
+    )
+
+
 def _splash_attention_forward(
     mask_info: MaskInfo,
     q: jax.Array,
@@ -1327,17 +1366,23 @@ def _splash_attention_forward(
       logsumexp = ad_checkpoint.checkpoint_name(
           logsumexp, name=config.residual_checkpoint_name
       )
-  # The backward's o residual is the head-sharded, normalized o.
-  o_res = out if cp_size == 1 or not exchange_o else o_head
+  # The backward's o residual is the named, normalized out: sequence sharded
+  # with the fused exchange (a copy of o_head; the backward forms Di there),
+  # head sharded otherwise (taken before the all-to-all below). The caller's
+  # downstream backward also keeps out, so naming o_head too would save o twice.
+  o_res = out
+  # The kernel's own head-sharded o, for a backward that re-runs this kernel
+  # (unnamed head buffers): Di then uses the o of the re-run, like q/k/v.
+  o_kernel = o_head if exchange_o else o_res
   if cp_size > 1 and not exchange_o:
     # Unfused reciprocal: the native caller divides, then the post-kernel
     # all-to-all moves o back to the sequence-sharded layout.
     out = lax.all_to_all(out, cp_axis, 1, 0, tiled=True)
   if cp_size > 1:
     buffers = {"q": outs["q_recv"], "k": outs["k_recv"], "v": outs["v_recv"],
-               "o": o_res}
+               "o": o_res, "o_head": o_kernel}
   else:
-    buffers = {"q": q, "k": k, "v": v, "o": o_res}
+    buffers = {"q": q, "k": k, "v": v, "o": o_res, "o_head": o_kernel}
   stats = None
   if save_residuals:
     stats = {"logsumexp": logsumexp, "max_logits": max_logits}
@@ -1357,6 +1402,8 @@ def _splash_attention_forward(
         "dkv_mask_sparsity",
         "cp_size",
         "cp_axis",
+        "bwd_input_exchange",
+        "head_checkpoint_names",
     ),
 )
 def _splash_attention_custom(
@@ -1376,6 +1423,8 @@ def _splash_attention_custom(
     dkv_mask_sparsity: float,
     cp_size: int,
     cp_axis: str | None,
+    bwd_input_exchange: str,
+    head_checkpoint_names: tuple[str, str, str] | None,
     max_logit_value: jax.Array | None = None,
 ) -> base.SplashCustomReturnType:
   # The forward function does not use the dq and dkv MaskInfos, it just forwards
@@ -1388,6 +1437,7 @@ def _splash_attention_custom(
   # mask then we would not work with the MaskInfo slice relevant to the current
   # device.
   del dkv_mask_info
+  del bwd_input_exchange, head_checkpoint_names  # Backward residuals only.
 
   out, stats, _ = _splash_attention_forward(  # pytype: disable=wrong-arg-types
       fwd_mask_info,
@@ -1432,12 +1482,17 @@ def _splash_attention_fwd(
     dkv_mask_sparsity: float,
     cp_size: int,
     cp_axis: str | None,
+    bwd_input_exchange: str,
+    head_checkpoint_names: tuple[str, str, str] | None,
     max_logit_value: jax.Array | None = None,
 ) -> tuple[tuple[jax.Array], base.SplashResidualsType]:
 
   # TODO: add some higher order AD check that isn't save_residuals based.
   # if save_residuals:
   #   raise NotImplementedError("Higher-order AD not supported.")
+  _check_bwd_input_exchange(bwd_input_exchange, head_checkpoint_names)
+  if bwd_input_exchange == "kv_hbm_prefetch" and k.shape[0] != q.shape[0]:
+    raise ValueError("kv_hbm_prefetch imports one k/v head per q head; no GQA.")
 
   out, stats, buffers = _splash_attention_forward(  # pytype: disable=wrong-arg-types
       fwd_mask_info,
@@ -1462,14 +1517,23 @@ def _splash_attention_fwd(
     stats["logsumexp"] = stats["logsumexp"] / LOG2E
     if stats["max_logits"] is not None:
       stats["max_logits"] = stats["max_logits"] / LOG2E
-  # The backward runs on the head-sharded buffers the forward already holds,
-  # i.e. exactly the native kernel's inputs after the pre-kernel all-to-all.
   heads_local = q.shape[0] // cp_size
   kv_heads_local = k.shape[0] // cp_size  # differs from heads_local with GQA
   if cp_size > 1:
-    q_res = _unflat(buffers["q"], config.q_layout, heads_local)
-    k_res = _unflat(buffers["k"], config.k_layout, kv_heads_local)
-    v_res = _unflat(buffers["v"], config.v_layout, kv_heads_local)
+    if bwd_input_exchange == "head":
+      # The head-sharded buffers the forward already holds, i.e. exactly the
+      # native kernel's inputs after the pre-kernel all-to-all.
+      q_res = _unflat(buffers["q"], config.q_layout, heads_local)
+      k_res = _unflat(buffers["k"], config.k_layout, kv_heads_local)
+      v_res = _unflat(buffers["v"], config.v_layout, kv_heads_local)
+      if head_checkpoint_names is not None:
+        q_res, k_res, v_res = (
+            ad_checkpoint.checkpoint_name(x, name=name)
+            for x, name in zip((q_res, k_res, v_res), head_checkpoint_names)
+        )
+    else:
+      # The sequence shards; the backward rebuilds the head layout.
+      q_res, k_res, v_res = q, k, v
     rank = lax.axis_index(cp_axis)
     sinks_res = (
         None if sinks is None
@@ -1488,8 +1552,13 @@ def _splash_attention_fwd(
           block_mask=local(dkv_mask_info.block_mask))
   else:
     q_res, k_res, v_res, sinks_res, seg_res = q, k, v, sinks, segment_ids
+  o_res = (
+      buffers["o_head"]
+      if _di_from_kernel_o(bwd_input_exchange, head_checkpoint_names)
+      else buffers["o"]
+  )
   residuals = (
-      q_res, k_res, v_res, seg_res, sinks_res, buffers["o"], logsumexp,
+      q_res, k_res, v_res, seg_res, sinks_res, o_res, logsumexp,
       dkv_mask_info,
   )
   if save_residuals:
@@ -1508,6 +1577,8 @@ def _splash_attention_bwd(
     dkv_mask_sparsity: float,
     cp_size: int,
     cp_axis: str | None,
+    bwd_input_exchange: str,
+    head_checkpoint_names: tuple[str, str, str] | None,
     res: base.SplashResidualsType,
     grads: jax.Array | tuple[jax.Array, dict[str, jax.Array]],
 ):
@@ -1522,14 +1593,37 @@ def _splash_attention_bwd(
   if not config.has_backward_blocks:
     raise ValueError("Need to specify backward blocks.")
   if cp_size == 1:
-    raise NotImplementedError("The MLA fused backward requires cp_size 8 or 16.")
+    raise NotImplementedError("The MLA fused backward requires cp_size > 1.")
   q, k, v, segment_ids, sinks, o, logsumexp, dkv_mask_info = res
   if sinks is not None:
     raise NotImplementedError("The MLA fused backward does not support sinks.")
-  # dO arrives sequence sharded; move it to the head-sharded layout of o.
-  do = lax.all_to_all(do, cp_axis, 0, 1, tiled=True)
+
+  def to_head(x):
+    return lax.all_to_all(x, cp_axis, 0, 1, tiled=True)
+
+  kv_hbm_prefetch = None
+  if bwd_input_exchange == "kv_hbm_prefetch":
+    # q is read by every k/v row from the first one on, so it keeps the XLA
+    # exchange; the kernel imports each k/v row while computing the previous.
+    q = to_head(q)
+    kv_hbm_prefetch = True
+  elif bwd_input_exchange == "a2a":
+    q, k, v = (to_head(x) for x in (q, k, v))
+  # dO arrives sequence sharded; the kernel takes it in the head layout.
+  do_head = to_head(do)
   with jax.named_scope("splash_bwd_di"):
-    di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))
+    # The forward kernel's o is head sharded. Otherwise, in the VJP forward
+    # fuse_reciprocal is config.fuse_reciprocal, and with cp_size > 1 it fuses
+    # the o exchange: the saved o is sequence sharded like dO. Form Di from the
+    # head-layout o and dO that the kernel reads, as the native backward does.
+    if (_di_from_kernel_o(bwd_input_exchange, head_checkpoint_names)
+        or not config.fuse_reciprocal):
+      o_head = o
+    else:
+      o_head = to_head(o)
+    di = jnp.einsum(
+        "hsd,hsd->hs", o_head.astype(jnp.float32), do_head.astype(jnp.float32))
+  do = do_head
   # The kernel exports dq/dk/dv in the caller's sequence-sharded layout.
   dq, dk, dv = mla_fused_backward.fused_backward(
       q,
@@ -1541,6 +1635,7 @@ def _splash_attention_bwd(
       di,
       cp=cp_size,
       axis_name=cp_axis,
+      kv_hbm_prefetch=kv_hbm_prefetch,
       bq=config.block_q_dkv,
       bkv=config.block_kv_dkv,
       bkv_compute=config.block_kv_dkv_compute,
@@ -1578,6 +1673,8 @@ _splash_attention_custom.defvjp(_splash_attention_fwd, _splash_attention_bwd)
         "dkv_mask_sparsity",
         "cp_size",
         "cp_axis",
+        "bwd_input_exchange",
+        "head_checkpoint_names",
     ],
 )
 def _splash_attention(
@@ -1599,6 +1696,8 @@ def _splash_attention(
     dkv_mask_sparsity: float,
     cp_size: int,
     cp_axis: str | None,
+    bwd_input_exchange: str = "head",
+    head_checkpoint_names: tuple[str, str, str] | None = None,
 ) -> base.SplashCustomReturnType:
   return _splash_attention_custom(
       fwd_mask_info,
@@ -1618,6 +1717,8 @@ def _splash_attention(
       dkv_mask_sparsity=dkv_mask_sparsity,
       cp_size=cp_size,
       cp_axis=cp_axis,
+      bwd_input_exchange=bwd_input_exchange,
+      head_checkpoint_names=head_checkpoint_names,
   )
 
 
@@ -1722,11 +1823,16 @@ def _make_splash_attention(
     q_seq_shards: int = 1,
     cp_size: int = 1,
     cp_axis: str | None = None,
+    bwd_input_exchange: str = "head",
+    head_checkpoint_names: tuple[str, str, str] | None = None,
 ):
   # After the fused exchange every rank attends the full sequence, so the mask
   # is never sequence sharded.
   if q_seq_shards != 1:
     raise ValueError(f"{q_seq_shards=} must be 1; the a2a exchange is fused.")
+  if head_checkpoint_names is not None:
+    head_checkpoint_names = tuple(head_checkpoint_names)
+  _check_bwd_input_exchange(bwd_input_exchange, head_checkpoint_names)
   if len(mask.shape) != 2:
     raise ValueError(f"Unexpected mask shape: {mask.shape}")
 
@@ -1763,11 +1869,28 @@ def _make_splash_attention(
     assert (mask_function_fwd is None) == (mask_function_dkv is None)
 
     dkv_mask_sparsity = float(np.mean(dkv_mask_info.block_mask != 0))
+    if cp_size > 1:
+      # The fused backward's configuration and schedule checks read the static
+      # mask metadata with NumPy, so run them before the arrays are converted
+      # (the factory may be called while tracing). The closure is not used.
+      mla_fused_backward.make_backward(
+          SplashAttentionA2ACpKernel(
+              fwd_mask_info,
+              dkv_mask_info,
+              config=config,
+              is_mqa=is_mqa,
+              mask_value=mask_value,
+              mask_function=mask_function_dkv,
+              dkv_mask_sparsity=dkv_mask_sparsity,
+          ),
+          cp_size,
+          axis_name=cp_axis,
+      )
     dkv_mask_info = tree_util.tree_map(jnp.array, dkv_mask_info)
   else:
     dkv_mask_sparsity = 1.0
 
-  kernel = SplashAttentionA2ACpKernel(
+  return SplashAttentionA2ACpKernel(
       fwd_mask_info,
       dkv_mask_info,
       config=config,
@@ -1779,13 +1902,9 @@ def _make_splash_attention(
       dkv_mask_sparsity=dkv_mask_sparsity,
       cp_size=cp_size,
       cp_axis=cp_axis,
+      bwd_input_exchange=bwd_input_exchange,
+      head_checkpoint_names=head_checkpoint_names,
   )
-  if cp_size > 1 and config.has_backward_blocks:
-    # The fused backward's configuration and schedule checks need the concrete
-    # mask metadata, which is only available here; the returned closure is not
-    # used.
-    mla_fused_backward.make_backward(kernel, cp_size, axis_name=cp_axis)
-  return kernel
 
 
 def _make_dynamic_splash_attention(
