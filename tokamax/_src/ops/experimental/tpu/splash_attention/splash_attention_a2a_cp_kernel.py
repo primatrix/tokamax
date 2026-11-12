@@ -701,6 +701,16 @@ def _local_groups(x, rank, num_heads: int, heads_local: int):
 BWD_INPUT_EXCHANGES = ("head", "kv_hbm_prefetch", "a2a")
 
 
+def _di_from_kernel_o(bwd_input_exchange, head_checkpoint_names):
+  """Whether the backward forms Di from the forward kernel's head-layout o.
+
+  Unnamed head buffers are rebuilt by re-running the forward kernel, which
+  rebuilds its o as well; Di then pairs o with the q/k/v of the backward's P.
+  Otherwise Di uses the named, saved output.
+  """
+  return bwd_input_exchange == "head" and head_checkpoint_names is None
+
+
 def _check_bwd_input_exchange(bwd_input_exchange, head_checkpoint_names):
   if bwd_input_exchange not in BWD_INPUT_EXCHANGES:
     raise ValueError(
@@ -1361,15 +1371,18 @@ def _splash_attention_forward(
   # head sharded otherwise (taken before the all-to-all below). The caller's
   # downstream backward also keeps out, so naming o_head too would save o twice.
   o_res = out
+  # The kernel's own head-sharded o, for a backward that re-runs this kernel
+  # (unnamed head buffers): Di then uses the o of the re-run, like q/k/v.
+  o_kernel = o_head if exchange_o else o_res
   if cp_size > 1 and not exchange_o:
     # Unfused reciprocal: the native caller divides, then the post-kernel
     # all-to-all moves o back to the sequence-sharded layout.
     out = lax.all_to_all(out, cp_axis, 1, 0, tiled=True)
   if cp_size > 1:
     buffers = {"q": outs["q_recv"], "k": outs["k_recv"], "v": outs["v_recv"],
-               "o": o_res}
+               "o": o_res, "o_head": o_kernel}
   else:
-    buffers = {"q": q, "k": k, "v": v, "o": o_res}
+    buffers = {"q": q, "k": k, "v": v, "o": o_res, "o_head": o_kernel}
   stats = None
   if save_residuals:
     stats = {"logsumexp": logsumexp, "max_logits": max_logits}
@@ -1539,8 +1552,13 @@ def _splash_attention_fwd(
           block_mask=local(dkv_mask_info.block_mask))
   else:
     q_res, k_res, v_res, sinks_res, seg_res = q, k, v, sinks, segment_ids
+  o_res = (
+      buffers["o_head"]
+      if _di_from_kernel_o(bwd_input_exchange, head_checkpoint_names)
+      else buffers["o"]
+  )
   residuals = (
-      q_res, k_res, v_res, seg_res, sinks_res, buffers["o"], logsumexp,
+      q_res, k_res, v_res, seg_res, sinks_res, o_res, logsumexp,
       dkv_mask_info,
   )
   if save_residuals:
@@ -1571,7 +1589,7 @@ def _splash_attention_bwd(
     do, _ = grads
   else:
     do = grads
-  del save_residuals, fwd_mask_sparsity, head_checkpoint_names
+  del save_residuals, fwd_mask_sparsity
   if not config.has_backward_blocks:
     raise ValueError("Need to specify backward blocks.")
   if cp_size == 1:
@@ -1594,11 +1612,15 @@ def _splash_attention_bwd(
   # dO arrives sequence sharded; the kernel takes it in the head layout.
   do_head = to_head(do)
   with jax.named_scope("splash_bwd_di"):
-    # In the VJP forward fuse_reciprocal is config.fuse_reciprocal, and with
-    # cp_size > 1 it fuses the o exchange: the saved o is sequence sharded
-    # like dO. Form Di from the head-layout o and dO that the kernel reads,
-    # as the native backward does.
-    o_head = to_head(o) if config.fuse_reciprocal else o
+    # The forward kernel's o is head sharded. Otherwise, in the VJP forward
+    # fuse_reciprocal is config.fuse_reciprocal, and with cp_size > 1 it fuses
+    # the o exchange: the saved o is sequence sharded like dO. Form Di from the
+    # head-layout o and dO that the kernel reads, as the native backward does.
+    if (_di_from_kernel_o(bwd_input_exchange, head_checkpoint_names)
+        or not config.fuse_reciprocal):
+      o_head = o
+    else:
+      o_head = to_head(o)
     di = jnp.einsum(
         "hsd,hsd->hs", o_head.astype(jnp.float32), do_head.astype(jnp.float32))
   do = do_head

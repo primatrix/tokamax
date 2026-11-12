@@ -100,6 +100,14 @@ def live_forward_kernels(text):
   return live
 
 
+def backward_all_to_alls(exchange, names):
+  """dO always; o unless head re-runs the forward kernel; q for kv_hbm_prefetch; q/k/v for a2a."""
+  if exchange == "head":
+    # Unnamed: Di uses the re-run forward kernel's head-layout o, as Tokamax f0686ad does.
+    return 1 if names is None else 2
+  return {"kv_hbm_prefetch": 3, "a2a": 5}[exchange]
+
+
 requires_devices = pytest.mark.skipif(len(jax.devices()) < CP, reason="Run with 16 logical CPU devices")
 
 
@@ -114,8 +122,12 @@ def test_saved_residuals(exchange, names, saved):
       if origin != "from a constant"
   )
   arguments = [("bfloat16", HEADS * SEQ * d, True) for d in (192, 192, 128)] + [("int32", SEQ, True)]
-  # Sequence-layout o and the local heads' logsumexp, gathered over CP.
-  splash = [("bfloat16", HEADS * SEQ * 128, False), ("float32", HEADS * SEQ, False)]
+  # The local heads' logsumexp, gathered over CP, and the sequence-layout o,
+  # except for unnamed head buffers: that backward takes o from the re-run
+  # forward kernel, as Tokamax f0686ad does.
+  splash = [("float32", HEADS * SEQ, False)]
+  if exchange != "head" or names is not None:
+    splash.append(("bfloat16", HEADS * SEQ * 128, False))
   head_qkv = [("bfloat16", HEADS * SEQ * d, False) for d in (192, 192, 128)] if names else []
   assert found == sorted(arguments + splash + head_qkv)
 
@@ -131,8 +143,7 @@ def test_backward_exchanges_and_forward_recompute(exchange, names, saved):
   assert outvars == [(HEADS, SEQ, 128), (HEADS, SEQ, 192), (HEADS, SEQ, 192), (HEADS, SEQ, 128)]
   text = str(program)
   assert text.count("name=mla_fused_dq_dkv_a2a") == 1
-  # dO and Di always; q for kv_hbm_prefetch; q/k/v for a2a.
-  assert text.count("all_to_all[") == {"head": 2, "kv_hbm_prefetch": 3, "a2a": 5}[exchange]
+  assert text.count("all_to_all[") == backward_all_to_alls(exchange, names)
   hlo = jax.jit(run).trace(*args).lower(lowering_platforms=("tpu",)).as_text()
   # Unnamed head buffers can only be rebuilt by re-running the forward kernel.
   assert live_forward_kernels(hlo) == (2 if exchange == "head" and names is None else 1)
@@ -213,7 +224,7 @@ def test_batch_folded_into_heads(cp, heads, batch, bq, bkv, exchange):
   ]
   text = str(program)
   assert text.count("name=mla_fused_dq_dkv_a2a") == 1
-  assert text.count("all_to_all[") == {"head": 2, "kv_hbm_prefetch": 3, "a2a": 5}[exchange]
+  assert text.count("all_to_all[") == backward_all_to_alls(exchange, None)
   jax.jit(cycle(fn)).trace(*args).lower(lowering_platforms=("tpu",))
 
 
