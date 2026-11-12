@@ -12,11 +12,19 @@ completion, mask metadata validation and the sequence/head layout boundary.
 The model caller owns dispatch, configuration, rematerialization policy,
 projection/gate integration and any model-specific precision constraints.
 
-The validated full-model combination is BF16 attention inputs, CP16, four local
-heads, DQK192/DV128, 262144 tokens and one local batch item per FSDP group.
-It uses causal attention with int32 segment IDs, natural-log softmax,
-HEAD_DIM_MINOR inputs and backward blocks Q512/KV4096/compute512 with three
-dQ partials and cast-before-transpose. Factory arguments are:
+The geometry is derived from the call: CP is the mesh context size, local
+heads are global heads / CP (any positive count), head widths are the Q/K and
+V input widths, and the sequence must be a multiple of CP x `block_kv_dkv` so
+every rank owns whole K/V tiles. Tile sizes come from the Splash config; Splash
+and Pallas enforce TPU block alignment. Diagonal dQ finalization requires
+`block_kv_dkv == 8 * block_q_dkv` and three dQ partials. Inputs are BF16 with
+int32 segment IDs, causal attention, natural-log softmax, HEAD_DIM_MINOR
+layouts and cast-before-transpose. Mask
+metadata may be concrete NumPy (checked element-wise) or traced, e.g. when the
+kernel is built inside topology AOT; traced metadata is checked against the
+static causal schedule proof for the call's sequence length. The production
+full-model configuration is CP16, four local heads, 262144 tokens.
+Factory arguments are:
 
 ```python
 from tokamax.experimental.mla_attention import make_attention, make_static_splash_kernel
@@ -36,10 +44,11 @@ The separate MTP path uses `bwd_input_exchange="remat"`. The original remat
 policy saves Splash output/LSE under `mla_splash_residuals`; this migration
 does not change checkpoint tags or the caller's policy.
 
-CP8 and other exchange modes remain available for their existing isolated
-experiments. Their availability does not imply full-model acceptance. In
-particular, per-head, credit, shadow and traced/serial HBM modes are diagnostic.
-The production HBM selector requires CP16 and `cp_barrier=False` in MaxText.
+Backward input exchanges are `remat` (rematerialized head-layout Q/K/V) and
+`kv_hbm_prefetch` / `kv_hbm_serial` (in-kernel K/V import; both require
+`cp_barrier=False`, i.e. the compiler global barrier). Earlier diagnostic
+modes (packed/separate/remote_dma inputs, per-head, credit and shadow imports,
+traced HBM regions) were removed.
 The existing forward-only `splash_attention_a2a_cp_kernel` is an independent
 implementation and is not used by this API.
 

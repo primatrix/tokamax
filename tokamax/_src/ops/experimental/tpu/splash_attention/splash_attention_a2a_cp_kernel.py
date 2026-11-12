@@ -29,7 +29,8 @@ With ``cp_size == 1`` the same block loop runs without any exchange.
 
 The backward is ``mla_fused_backward``: dO is exchanged to the head layout with
 ``lax.all_to_all`` and the kernel exports dq/dk/dv back to sequence shards.  It
-supports cp 8/16, a static mask schedule and the qualified MLA configuration.
+needs cp_size > 1 dividing the K/V tile count, a static causal mask schedule
+and the MLA backward configuration checked by ``make_backward``.
 
 Calling convention for ``cp_size > 1`` (inside the caller's ``shard_map`` over
 ``cp_axis``): q/k/v are the local sequence shards ``[heads, N / cp, d]``,
@@ -1522,7 +1523,7 @@ def _splash_attention_bwd(
   if not config.has_backward_blocks:
     raise ValueError("Need to specify backward blocks.")
   if cp_size == 1:
-    raise NotImplementedError("The MLA fused backward requires cp_size 8 or 16.")
+    raise NotImplementedError("The MLA fused backward requires cp_size > 1.")
   q, k, v, segment_ids, sinks, o, logsumexp, dkv_mask_info = res
   if sinks is not None:
     raise NotImplementedError("The MLA fused backward does not support sinks.")

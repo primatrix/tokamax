@@ -1,10 +1,11 @@
-"""Sequence-layout custom VJP for the qualified MLA dKV export kernel.
+"""Sequence-layout custom VJP for the fused MLA backward kernel.
 
 The factory accepts the caller's complete Splash kernel/configuration; it does
-not import benchmark state, change its tile/cost configuration, or install a
-remat policy. The caller remains responsible for choosing checkpoint policies.
-The fused path is restricted to the validated static causal geometry; callers
-retain their existing implementation for other masks and shapes.
+not change its tile/cost configuration or install a remat policy. The fused
+backward supports any context parallelism CP that divides the global head
+count and the number of K/V tiles (``block_kv_dkv`` tokens each). Head widths
+come from the Q/K/V inputs. Callers keep their existing implementation for
+other masks and shapes.
 """
 
 from __future__ import annotations
@@ -221,32 +222,6 @@ def _forward_input_exchange(x, *, cp, axis_name):
   return _remote_input_exchange(x, cp=cp, axis_name=axis_name, name="mla_fwd_input_remote_a2a")
 
 
-def _backward_input_exchange(x, *, cp, axis_name):
-  """Move packed backward Q/K/V/dO from sequence to head layout."""
-  return _remote_input_exchange(x, cp=cp, axis_name=axis_name, name="mla_bwd_input_remote_a2a")
-
-
-def _exchange_head(x, head, cp, axis_name):
-  """Exchange one head from a local [CP*4,L,D] source into [1,S,D]."""
-  if x.ndim != 3 or x.shape[0] != cp * 4 or not 0 <= head < 4:
-    raise ValueError("Per-head exchange requires [CP*4,L,D] and a head in [0,4)")
-  return lax.all_to_all(
-      x.reshape(cp, 4, x.shape[1], x.shape[2])[:, head],
-      axis_name,
-      split_axis=0,
-      concat_axis=1,
-      tiled=True,
-  )
-
-
-def _merge_head_gradients(parts):
-  """Restore sender-major, head-minor rows from four fresh [CP,L,D] outputs."""
-  if len(parts) != 4 or any(x.shape != parts[0].shape for x in parts) or parts[0].ndim != 3:
-    raise ValueError("Gradient assembly requires four matching [CP,L,D] outputs")
-  cp, length, width = parts[0].shape
-  return jnp.stack(parts, axis=1).reshape(cp * 4, length, width)
-
-
 def make_static_splash_kernel(mask, config):
   """Keep pinned Tokamax mask metadata as NumPy constants for topology AOT."""
   validate_source()
@@ -279,8 +254,8 @@ def make_static_splash_kernel(mask, config):
 
 def _validate_kernel(kernel, cp):
   cfg = kernel.kwargs["config"]
-  if cp not in (8, 16):
-    raise ValueError("Qualified CP sizes are 8 and 16")
+  if type(cp) is not int or cp < 1:
+    raise ValueError("Context parallelism must be a positive integer")
   if kernel.kwargs["is_mqa"]:
     raise ValueError("MLA fused export requires MHA")
   # The public forward converts base2 LSE to natural log, while native bwd
@@ -312,69 +287,26 @@ def make_local_attention(
 ):
   """Map local BSHD sequence shards to the same layout and gradient ownership.
 
-  Global H is CP*4; a rank owns all heads for S/CP tokens at the boundary.
-  Kernel inputs are H4/Sfull. Runtime segment IDs enter as sequence shards.
-  The local batch is exactly one, as in the production FSDP32 configuration.
-  Experimental backward input exchanges require the original remat policy:
-  head Q/K/V are recomputed, while Splash output/LSE may be retained. Head
-  checkpoint tags do not retain experimental backward inputs.
+  Global H must be a multiple of CP. At the boundary a rank owns all heads
+  for S/CP tokens; inside the kernel it owns H/CP heads for the full
+  sequence. Runtime segment IDs enter as sequence shards and the local batch
+  is exactly one. ``kv_hbm_*`` imports K/V inside the backward kernel from
+  the sequence-layout arguments that the original remat policy already
+  saves; ``remat`` uses the rematerialized head-layout Q/K/V.
   """
-  if bwd_input_exchange not in (
-      "remat",
-      "packed",
-      "separate",
-      "remote_dma",
-      "per_head_split",
-      "per_head_a2a",
-      "per_head_import",
-      "kv_credit_serial",
-      "kv_credit_prefetch",
-      "kv_credit_deferred",
-      "kv_credit_ahead",
-      "kv_hbm_serial",
-      "kv_hbm_prefetch",
-      "kv_hbm_traced",
-      "kv_shadow_serial",
-      "kv_shadow_prefetch",
-  ):
+  del evidence_dir  # Accepted for API compatibility.
+  if bwd_input_exchange not in ("remat", "kv_hbm_serial", "kv_hbm_prefetch"):
     raise ValueError("Unsupported MLA backward input exchange")
   if fwd_input_exchange not in ("external", "remote_dma"):
     raise ValueError("Unsupported MLA forward input exchange")
   if fwd_output_exchange not in ("external", "remote_dma"):
     raise ValueError("Unsupported MLA forward output exchange")
-  if bwd_input_exchange != "remat" and not fused:
-    raise ValueError("Experimental backward input exchanges require the fused VJP")
-  per_head = bwd_input_exchange in ("per_head_split", "per_head_a2a", "per_head_import")
-  kv_hbm = bwd_input_exchange in ("kv_hbm_serial", "kv_hbm_prefetch", "kv_hbm_traced")
-  kv_import = kv_hbm or bwd_input_exchange in (
-      "kv_credit_serial",
-      "kv_credit_prefetch",
-      "kv_credit_deferred",
-      "kv_credit_ahead",
-  )
-  kv_shadow = bwd_input_exchange in ("kv_shadow_serial", "kv_shadow_prefetch")
-  if per_head and cp_barrier:
-    raise ValueError("Per-head MLA backward requires the compiler global barrier")
+  kv_import = bwd_input_exchange != "remat"
+  if kv_import and not fused:
+    raise ValueError("Backward K/V import requires the fused VJP")
   if kv_import and cp_barrier:
-    raise ValueError("Experimental K/V row import requires the compiler global barrier")
-  if kv_shadow and cp_barrier:
-    raise ValueError("Shadow K/V traffic requires the compiler global barrier")
-  sequence_residuals = bwd_input_exchange in (
-      "packed",
-      "separate",
-      "remote_dma",
-      "per_head_a2a",
-      "per_head_import",
-      "kv_credit_serial",
-      "kv_credit_prefetch",
-      "kv_credit_deferred",
-      "kv_credit_ahead",
-      "kv_hbm_serial",
-      "kv_hbm_prefetch",
-      "kv_hbm_traced",
-      "kv_shadow_serial",
-      "kv_shadow_prefetch",
-  )
+    raise ValueError("Backward K/V import requires the compiler global barrier")
+  sequence_residuals = kv_import
   if fused:
     cfg = _validate_kernel(kernel, cp)
     backward = make_backward(kernel, cp, axis_name=axis_name, cp_barrier=cp_barrier)
@@ -396,21 +328,22 @@ def make_local_attention(
   def inputs(q, k, v, ids):
     if q.shape != k.shape or q.shape[:3] != v.shape[:3]:
       raise ValueError("MHA Q/K/V leading shapes must match")
-    if q.shape[0] != 1 or q.shape[2:] != (cp * 4, 192) or v.shape[-1] != 128:
-      raise ValueError("Qualified local boundary is B1, H=CP*4, DQK192/DV128")
-    if q.shape[1] % 4096 or ids.shape != q.shape[:2]:
-      raise ValueError("Sequence shard must be divisible by 4096 and match segment IDs")
+    if q.shape[0] != 1 or q.shape[2] % cp:
+      raise ValueError("Local boundary requires batch one and heads divisible by CP")
+    if q.shape[1] % cfg.block_kv_dkv or ids.shape != q.shape[:2]:
+      raise ValueError("Sequence shard must be divisible by block_kv_dkv and match segment IDs")
     if not all(x.dtype == jnp.bfloat16 for x in (q, k, v)) or ids.dtype != jnp.int32:
-      raise ValueError("Qualified data types are BF16 and int32 segment IDs")
+      raise ValueError("Supported data types are BF16 and int32 segment IDs")
     # Preserve the production input Q/K/V collective fusion.
     packed = jnp.concatenate((q, k, v), axis=-1)
     if fwd_input_exchange == "remote_dma":
       packed = _forward_input_exchange(jnp.transpose(packed, (0, 2, 1, 3))[0], cp=cp, axis_name=axis_name)[None]
     else:
       packed = to_head(packed)
+    dqk = q.shape[-1]
     qh, kh, vh = (
         ad_checkpoint.checkpoint_name(x, tag)
-        for x, tag in zip(jnp.split(packed, (192, 384), axis=-1), ("mla_q_head", "mla_k_head", "mla_v_head"))
+        for x, tag in zip(jnp.split(packed, (dqk, 2 * dqk), axis=-1), ("mla_q_head", "mla_k_head", "mla_v_head"))
     )
     full_ids = lax.all_gather(ids, axis_name, axis=1, tiled=True)
     return qh, kh, vh, full_ids
@@ -442,8 +375,8 @@ def make_local_attention(
     if record_max_logits:
       output = (output, lax.stop_gradient(jnp.max(stats["max_logits"], axis=-1)[None]))
     # The original policy already saves the sequence-layout input arguments.
-    # Return those arguments so pullback owns the selected Q/K/V/dO exchange,
-    # instead of remat separately rebuilding the head-layout Q/K/V residuals.
+    # Return those arguments so pullback owns the K/V exchange, instead of
+    # remat separately rebuilding the head-layout Q/K/V residuals.
     qkv_residuals = (q, k, v) if sequence_residuals else (qh, kh, vh)
     return output, (*qkv_residuals, full_ids, oh, lse)
 
@@ -456,100 +389,20 @@ def make_local_attention(
     # Their cotangent must not enter attention's Q/K/V gradients.
     do_sequence = cotangent[0] if record_max_logits else cotangent
     qkv_a, qkv_b, qkv_c, ids, oh, lse = residuals
-    if sequence_residuals:
+    if kv_import:
       q_seq, k_seq, v_seq = qkv_a, qkv_b, qkv_c
-      if do_sequence.dtype != jnp.bfloat16 or do_sequence.shape != q_seq.shape[:3] + (128,):
-        raise ValueError("Backward input exchanges require BF16 dO with Q/K/V leading shape")
-    if bwd_input_exchange == "packed":
-      packed = to_head(jnp.concatenate((q_seq, k_seq, v_seq, do_sequence), axis=-1))
-      qh, kh, vh, do_head = jnp.split(packed, (192, 384, 512), axis=-1)
-      if qh.shape[-1] != 192 or do_head.shape[-1] != 128:
-        raise ValueError("Packed backward input split has an invalid head dimension")
-    elif bwd_input_exchange == "remote_dma":
-      packed = _backward_input_exchange(
-          jnp.transpose(jnp.concatenate((q_seq, k_seq, v_seq, do_sequence), axis=-1), (0, 2, 1, 3))[0],
-          cp=cp,
-          axis_name=axis_name,
-      )[None]
-      qh, kh, vh, do_head = jnp.split(packed, (192, 384, 512), axis=-1)
-    elif bwd_input_exchange == "separate" or kv_shadow:
-      qh, kh, vh, do_head = (to_head(x) for x in (q_seq, k_seq, v_seq, do_sequence))
-    elif kv_import:
-      # Q/dO remain once-per-call external imports for this intermediate
-      # candidate. The backward kernel owns each K/V sequence row's exchange.
+      if do_sequence.dtype != jnp.bfloat16 or do_sequence.shape[:3] != q_seq.shape[:3]:
+        raise ValueError("Backward K/V import requires BF16 dO with the Q/K/V leading shape")
+      # Q/dO use external exchanges. The kernel imports each K/V head.
       qh, do_head = (to_head(x) for x in (q_seq, do_sequence))
       kh, vh = (jnp.transpose(x, (0, 2, 1, 3)) for x in (k_seq, v_seq))
-    elif bwd_input_exchange in ("per_head_a2a", "per_head_import"):
-      # Keep each tensor separate so no 640-wide unpacking is needed. The
-      # head slice is gathered before XLA's exchange; measure that cost too.
-      sources = tuple(jnp.transpose(x, (0, 2, 1, 3))[0] for x in (q_seq, k_seq, v_seq, do_sequence))
-      gradients = []
-      for h in range(4):
-        with jax.named_scope(f"mla_bwd_head_{h}"):
-          if h == 0 or bwd_input_exchange == "per_head_a2a":
-            head_inputs = tuple(_exchange_head(x, h, cp, axis_name) for x in sources)
-          # all_to_all preserves a singleton head: [CP,L,D] -> [1,S,D].
-          q_h, k_h, v_h, do_h = head_inputs
-          importing = bwd_input_exchange == "per_head_import" and h < 3
-          result = backward(
-              q_h,
-              k_h,
-              v_h,
-              ids[0],
-              oh[0, h : h + 1],
-              lse[0, h : h + 1],
-              do_h,
-              import_head=h + 1 if importing else None,
-              imports=sources if importing else None,
-          )
-          gradients.append(result[:3])
-          if importing:
-            head_inputs = result[3:]
-      dq, dk, dv = (_merge_head_gradients(parts) for parts in zip(*gradients))
     else:
-      # Both C and E0 use the original full-head remat input exchange.
       qh, kh, vh = qkv_a, qkv_b, qkv_c
       do_head = to_head(do_sequence)
-    if bwd_input_exchange == "per_head_split":
-      # E0 isolates the four-call cost: retain C's full-head di reduction.
-      with jax.named_scope("splash_bwd_di"):
-        di = jnp.einsum("hsd,hsd->hs", oh[0].astype(jnp.float32), do_head[0].astype(jnp.float32))
-      gradients = []
-      for h in range(4):
-        with jax.named_scope(f"mla_bwd_head_{h}"):
-          gradients.append(
-              backward(
-                  qh[0, h : h + 1],
-                  kh[0, h : h + 1],
-                  vh[0, h : h + 1],
-                  ids[0],
-                  oh[0, h : h + 1],
-                  lse[0, h : h + 1],
-                  do_head[0, h : h + 1],
-                  di=di[h : h + 1],
-              )
-          )
-      dq, dk, dv = (_merge_head_gradients(parts) for parts in zip(*gradients))
-    elif bwd_input_exchange not in ("per_head_a2a", "per_head_import"):
-      dq, dk, dv = backward(
-          *(x[0] for x in (qh, kh, vh, ids, oh, lse, do_head)),
-          kv_import_prefetch=(bwd_input_exchange != "kv_credit_serial") if kv_import and not kv_hbm else None,
-          kv_hbm_prefetch=(bwd_input_exchange != "kv_hbm_serial") if kv_hbm else None,
-          kv_hbm_trace=bwd_input_exchange == "kv_hbm_traced",
-          kv_import_defer_send=bwd_input_exchange in ("kv_credit_deferred", "kv_credit_ahead"),
-          kv_import_launch_after_credit=bwd_input_exchange == "kv_credit_ahead",
-          # Keep the diagnostic source conversion independent of the real
-          # input A2A. Sharing the transpose lets its dim-minor requirement
-          # force K through a copy and a reverse conversion before the A2A.
-          # This barrier is only a layout-isolation candidate until AOT
-          # confirms that the real collective's producer chain is preserved.
-          shadow_imports=(
-              tuple(jnp.transpose(lax.optimization_barrier(x), (0, 2, 1, 3))[0] for x in (k_seq, v_seq))
-              if kv_shadow
-              else None
-          ),
-          shadow_prefetch=bwd_input_exchange == "kv_shadow_prefetch",
-      )
+    dq, dk, dv = backward(
+        *(x[0] for x in (qh, kh, vh, ids, oh, lse, do_head)),
+        kv_hbm_prefetch=(bwd_input_exchange == "kv_hbm_prefetch") if kv_import else None,
+    )
     # All three gradients already have [CP*H, S/CP, D] ownership.
     return (
         jnp.transpose(dq[None], (0, 2, 1, 3)),
@@ -636,7 +489,9 @@ def _make_attention_with_external_inputs(
     )
     qh, kh, vh = (
         jnp.transpose(ad_checkpoint.checkpoint_name(x, name), (0, 2, 1, 3))
-        for x, name in zip(jnp.split(packed, (192, 384), axis=-1), ("mla_q_head", "mla_k_head", "mla_v_head"))
+        for x, name in zip(
+            jnp.split(packed, (q.shape[-1], 2 * q.shape[-1]), axis=-1), ("mla_q_head", "mla_k_head", "mla_v_head")
+        )
     )
     full_ids = lax.with_sharding_constraint(ids, NamedSharding(mesh, full_segments))
     oh, lse, max_logits = head_forward(qh, kh, vh, full_ids)
@@ -717,14 +572,14 @@ def make_attention(
 
   def call(q, k, v, ids):
     if q.shape[0] != batch_size:
-      raise ValueError("Qualified local batch is exactly one per FSDP group")
+      raise ValueError("Local batch must be exactly one per FSDP group")
     if external_inputs:
-      if q.shape != k.shape or q.shape[:3] != v.shape[:3] or q.shape[2:] != (cp * 4, 192) or v.shape[-1] != 128:
-        raise ValueError("Qualified global boundary requires matching Q/K/V with H=CP*4, DQK192/DV128")
-      if q.shape[1] % (cp * 4096) or ids.shape != q.shape[:2]:
-        raise ValueError("Sequence shards must be divisible by 4096 and match segment IDs")
+      if q.shape != k.shape or q.shape[:3] != v.shape[:3] or q.shape[2] % cp:
+        raise ValueError("Global boundary requires matching Q/K/V with heads divisible by CP")
+      if q.shape[1] % (cp * kernel.kwargs["config"].block_kv_dkv) or ids.shape != q.shape[:2]:
+        raise ValueError("Sequence shards must be divisible by block_kv_dkv and match segment IDs")
       if not all(x.dtype == jnp.bfloat16 for x in (q, k, v)) or ids.dtype != jnp.int32:
-        raise ValueError("Qualified data types are BF16 and int32 segment IDs")
+        raise ValueError("Supported data types are BF16 and int32 segment IDs")
     return mapped(q, k, v, ids)
 
   return call
