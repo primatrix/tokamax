@@ -410,7 +410,7 @@ def test_segment_schedule_needs_causal_mask():
 @pytest.mark.parametrize("cp_barrier", [False, True])
 @pytest.mark.parametrize("exchange,names,saved", CASES, ids=IDS)
 def test_cp_barrier_replaces_the_device_barrier(exchange, names, saved, cp_barrier):
-  # Every fused kernel skips the compiler's device barrier only on request.
+  # Only the backward skips the compiler's device barrier, and only on request.
   with jax.ensure_compile_time_eval():
     kernel = a2a.make_splash_mha_a2a_cp(
         sm.CausalMask((SEQ, SEQ)), config=config(), cp_size=CP, cp_axis="context",
@@ -429,6 +429,8 @@ def test_cp_barrier_replaces_the_device_barrier(exchange, names, saved, cp_barri
   args = inputs() + [jax.ShapeDtypeStruct((HEADS, SEQ, 128), jnp.bfloat16)]
   hlo = jax.jit(cycle(fn)).trace(*args).lower(lowering_platforms=("tpu",)).as_text()
   calls = [line for line in hlo.splitlines() if "tpu_custom_call" in line]
-  assert sum("mla_fused_dq_dkv_a2a" in line for line in calls) == 1
-  assert any("fwd_a2a_cp" in line for line in calls)
-  assert all(("skip_device_barrier" in line) == cp_barrier for line in calls)
+  backward = [line for line in calls if "mla_fused_dq_dkv_a2a" in line]
+  forward = [line for line in calls if "fwd_a2a_cp" in line]
+  assert len(backward) == 1 and forward
+  assert ("skip_device_barrier" in backward[0]) == cp_barrier
+  assert not any("skip_device_barrier" in line for line in forward)
