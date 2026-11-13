@@ -828,7 +828,6 @@ def _splash_attention_forward(
     cp_axis: str | None,
     max_logit_value: jax.Array | None = None,
     save_max_logits: bool = True,
-    cp_barrier: bool = False,
 ):
   """Forward pass with the Ulysses exchange fused into one pallas call.
 
@@ -1390,10 +1389,6 @@ def _splash_attention_forward(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=(),
             collective_id=0 if cp_size > 1 else None,
-            # Every remote copy targets a context peer, so the kernel's entry
-            # barrier over the context peers can replace the compiler's device
-            # barrier, which also waits for the other context groups.
-            skip_device_barrier=cp_barrier and cp_size > 1,
             vmem_limit_bytes=(
                 config.fwd_vmem_limit_bytes or _DEFAULT_FWD_VMEM_LIMIT_BYTES
             ),
@@ -1530,7 +1525,7 @@ def _splash_attention_custom(
   # mask then we would not work with the MaskInfo slice relevant to the current
   # device.
   del dkv_mask_info
-  del bwd_input_exchange, head_checkpoint_names, segment_schedule  # Backward only.
+  del bwd_input_exchange, head_checkpoint_names, segment_schedule, cp_barrier  # Backward only.
 
   out, stats, _ = _splash_attention_forward(  # pytype: disable=wrong-arg-types
       fwd_mask_info,
@@ -1548,7 +1543,6 @@ def _splash_attention_custom(
       cp_size=cp_size,
       cp_axis=cp_axis,
       max_logit_value=max_logit_value,
-      cp_barrier=cp_barrier,
   )
   if save_residuals:
     if config.use_base2_exp:  # for user, output values in natural base
@@ -1586,7 +1580,7 @@ def _splash_attention_fwd(
   # TODO: add some higher order AD check that isn't save_residuals based.
   # if save_residuals:
   #   raise NotImplementedError("Higher-order AD not supported.")
-  del segment_schedule  # Backward only.
+  del segment_schedule, cp_barrier  # Backward only.
   _check_bwd_input_exchange(bwd_input_exchange, head_checkpoint_names)
   if bwd_input_exchange == "kv_hbm_prefetch" and k.shape[0] != q.shape[0]:
     raise ValueError("kv_hbm_prefetch imports one k/v head per q head; no GQA.")
@@ -1608,7 +1602,6 @@ def _splash_attention_fwd(
       cp_size=cp_size,
       cp_axis=cp_axis,
       max_logit_value=max_logit_value,
-      cp_barrier=cp_barrier,
   )
   logsumexp = stats["logsumexp"]  # save in the config base for the bwd pass
   if config.use_base2_exp:  # for user, output values in natural base
