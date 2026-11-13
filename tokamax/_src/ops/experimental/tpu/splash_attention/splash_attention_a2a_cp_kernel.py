@@ -1389,7 +1389,9 @@ def _splash_attention_forward(
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=(),
-            collective_id=0 if cp_size > 1 else None,
+            # 61441: the context-peer barrier's own semaphore; 0 is shared
+            # with kernels that keep the compiler's device barrier.
+            collective_id=(61441 if cp_barrier else 0) if cp_size > 1 else None,
             # Every remote copy targets a context peer, so the kernel's entry
             # barrier over the context peers can replace the compiler's device
             # barrier, which also waits for the other context groups.
