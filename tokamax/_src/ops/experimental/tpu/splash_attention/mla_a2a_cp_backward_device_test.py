@@ -4,10 +4,12 @@ Runs at CP8 on 8 TPU devices (v7x 2x2x1). For every tile geometry and
 ``bwd_input_exchange``, out, dq, dk and dv must match native Splash with the
 same tiles and three BF16 dQ partials bit for bit. A local batch folded into
 the head axis must match one call per sequence bit for bit, including
-max_logits.
+max_logits. With ``segment_schedule`` the pruned schedules must match the
+full causal schedule bit for bit; the wall time of both is reported.
 """
 
 import json
+import time
 
 import jax
 import jax.numpy as jnp
@@ -85,7 +87,7 @@ def ids_spec(ids):
   return P(*(None,) * ids.ndim)
 
 
-def vjp(local, saved, q, k, v, ids, do):
+def vjp_fn(local, saved, ids):
   mapped = jax.shard_map(
       local, mesh=mesh(), in_specs=(SEQ_SPEC,) * 3 + (ids_spec(ids),), out_specs=SEQ_SPEC, check_vma=False
   )
@@ -97,7 +99,11 @@ def vjp(local, saved, q, k, v, ids, do):
     out, pullback = jax.vjp(lambda q, k, v: mapped(q, k, v, ids), q, k, v)
     return (out, *pullback(do))
 
-  return run(q, k, v, ids, do)
+  return run
+
+
+def vjp(local, saved, q, k, v, ids, do):
+  return vjp_fn(local, saved, ids)(q, k, v, ids, do)
 
 
 def native(tiles, dq_reduction_steps, q, k, v, ids, do):
@@ -111,7 +117,7 @@ def native(tiles, dq_reduction_steps, q, k, v, ids, do):
   return vjp(local, None, q, k, v, ids, do)
 
 
-def fused_kernel(tiles, exchange, names):
+def fused_kernel(tiles, exchange, names, segment_schedule=False):
   return a2a.make_splash_mha_a2a_cp(
       sm.CausalMask((SEQ, SEQ)),
       config=config(tiles),
@@ -119,16 +125,21 @@ def fused_kernel(tiles, exchange, names):
       cp_axis="context",
       bwd_input_exchange=exchange,
       head_checkpoint_names=names,
+      segment_schedule=segment_schedule,
   )
 
 
-def fused(tiles, exchange, names, saved, q, k, v, ids, do):
-  kernel = fused_kernel(tiles, exchange, names)
-  return vjp(lambda q, k, v, ids: kernel(q, k, v, sk.SegmentIds(ids, ids)), saved, q, k, v, ids, do)
+def fused_fn(tiles, exchange, names, saved, ids, segment_schedule=False):
+  kernel = fused_kernel(tiles, exchange, names, segment_schedule)
+  return vjp_fn(lambda q, k, v, ids: kernel(q, k, v, sk.SegmentIds(ids, ids)), saved, ids)
 
 
-def fused_max_logits(tiles, exchange, q, k, v, ids):
-  kernel = fused_kernel(tiles, exchange, None)
+def fused(tiles, exchange, names, saved, q, k, v, ids, do, segment_schedule=False):
+  return fused_fn(tiles, exchange, names, saved, ids, segment_schedule)(q, k, v, ids, do)
+
+
+def fused_max_logits(tiles, exchange, q, k, v, ids, segment_schedule=False):
+  kernel = fused_kernel(tiles, exchange, None, segment_schedule)
 
   def local(q, k, v, ids):
     _, stats = kernel(q, k, v, sk.SegmentIds(ids, ids), save_residuals=True)
@@ -214,4 +225,90 @@ def test_batch_folded_into_heads_matches_one_call_per_sequence(data, exchange, n
     single_logits = fused_max_logits(tiles, exchange, q[rows], k[rows], v[rows], ids[b])
     out[f"max_logits{b}"] = report(folded_logits[rows], single_logits)
   print(json.dumps(dict(tiles=tiles, exchange=exchange, folded=2, **out)), flush=True)
+  assert all(r["mismatches"] == 0 and r["nonfinite"] == 0 for r in out.values()), out
+
+
+def segment_ids(name):
+  """Segment IDs of one sequence for the segment-schedule cases."""
+  rng = np.random.default_rng(1)
+  if name == "packed":
+    return np.repeat(np.arange(len(LENGTHS[0]), dtype=np.int32), LENGTHS[0])
+  if name == "nonmonotone":
+    # IDs recur: a later block of an ID attends its earlier blocks.
+    return np.repeat(rng.integers(1, 6, 32).astype(np.int32), SEQ // 32)
+  if name == "tile_edge":
+    # Every document ends 256 tokens into a K/V tile, inside the first Q tile
+    # of that row's diagonal, so diagonal finalization reads the partial the
+    # previous program stored (the previous-bank path) at every tile ratio.
+    ends = [*range(4096 + 256, SEQ, 4096), SEQ]
+  else:
+    # Many short documents, then ID-0 padding, as in packed training batches.
+    ends = [int(e) for e in np.cumsum(rng.integers(64, 3000, 64)) if e <= SEQ - 4096]
+  ids, start = np.zeros(SEQ, np.int32), 0
+  for doc, end in enumerate(ends, 1):
+    ids[start:end] = doc
+    start = end
+  return ids
+
+
+def timed(fn, *args, repeats=5):
+  """Result and mean wall time in ms after one compiling call."""
+  jax.block_until_ready(fn(*args))
+  start = time.perf_counter()
+  for _ in range(repeats):
+    out = fn(*args)
+  jax.block_until_ready(out)
+  return out, (time.perf_counter() - start) / repeats * 1e3
+
+
+# (tiles, bwd_input_exchange, head_checkpoint_names, saved names, segment layout).
+SEGMENT_CASES = [
+    # MaxText's Plus-VL default under remat.
+    ("plus_vl_r8", "head", None, (RESIDUALS,), "tile_edge"),
+    ("plus_vl_r8", "head", None, (RESIDUALS,), "short_padded"),
+    ("plus_vl_r8", "head", None, (RESIDUALS,), "nonmonotone"),
+    ("plus_vl_r8", "head", None, None, "packed"),
+    ("plus_vl_r8", "head", NAMES, (RESIDUALS, *NAMES), "tile_edge"),
+    ("plus_vl_r8", "kv_hbm_prefetch", None, (RESIDUALS,), "tile_edge"),
+    ("plus_vl_r8", "kv_hbm_prefetch", None, (RESIDUALS,), "short_padded"),
+    ("plus_vl_r8", "a2a", None, (RESIDUALS,), "tile_edge"),
+    ("tiny_vl_r1", "kv_hbm_prefetch", None, (RESIDUALS,), "short_padded"),
+    ("tiny_vl_r1", "kv_hbm_prefetch", None, (RESIDUALS,), "nonmonotone"),
+    ("tiny_vl_r1", "head", NAMES, (RESIDUALS, *NAMES), "short_padded"),
+    ("tiny_vl_r1", "a2a", None, (RESIDUALS,), "tile_edge"),
+    ("r2", "kv_hbm_prefetch", None, (RESIDUALS,), "tile_edge"),
+    ("r4", "kv_hbm_prefetch", None, (RESIDUALS,), "tile_edge"),
+]
+
+
+@pytest.mark.parametrize("tiles,exchange,names,saved,layout", SEGMENT_CASES)
+def test_segment_schedule_matches_full_schedule(data, tiles, exchange, names, saved, layout):
+  # A skipped tile is fully masked, so it adds exactly zero: out, dq, dk, dv
+  # and max_logits must equal the full causal schedule's bit for bit.
+  q, k, v, _, do = data
+  ids = jax.device_put(jnp.asarray(segment_ids(layout)), NamedSharding(mesh(), P(None)))
+  full, full_ms = timed(fused_fn(tiles, exchange, names, saved, ids), q, k, v, ids, do)
+  pruned, pruned_ms = timed(fused_fn(tiles, exchange, names, saved, ids, True), q, k, v, ids, do)
+  out = {name: report(a, b) for name, a, b in zip(("out", "dq", "dk", "dv"), pruned, full)}
+  out["max_logits"] = report(
+      fused_max_logits(tiles, exchange, q, k, v, ids, True), fused_max_logits(tiles, exchange, q, k, v, ids)
+  )
+  print(json.dumps(dict(
+      tiles=tiles, exchange=exchange, named=names is not None, saved=saved, layout=layout,
+      full_ms=round(full_ms, 3), pruned_ms=round(pruned_ms, 3), **out,
+  )), flush=True)
+  assert all(r["mismatches"] == 0 and r["nonfinite"] == 0 for r in out.values()), out
+
+
+def test_segment_schedule_folded_batch_matches_full_schedule(data):
+  # Tiny-VL: two sequences with different documents folded into the head axis.
+  q, k, v, ids, do = data
+  tiles, saved = "tiny_vl_r1", (RESIDUALS,)
+  full, full_ms = timed(fused_fn(tiles, "kv_hbm_prefetch", None, saved, ids), q, k, v, ids, do)
+  pruned, pruned_ms = timed(fused_fn(tiles, "kv_hbm_prefetch", None, saved, ids, True), q, k, v, ids, do)
+  out = {name: report(a, b) for name, a, b in zip(("out", "dq", "dk", "dv"), pruned, full)}
+  print(json.dumps(dict(
+      tiles=tiles, exchange="kv_hbm_prefetch", folded=2, segment_schedule=True,
+      full_ms=round(full_ms, 3), pruned_ms=round(pruned_ms, 3), **out,
+  )), flush=True)
   assert all(r["mismatches"] == 0 and r["nonfinite"] == 0 for r in out.values()), out
