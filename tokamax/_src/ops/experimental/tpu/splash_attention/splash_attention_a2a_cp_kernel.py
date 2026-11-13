@@ -34,6 +34,12 @@ and the MLA backward configuration checked by ``make_backward``.
 ``bwd_input_exchange`` selects how the backward gets head-layout q/k/v
 (``head``, ``kv_hbm_prefetch`` or ``a2a``; see ``BWD_INPUT_EXCHANGES``).
 
+Both kernels exchange data only with context peers and wait at entry until
+every context peer has entered the call. ``cp_barrier=True`` skips the
+compiler's device barrier, which also waits for the other context groups of
+the program; the forward and backward then synchronize only their context
+peers. It changes no arithmetic.
+
 Calling convention for ``cp_size > 1`` (inside the caller's ``shard_map`` over
 ``cp_axis``): q/k/v are the local sequence shards ``[heads, N / cp, d]``,
 segment ids cover the full sequence ``[N]``.  ``o`` is returned sequence
@@ -822,6 +828,7 @@ def _splash_attention_forward(
     cp_axis: str | None,
     max_logit_value: jax.Array | None = None,
     save_max_logits: bool = True,
+    cp_barrier: bool = False,
 ):
   """Forward pass with the Ulysses exchange fused into one pallas call.
 
@@ -1383,6 +1390,10 @@ def _splash_attention_forward(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=(),
             collective_id=0 if cp_size > 1 else None,
+            # Every remote copy targets a context peer, so the kernel's entry
+            # barrier over the context peers can replace the compiler's device
+            # barrier, which also waits for the other context groups.
+            skip_device_barrier=cp_barrier and cp_size > 1,
             vmem_limit_bytes=(
                 config.fwd_vmem_limit_bytes or _DEFAULT_FWD_VMEM_LIMIT_BYTES
             ),
@@ -1483,6 +1494,7 @@ def _splash_attention_forward(
         "bwd_input_exchange",
         "head_checkpoint_names",
         "segment_schedule",
+        "cp_barrier",
     ),
 )
 def _splash_attention_custom(
@@ -1505,6 +1517,7 @@ def _splash_attention_custom(
     bwd_input_exchange: str,
     head_checkpoint_names: tuple[str, str, str] | None,
     segment_schedule: bool,
+    cp_barrier: bool,
     max_logit_value: jax.Array | None = None,
 ) -> base.SplashCustomReturnType:
   # The forward function does not use the dq and dkv MaskInfos, it just forwards
@@ -1535,6 +1548,7 @@ def _splash_attention_custom(
       cp_size=cp_size,
       cp_axis=cp_axis,
       max_logit_value=max_logit_value,
+      cp_barrier=cp_barrier,
   )
   if save_residuals:
     if config.use_base2_exp:  # for user, output values in natural base
@@ -1565,6 +1579,7 @@ def _splash_attention_fwd(
     bwd_input_exchange: str,
     head_checkpoint_names: tuple[str, str, str] | None,
     segment_schedule: bool,
+    cp_barrier: bool,
     max_logit_value: jax.Array | None = None,
 ) -> tuple[tuple[jax.Array], base.SplashResidualsType]:
 
@@ -1593,6 +1608,7 @@ def _splash_attention_fwd(
       cp_size=cp_size,
       cp_axis=cp_axis,
       max_logit_value=max_logit_value,
+      cp_barrier=cp_barrier,
   )
   logsumexp = stats["logsumexp"]  # save in the config base for the bwd pass
   if config.use_base2_exp:  # for user, output values in natural base
@@ -1662,6 +1678,7 @@ def _splash_attention_bwd(
     bwd_input_exchange: str,
     head_checkpoint_names: tuple[str, str, str] | None,
     segment_schedule: bool,
+    cp_barrier: bool,
     res: base.SplashResidualsType,
     grads: jax.Array | tuple[jax.Array, dict[str, jax.Array]],
 ):
@@ -1729,6 +1746,7 @@ def _splash_attention_bwd(
       config=config,
       dkv_mask_sparsity=dkv_mask_sparsity,
       segment_schedule=segment_schedule,
+      cp_barrier=cp_barrier,
   )
   return (
       None,  # fwd_mask_info
@@ -1760,6 +1778,7 @@ _splash_attention_custom.defvjp(_splash_attention_fwd, _splash_attention_bwd)
         "bwd_input_exchange",
         "head_checkpoint_names",
         "segment_schedule",
+        "cp_barrier",
     ],
 )
 def _splash_attention(
@@ -1784,6 +1803,7 @@ def _splash_attention(
     bwd_input_exchange: str = "head",
     head_checkpoint_names: tuple[str, str, str] | None = None,
     segment_schedule: bool = False,
+    cp_barrier: bool = False,
 ) -> base.SplashCustomReturnType:
   if segment_schedule and segment_ids is not None:
     # Pruned once here, so the forward, a remat replay and the backward all
@@ -1813,6 +1833,7 @@ def _splash_attention(
       bwd_input_exchange=bwd_input_exchange,
       head_checkpoint_names=head_checkpoint_names,
       segment_schedule=segment_schedule,
+      cp_barrier=cp_barrier,
   )
 
 
@@ -1920,6 +1941,7 @@ def _make_splash_attention(
     bwd_input_exchange: str = "head",
     head_checkpoint_names: tuple[str, str, str] | None = None,
     segment_schedule: bool = False,
+    cp_barrier: bool = False,
 ):
   # After the fused exchange every rank attends the full sequence, so the mask
   # is never sequence sharded.
@@ -2004,6 +2026,7 @@ def _make_splash_attention(
       bwd_input_exchange=bwd_input_exchange,
       head_checkpoint_names=head_checkpoint_names,
       segment_schedule=segment_schedule,
+      cp_barrier=cp_barrier,
   )
 
 

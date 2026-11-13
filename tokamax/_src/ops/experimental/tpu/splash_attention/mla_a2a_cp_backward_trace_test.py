@@ -404,3 +404,31 @@ def test_segment_schedule_needs_causal_mask():
     a2a.make_splash_mha_a2a_cp(
         sm.FullMask((SEQ, SEQ)), config=config(), cp_size=CP, cp_axis="context", segment_schedule=True
     )
+
+
+@requires_devices
+@pytest.mark.parametrize("cp_barrier", [False, True])
+@pytest.mark.parametrize("exchange,names,saved", CASES, ids=IDS)
+def test_cp_barrier_replaces_the_device_barrier(exchange, names, saved, cp_barrier):
+  # Every fused kernel skips the compiler's device barrier only on request.
+  with jax.ensure_compile_time_eval():
+    kernel = a2a.make_splash_mha_a2a_cp(
+        sm.CausalMask((SEQ, SEQ)), config=config(), cp_size=CP, cp_axis="context",
+        bwd_input_exchange=exchange, head_checkpoint_names=names, segment_schedule=True,
+        cp_barrier=cp_barrier,
+    )
+  mesh = Mesh(np.asarray(jax.devices()[:CP]), ("context",))
+  mapped = jax.shard_map(
+      lambda q, k, v, ids: kernel(q, k, v, sk.SegmentIds(ids, ids)),
+      mesh=mesh,
+      in_specs=(P(None, "context", None),) * 3 + (P(None),),
+      out_specs=P(None, "context", None),
+      check_vma=False,
+  )
+  fn = jax.checkpoint(mapped, prevent_cse=True, policy=jax.checkpoint_policies.save_only_these_names(*saved))
+  args = inputs() + [jax.ShapeDtypeStruct((HEADS, SEQ, 128), jnp.bfloat16)]
+  hlo = jax.jit(cycle(fn)).trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+  calls = [line for line in hlo.splitlines() if "tpu_custom_call" in line]
+  assert sum("mla_fused_dq_dkv_a2a" in line for line in calls) == 1
+  assert any("fwd_a2a_cp" in line for line in calls)
+  assert all(("skip_device_barrier" in line) == cp_barrier for line in calls)
