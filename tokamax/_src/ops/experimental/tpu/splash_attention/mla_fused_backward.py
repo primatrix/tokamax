@@ -224,6 +224,26 @@ def validate_metadata(kernel, cp, sequence=None):
   return dict(proof, concrete=True)
 
 
+def cp_entry_barrier(axis_name, cp):
+  """Wait until every context peer has entered this call.
+
+  Used with skip_device_barrier in place of the compiler's device barrier:
+  every remote copy of these kernels targets a context peer. Only context
+  coordinates change. Every peer consumes this generation before sending data,
+  and the final receive drain prevents a later call from overtaking an
+  unconsumed generation.
+  """
+  barrier = pltpu.get_barrier_semaphore()
+  sender = lax.axis_index(axis_name)
+
+  def announce(offset, _):
+    peer = lax.rem(sender + offset + 1, cp)
+    pl.semaphore_signal(barrier, 1, device_id={axis_name: peer})
+
+  lax.fori_loop(0, cp - 1, announce, None, unroll=False)
+  pl.semaphore_wait(barrier, cp - 1)
+
+
 def dkv_output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_steps, **params):
   """One grid invocation; delegate all dQ/dK/dV arithmetic unchanged.
 
@@ -245,20 +265,7 @@ def dkv_output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv
   should_write = original[4][grid_idx].astype(jnp.bool_)
   sender = lax.axis_index(axis_name)
   if cp_barrier:
-
-    @pl.when(jnp.logical_and(h == 0, grid_idx == 0))
-    def _cp_entry_barrier():
-      # Only context coordinates change. Every peer consumes this
-      # generation before sending data, and the final receive drain
-      # prevents a later call from overtaking an unconsumed generation.
-      barrier = pltpu.get_barrier_semaphore()
-
-      def announce(offset, _):
-        peer = lax.rem(sender + offset + 1, cp)
-        pl.semaphore_signal(barrier, 1, device_id={axis_name: peer})
-
-      lax.fori_loop(0, cp - 1, announce, None, unroll=False)
-      pl.semaphore_wait(barrier, cp - 1)
+    pl.when(jnp.logical_and(h == 0, grid_idx == 0))(lambda: cp_entry_barrier(axis_name, cp))
 
   ordinal = h * kv_steps + j
   slot = lax.rem(ordinal, depth)
@@ -519,7 +526,7 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
     lax.fori_loop(0, cp * heads * per_peer, drain, None, unroll=False)
 
 
-def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bkv, prefetch):
+def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, cp_barrier, heads, rows, bkv, prefetch):
   """Import into unique HBM head slots, then explicitly load two VMEM banks.
 
   Experimental only. Each sender writes its disjoint sequence chunk once per
@@ -543,6 +550,10 @@ def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, heads, rows, bkv, pr
   per_owner, block = rows // cp, bkv
   length = per_owner * block
   bank = lax.rem(row, 2)
+
+  if cp_barrier:
+    # Before the first K/V import and the base kernel's first export.
+    pl.when(jnp.logical_and(head == 0, program == 0))(lambda: cp_entry_barrier(axis_name, cp))
 
   # @reference.begin kv_hbm_supply
   def transfers(h, peer):
@@ -696,8 +707,6 @@ def fused_backward(
   )
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   if kv_import:
-    if cp_barrier:
-      raise ValueError("HBM K/V staging requires the compiler global barrier")
     if k.shape != (cp * num_q_heads, q_seq_len // cp, head_dim_qk) or v.shape[:2] != (cp * num_q_heads, q_seq_len // cp):
       raise ValueError("HBM K/V staging requires sequence-owned [CP*H,S/CP,D] sources")
   kv_seq_len, head_dim_v = v.shape[-2:]
@@ -958,7 +967,8 @@ def fused_backward(
       output_kernel,
       cp=cp,
       axis_name=axis_name,
-      cp_barrier=cp_barrier,
+      # HBM K/V staging sends before the base kernel runs; its wrapper waits.
+      cp_barrier=cp_barrier and not kv_hbm,
       depth=1,
       serial=False,
       heads=num_q_heads,
@@ -1166,6 +1176,7 @@ def fused_backward(
         base_kernel=kernel,
         cp=cp,
         axis_name=axis_name,
+        cp_barrier=cp_barrier,
         heads=num_q_heads,
         rows=kv_steps,
         bkv=bkv,
