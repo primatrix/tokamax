@@ -224,7 +224,10 @@ def validate_metadata(kernel, cp, sequence=None):
   return dict(proof, concrete=True)
 
 
-def cp_entry_barrier(axis_name, cp):
+CP_BARRIERS = (False, True, "scratch")
+
+
+def cp_entry_barrier(axis_name, cp, semaphore=None):
   """Wait until every context peer has entered this call.
 
   Used with skip_device_barrier in place of the compiler's device barrier:
@@ -232,8 +235,14 @@ def cp_entry_barrier(axis_name, cp):
   coordinates change. Every peer consumes this generation before sending data,
   and the final receive drain prevents a later call from overtaking an
   unconsumed generation.
+
+  ``semaphore`` (cp_barrier="scratch", experimental) is a kernel scratch
+  semaphore used in place of the compiler-allocated barrier semaphore, so the
+  call needs no barrier ID. A peer may signal it before this device has
+  entered the kernel; whether that signal survives, and what it touches if the
+  device is still running another op, is what device tests must establish.
   """
-  barrier = pltpu.get_barrier_semaphore()
+  barrier = pltpu.get_barrier_semaphore() if semaphore is None else semaphore
   sender = lax.axis_index(axis_name)
 
   def announce(offset, _):
@@ -244,7 +253,7 @@ def cp_entry_barrier(axis_name, cp):
   pl.semaphore_wait(barrier, cp - 1)
 
 
-def dkv_output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_steps, **params):
+def dkv_output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_steps, barrier_semaphore=None, **params):
   """One grid invocation; delegate all dQ/dK/dV arithmetic unchanged.
 
   Source (rank c, head h, KV tile j) uniquely owns destination
@@ -265,7 +274,7 @@ def dkv_output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv
   should_write = original[4][grid_idx].astype(jnp.bool_)
   sender = lax.axis_index(axis_name)
   if cp_barrier:
-    pl.when(jnp.logical_and(h == 0, grid_idx == 0))(lambda: cp_entry_barrier(axis_name, cp))
+    pl.when(jnp.logical_and(h == 0, grid_idx == 0))(lambda: cp_entry_barrier(axis_name, cp, barrier_semaphore))
 
   ordinal = h * kv_steps + j
   slot = lax.rem(ordinal, depth)
@@ -347,7 +356,9 @@ def dkv_output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv
     lax.fori_loop(0, cp * heads * tiles_per_peer, receive_one, None, unroll=False)
 
 
-def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_steps, dq_pipeline, pruned=False, **params):
+def output_kernel(
+    *refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_steps, dq_pipeline, pruned=False, barrier_semaphore=None, **params
+):
   assert len(refs) == 39
   # Added output at index22 shifts original scratch and dKV scratch by one.
   original = list(refs[:22]) + list(refs[23:26])
@@ -420,6 +431,7 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
       serial=serial,
       heads=heads,
       kv_steps=kv_steps,
+      barrier_semaphore=barrier_semaphore,
       **params,
   )
   store(g).start()
@@ -526,7 +538,7 @@ def output_kernel(*refs, cp, axis_name, cp_barrier, depth, serial, heads, kv_ste
     lax.fori_loop(0, cp * heads * per_peer, drain, None, unroll=False)
 
 
-def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, cp_barrier, heads, rows, bkv, prefetch):
+def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, cp_barrier, heads, rows, bkv, prefetch, barrier_semaphore=None):
   """Import into unique HBM head slots, then explicitly load two VMEM banks.
 
   Experimental only. Each sender writes its disjoint sequence chunk once per
@@ -553,7 +565,7 @@ def kv_hbm_output_kernel(*refs, base_kernel, cp, axis_name, cp_barrier, heads, r
 
   if cp_barrier:
     # Before the first K/V import and the base kernel's first export.
-    pl.when(jnp.logical_and(head == 0, program == 0))(lambda: cp_entry_barrier(axis_name, cp))
+    pl.when(jnp.logical_and(head == 0, program == 0))(lambda: cp_entry_barrier(axis_name, cp, barrier_semaphore))
 
   # @reference.begin kv_hbm_supply
   def transfers(h, peer):
@@ -1193,6 +1205,16 @@ def fused_backward(
         pltpu.SemaphoreType.DMA((2, 2)),
         pltpu.SemaphoreType.DMA((1,)),
     ]
+  if cp_barrier == "scratch":
+    # A trailing scratch semaphore for cp_entry_barrier, as sgl-jax fused_moe
+    # v2 allocates its barrier; BARRIER scratch lowers to a regular semaphore.
+    # The outermost kernel (kv_hbm wrapper or export kernel) owns the barrier.
+    inner_kernel = kernel
+
+    def kernel(*refs):
+      return inner_kernel(*refs[:-1], barrier_semaphore=refs[-1])
+
+    scratch_shapes = scratch_shapes + [pltpu.SemaphoreType.BARRIER]
   with jax.named_scope(kernel_name):
     results = pl.pallas_call(
         kernel,
@@ -1211,10 +1233,11 @@ def fused_backward(
         #     megacore
         # 3) for q_seq_len, we are reducing over it to compute dkv
         compiler_params=pltpu.CompilerParams(
-            skip_device_barrier=cp_barrier,
+            skip_device_barrier=bool(cp_barrier),
             # Reserved for this context-only protocol; other communication
-            # patterns (e.g. MoE) must use a different collective ID.
-            collective_id=61440 if cp_barrier else None,
+            # patterns (e.g. MoE) must use a different collective ID. The
+            # scratch barrier uses no compiler barrier semaphore.
+            collective_id=61440 if cp_barrier is True else None,
             dimension_semantics=("arbitrary",) * len(grid),
             flags={} if config.bwd_scheduler is None else {"XLA_TPU_FORCE_LP_LLO_SCHEDULER": config.bwd_scheduler},
             vmem_limit_bytes=config.bwd_vmem_limit_bytes,
@@ -1254,6 +1277,9 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
   partial slots of the pinned Splash dynamic grid.
   """
   validate_source()
+  # Exact values: 1 or 0 must not pass as True or False.
+  if not (cp_barrier is False or cp_barrier is True or cp_barrier == "scratch"):
+    raise ValueError(f"cp_barrier must be one of {CP_BARRIERS}; got {cp_barrier!r}")
   cfg = kernel.kwargs["config"]
   if cfg.dq_reduction_steps != 3:
     raise ValueError(f"MLA fused backward needs dq_reduction_steps=3; got {cfg.dq_reduction_steps=}")

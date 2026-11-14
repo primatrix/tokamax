@@ -407,10 +407,11 @@ def test_segment_schedule_needs_causal_mask():
 
 
 @requires_devices
-@pytest.mark.parametrize("cp_barrier", [False, True])
+@pytest.mark.parametrize("cp_barrier", [False, True, "scratch"])
 @pytest.mark.parametrize("exchange,names,saved", CASES, ids=IDS)
 def test_cp_barrier_replaces_the_device_barrier(exchange, names, saved, cp_barrier):
   # Only the backward skips the compiler's device barrier, and only on request.
+  # The scratch barrier asks for no compiler barrier semaphore (no collective ID).
   with jax.ensure_compile_time_eval():
     kernel = a2a.make_splash_mha_a2a_cp(
         sm.CausalMask((SEQ, SEQ)), config=config(), cp_size=CP, cp_axis="context",
@@ -432,5 +433,6 @@ def test_cp_barrier_replaces_the_device_barrier(exchange, names, saved, cp_barri
   backward = [line for line in calls if "mla_fused_dq_dkv_a2a" in line]
   forward = [line for line in calls if "fwd_a2a_cp" in line]
   assert len(backward) == 1 and forward
-  assert ("skip_device_barrier" in backward[0]) == cp_barrier
+  assert ("skip_device_barrier" in backward[0]) == bool(cp_barrier)
+  assert ("collective_id" in backward[0]) == (cp_barrier is True)
   assert not any("skip_device_barrier" in line for line in forward)
