@@ -17,3 +17,13 @@ Its default remains the PR's unrolled loop. The 1M recipe keeps the old rolled
 setting. Arithmetic order is unchanged, but CPU AOT and a device run are still
 separate gates. The distribution uses the local version `0.0.12+mla1940`, so
 strict runtime ABI checks cannot confuse it with the baseline package.
+
+The1M trace exposed quadratic host mask processing in the imported factory.
+For a plain square zero-offset causal mask with unsharded metadata, the
+integration derives each tile's empty/partial/full class from its endpoint
+inequalities and reuses the native schedule generator. Every returned field
+and dtype matches native processing across40 static/dynamic, forward/backward,
+tile-ratio and dtype cases; other masks fall back. A complete1M/CP16/one-local-head
+forward/backward trace with the peer barrier passed in the same42-test run in
+2.07s. The old trace was still scanning the dense mask after21 minutes.
+This is a host metadata construction improvement, not a device timing claim.
