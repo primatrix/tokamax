@@ -35,10 +35,11 @@ and the MLA backward configuration checked by ``make_backward``.
 (``head``, ``kv_hbm_prefetch`` or ``a2a``; see ``BWD_INPUT_EXCHANGES``).
 
 Both kernels exchange data only with context peers and wait at entry until
-every context peer has entered the call. ``cp_barrier=True`` skips the
-compiler's device barrier, which also waits for the other context groups of
-the program; the forward and backward then synchronize only their context
-peers. It changes no arithmetic.
+every context peer has entered the call. ``cp_barrier=True`` applies to the
+backward only: the backward skips the compiler's device barrier, which also
+waits for the other context groups of the program, and synchronizes only its
+context peers. The forward always keeps the compiler's device barrier; its
+entry handshake does not replace it. It changes no arithmetic.
 
 Calling convention for ``cp_size > 1`` (inside the caller's ``shard_map`` over
 ``cp_axis``): q/k/v are the local sequence shards ``[heads, N / cp, d]``,

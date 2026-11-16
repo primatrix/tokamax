@@ -434,3 +434,45 @@ def test_cp_barrier_replaces_the_device_barrier(exchange, names, saved, cp_barri
   assert len(backward) == 1 and forward
   assert ("skip_device_barrier" in backward[0]) == cp_barrier
   assert not any("skip_device_barrier" in line for line in forward)
+
+
+# Optional custom-call operands: no segment ids, or a NumPy mask with partial
+# mask blocks. Each changes how many operands the backward custom call takes.
+SMALL_SEQ = 1024
+OPERAND_SETS = {
+    "causal_no_ids": (lambda: sm.CausalMask((SMALL_SEQ, SMALL_SEQ)), False),
+    "numpy_causal_ids": (lambda: sm.NumpyMask(np.tril(np.ones((SMALL_SEQ, SMALL_SEQ), dtype=bool))), True),
+    "causal_ids": (lambda: sm.CausalMask((SMALL_SEQ, SMALL_SEQ)), True),
+}
+
+
+@requires_devices
+@pytest.mark.parametrize("exchange", ["head", "kv_hbm_prefetch", "a2a"])
+@pytest.mark.parametrize("operands", list(OPERAND_SETS))
+def test_backward_traces_with_optional_operands(operands, exchange):
+  mask, segmented = OPERAND_SETS[operands]
+  cfg = dataclasses.replace(
+      config(),
+      block_q=128,
+      block_kv=128,
+      block_kv_compute=128,
+      block_q_dkv=128,
+      block_kv_dkv=256,
+      block_kv_dkv_compute=128,
+      use_experimental_scheduler=False,
+  )
+  with jax.ensure_compile_time_eval():
+    kernel = a2a.make_splash_mha_a2a_cp(mask(), config=cfg, cp_size=2, cp_axis="context", bwd_input_exchange=exchange)
+  mesh = Mesh(np.asarray(jax.devices()[:2]), ("context",))
+  mapped = jax.shard_map(
+      lambda q, k, v, ids: kernel(q, k, v, sk.SegmentIds(ids, ids) if segmented else None),
+      mesh=mesh,
+      in_specs=(P(None, "context", None),) * 3 + (P(None),),
+      out_specs=P(None, "context", None),
+      check_vma=False,
+  )
+  loss = lambda q, k, v, ids: jnp.sum(mapped(q, k, v, ids).astype(jnp.float32))
+  args = [jax.ShapeDtypeStruct((4, SMALL_SEQ, 128), jnp.bfloat16) for _ in range(3)]
+  args.append(jax.ShapeDtypeStruct((SMALL_SEQ,), jnp.int32))
+  hlo = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+  assert sum("mla_fused_dq_dkv_a2a" in line for line in hlo.splitlines() if "tpu_custom_call" in line) == 1

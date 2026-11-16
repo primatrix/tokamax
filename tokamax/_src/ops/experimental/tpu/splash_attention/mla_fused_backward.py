@@ -1169,7 +1169,10 @@ def fused_backward(
     )
 
   if kv_hbm:
-    assert num_args == 14 and input_output_aliases == {14: 0} and len(scratch_shapes) == 16
+    # Optional operands (segment ids, partial mask blocks, q_sequence) drop out
+    # of the custom call, so the dQ alias follows the present operands. The
+    # kernel still sees every ref position (None for absent operands).
+    assert input_output_aliases == {num_args: 0} and len(scratch_shapes) == 16
     assert dynamic_grid and not native_layout and 6 + len(in_specs) == 19
     kernel = functools.partial(
         kv_hbm_output_kernel,

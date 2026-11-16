@@ -6,6 +6,9 @@ same tiles and three BF16 dQ partials bit for bit. A local batch folded into
 the head axis must match one call per sequence bit for bit, including
 max_logits. With ``segment_schedule`` the pruned schedules must match the
 full causal schedule bit for bit; the wall time of both is reported.
+``cp_barrier=True`` runs on two CP4 groups of the same 8 devices whose segment
+layouts give them unequal work, with two consecutive calls per step, and must
+match the device barrier bit for bit.
 """
 
 import json
@@ -310,5 +313,92 @@ def test_segment_schedule_folded_batch_matches_full_schedule(data):
   print(json.dumps(dict(
       tiles=tiles, exchange="kv_hbm_prefetch", folded=2, segment_schedule=True,
       full_ms=round(full_ms, 3), pruned_ms=round(pruned_ms, 3), **out,
+  )), flush=True)
+  assert all(r["mismatches"] == 0 and r["nonfinite"] == 0 for r in out.values()), out
+
+
+# cp_barrier: two CP groups of four ranks on a (data, context) mesh.
+GROUPS, GROUP_CP = 2, 4
+GROUP_SEQ_SPEC = P("data", None, "context", None)
+GROUP_OUT_SPEC = P("data", None, None, "context", None)
+
+
+def group_mesh():
+  return Mesh(np.asarray(jax.devices()[: GROUPS * GROUP_CP]).reshape(GROUPS, GROUP_CP), ("data", "context"))
+
+
+def two_calls_fn(tiles, exchange, saved, cp_barrier):
+  """Two consecutive fused calls per CP group; the second query depends on the first output."""
+  kernel = a2a.make_splash_mha_a2a_cp(
+      sm.CausalMask((SEQ, SEQ)),
+      config=config(tiles),
+      cp_size=GROUP_CP,
+      cp_axis="context",
+      bwd_input_exchange=exchange,
+      segment_schedule=True,
+      cp_barrier=cp_barrier,
+  )
+
+  def local(q, k, v, ids):
+    q, k, v, ids = q[0], k[0], v[0], sk.SegmentIds(ids[0], ids[0])
+    first = kernel(q, k, v, ids)
+    widen = jnp.concatenate([first, first[..., : q.shape[-1] - first.shape[-1]]], axis=-1)
+    second = kernel(q + widen, k, v, ids)
+    return jnp.stack([first, second])[None]
+
+  mapped = jax.shard_map(
+      local,
+      mesh=group_mesh(),
+      in_specs=(GROUP_SEQ_SPEC,) * 3 + (P("data", None),),
+      out_specs=GROUP_OUT_SPEC,
+      check_vma=False,
+  )
+  mapped = jax.checkpoint(mapped, prevent_cse=True, policy=jax.checkpoint_policies.save_only_these_names(*saved))
+
+  @jax.jit
+  def run(q, k, v, ids, do):
+    out, pullback = jax.vjp(lambda q, k, v: mapped(q, k, v, ids), q, k, v)
+    return (out, *pullback(do))
+
+  return run
+
+
+@pytest.fixture(scope="module")
+def group_data():
+  # Group 0: short packed documents and ID-0 padding, so its pruned schedules
+  # skip most tiles. Group 1: one document, so it skips none and runs behind.
+  mesh_ = group_mesh()
+  keys = jax.random.split(jax.random.key(1), 4)
+
+  def make(key, shape, spec):
+    return jax.jit(lambda key: jax.random.normal(key, shape, jnp.bfloat16), out_shardings=NamedSharding(mesh_, spec))(
+        key
+    )
+
+  q, k, v = (make(key, (GROUPS, HEADS, SEQ, w), GROUP_SEQ_SPEC) for key, w in zip(keys, (192, 192, 128)))
+  do = make(keys[3], (GROUPS, 2, HEADS, SEQ, 128), GROUP_OUT_SPEC)
+  rows = np.stack([segment_ids("short_padded"), np.ones(SEQ, np.int32)])
+  ids = jax.device_put(jnp.asarray(rows), NamedSharding(mesh_, P("data", None)))
+  return q, k, v, ids, do
+
+
+@pytest.mark.parametrize(
+    "tiles,exchange,saved",
+    [
+        ("tiny_vl_r1", "kv_hbm_prefetch", (RESIDUALS,)),
+        ("plus_vl_r8", "head", (RESIDUALS,)),
+    ],
+)
+def test_cp_barrier_skewed_groups_consecutive_calls(group_data, tiles, exchange, saved):
+  # cp_barrier changes no arithmetic: peer-only and device barriers must agree
+  # bit for bit. Each timed run repeats both calls, so every barrier and DMA
+  # semaphore is reused across calls and steps while the groups are skewed.
+  q, k, v, ids, do = group_data
+  device, device_ms = timed(two_calls_fn(tiles, exchange, saved, False), q, k, v, ids, do)
+  peers, peers_ms = timed(two_calls_fn(tiles, exchange, saved, True), q, k, v, ids, do)
+  out = {name: report(a, b) for name, a, b in zip(("out", "dq", "dk", "dv"), peers, device)}
+  print(json.dumps(dict(
+      tiles=tiles, exchange=exchange, groups=GROUPS, cp=GROUP_CP, calls=2, cp_barrier=True,
+      device_barrier_ms=round(device_ms, 3), cp_barrier_ms=round(peers_ms, 3), **out,
   )), flush=True)
   assert all(r["mismatches"] == 0 and r["nonfinite"] == 0 for r in out.values()), out
