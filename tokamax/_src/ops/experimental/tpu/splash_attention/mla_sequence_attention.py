@@ -22,12 +22,11 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as sk
 
-from tokamax._src.ops.experimental.tpu.splash_attention.mla_fused_backward import make_backward, validate_source
+from tokamax._src.ops.experimental.tpu.splash_attention.mla_fused_backward import make_backward
 
 
 def make_static_splash_kernel(mask, config):
   """Keep pinned Tokamax mask metadata as NumPy constants for topology AOT."""
-  validate_source()
   # Same processor/defaults as Tokamax's factory, without its eager jnp.array
   # conversion. That conversion executes on an enclosing topology-only mesh
   # even under default_device(cpu). NumPy leaves become constants when the
