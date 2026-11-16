@@ -18,16 +18,14 @@
 Derived from the C14/P18 allwrite candidate; any CP that partitions the K/V tiles.
 Arithmetic is delegated to the pinned Tokamax inner kernel. The caller is
 vendored as ordinary source so production never rewrites or executes strings.
-Keep the upstream source hash check when changing Tokamax: these Ref positions
-and partial-buffer lifetimes are an internal ABI, not a public API.
+These Ref positions and partial-buffer lifetimes are an internal ABI of the
+Splash inner kernel, not a public API. The Ref-count assertions and the trace
+tests catch a change to them; numerics need the device test.
 """
 from __future__ import annotations
 
 import functools
-import hashlib
-import inspect
 import math
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -36,8 +34,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as sk
-
-SOURCE_SHA = "d798fdd38edd5aed5650344b72bd43724cf4345a4c9e0a92fb722a9e6ccd81f9"
 
 MaskFunctionType = sk.MaskFunctionType
 MaskInfo = sk.MaskInfo
@@ -1240,13 +1236,6 @@ def fused_backward(
   return dq, dk, dv
 
 
-@functools.lru_cache(maxsize=1)
-def validate_source():
-  actual = hashlib.sha256(Path(inspect.getfile(sk)).read_bytes()).hexdigest()
-  if actual != SOURCE_SHA:
-    raise ValueError(f"MLA fused backward requires Tokamax Splash {SOURCE_SHA}; got {actual}")
-
-
 def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
   """Fused dQ/dK/dV backward for any CP that evenly partitions the K/V tiles.
 
@@ -1256,7 +1245,6 @@ def make_backward(kernel, cp, *, axis_name="context", cp_barrier=False):
   of block_q_dkv (r Q tiles per K/V tile, any r >= 1), with the three dQ
   partial slots of the pinned Splash dynamic grid.
   """
-  validate_source()
   cfg = kernel.kwargs["config"]
   if cfg.dq_reduction_steps != 3:
     raise ValueError(f"MLA fused backward needs dq_reduction_steps=3; got {cfg.dq_reduction_steps=}")

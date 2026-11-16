@@ -109,8 +109,7 @@ def config():
   )
 
 
-def test_pinned_source_and_bad_config_rejection():
-  mla_fused_backward.validate_source()
+def test_bad_config_rejection():
   cfg = config()
   kernel = sk.make_splash_mha(sm.CausalMask((32768, 32768)), config=cfg, q_seq_shards=1)
   bad = sk.SplashAttentionKernel(

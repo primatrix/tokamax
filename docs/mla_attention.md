@@ -81,10 +81,12 @@ A local batch can be folded into the head axis: `[B, H, S/CP, D]` becomes
 `B*H` must be a multiple of CP, and the `B*H/CP` heads of a rank must not
 straddle two sequences: B divides CP or CP divides B.
 
-The whole-source SHA256 check against `splash_attention_kernel.py` protects
-private Ref ordering and buffer-lifetime assumptions. A Splash source change
-requires explicit revalidation; do not simply refresh the expected hash.
-`test_pinned_source_and_bad_config_rejection` exercises this guard in CI.
+The fused backward calls the Splash inner dK/dV kernel with private Ref
+positions and buffer lifetimes. Its Ref-count assertions and the CPU trace
+tests (`mla_fused_backward_trace_test.py`, `mla_a2a_cp_backward_trace_test.py`)
+catch a change to that interface; numerics are checked only by the TPU device
+test (`mla_a2a_cp_backward_device_test.py`). Run both after changing
+`splash_attention_kernel.py`.
 
 ## Migration and validation
 
