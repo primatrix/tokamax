@@ -37,7 +37,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as sk
 
-SOURCE_SHA = "d798fdd38edd5aed5650344b72bd43724cf4345a4c9e0a92fb722a9e6ccd81f9"
+SOURCE_SHA = "13ac6f78550a4e36f5f2d2cf32a05e94a892a8c42e356be7e3de72ef17bfa5ff"
 
 MaskFunctionType = sk.MaskFunctionType
 MaskInfo = sk.MaskInfo
