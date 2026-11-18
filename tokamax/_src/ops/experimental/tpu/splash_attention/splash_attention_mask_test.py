@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import sys
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -683,6 +684,82 @@ class SplashAttentionMaskTest(test_utils.SplashAttentionTestCase):
 
 class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
   """Check the construction of MaskInfo from Mask."""
+
+  @parameterized.product(
+      is_dkv=(False, True),
+      return_dynamic_grid=(False, True),
+      permuted_q=(False, True),
+  )
+  def test_million_token_causal_mask_does_not_materialize_tiles(
+      self, is_dkv, return_dynamic_grid, permuted_q
+  ):
+    sequence_length = 1 << 20
+    mask = mask_lib.CausalMask((sequence_length, sequence_length))
+    if permuted_q:
+      mask.q_sequence = mask.q_sequence.reshape(16, -1).T.ravel()
+    mask_info_lib._process_mask.cache_clear()
+    process = (
+        mask_info_lib.process_mask_dkv if is_dkv else mask_info_lib.process_mask
+    )
+    with mock.patch.object(
+        mask_lib.CausalMask,
+        "__getitem__",
+        side_effect=AssertionError("Causal tiles must be classified from bounds"),
+    ):
+      info, mask_function = process(
+          mask,
+          (4096, 8192),
+          q_seq_shards=16,
+          return_dynamic_grid=return_dynamic_grid,
+      )
+    self.assertIsNotNone(mask_function)
+    self.assertIsNotNone(info.block_mask)
+    self.assertIsNone(info.mask_next)
+    self.assertIsNone(info.partial_mask_blocks)
+    np.testing.assert_array_equal(info.q_sequence, mask.q_sequence)
+
+  def test_custom_mask_subclasses_use_exact_fallback(self):
+    class CustomCausalMask(mask_lib.CausalMask):
+
+      def __init__(self, shape):
+        super().__init__(shape)
+        self.mask_function = lambda q, kv: (q >= kv) & ((q - kv) % 3 != 1)
+
+    class CustomFullMask(mask_lib.FullMask):
+
+      def __getitem__(self, idx):
+        q = np.arange(self.shape[0])[idx[0]]
+        kv = np.arange(self.shape[1])[idx[1]]
+        return q[:, None] % 3 == kv[None, :] % 3
+
+    for make_mask in (CustomCausalMask, CustomFullMask):
+      mask = make_mask((64, 128))
+      dense = mask_lib.NumpyMask(mask[:, :])
+      for process in (mask_info_lib.process_mask, mask_info_lib.process_mask_dkv):
+        for return_dynamic_grid in (False, True):
+          with self.subTest(
+              mask=make_mask.__name__,
+              is_dkv=process is mask_info_lib.process_mask_dkv,
+              return_dynamic_grid=return_dynamic_grid,
+          ):
+            kwargs = dict(
+                q_seq_shards=2,
+                kv_seq_shards=2,
+                return_dynamic_grid=return_dynamic_grid,
+            )
+            actual, _ = process(mask, (16, 32), **kwargs)
+            expected, _ = process(dense, (16, 32), **kwargs)
+            for field in (
+                "active_rows",
+                "active_cols",
+                "block_mask",
+                "num_active_blocks",
+            ):
+              self._assert_array_equal(
+                  getattr(actual, field), getattr(expected, field)
+              )
+            if not hasattr(mask, "mask_function"):
+              self._assert_mask_info_match(actual, expected)
 
   def _assert_mask_info_match(
       self, actual: mask_info_lib.MaskInfo, expected: mask_info_lib.MaskInfo
@@ -1748,6 +1825,174 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         start, end = mask_info_lib.find_bounds(np.array(arr))
         np.testing.assert_array_equal(start[:n], np.array(exp_start)[:n])  # pyrefly: ignore[unsupported-operation]
         np.testing.assert_array_equal(end[:n], np.array(exp_end)[:n])  # pyrefly: ignore[unsupported-operation]
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="causal_offset_neg",
+          make_mask=lambda s: mask_lib.CausalMask(s, offset=-8),
+      ),
+      dict(
+          testcase_name="causal_offset_pos",
+          make_mask=lambda s: mask_lib.CausalMask(s, offset=12),
+      ),
+      dict(
+          testcase_name="causal_interleaved_shards",
+          make_mask=lambda s: mask_lib.CausalMask(s, offset=0, shard_count=4),
+      ),
+      dict(
+          testcase_name="local_both_bounds",
+          make_mask=lambda s: mask_lib.LocalMask(
+              s, window_size=(12, 20), offset=4
+          ),
+      ),
+      dict(
+          testcase_name="local_left_only",
+          make_mask=lambda s: mask_lib.LocalMask(
+              s, window_size=(12, None), offset=-4
+          ),
+      ),
+      dict(
+          testcase_name="local_right_only",
+          make_mask=lambda s: mask_lib.LocalMask(
+              s, window_size=(None, 20), offset=0
+          ),
+      ),
+      dict(
+          testcase_name="local_unbounded",
+          make_mask=lambda s: mask_lib.LocalMask(
+              s, window_size=(None, None), offset=0
+          ),
+      ),
+      dict(
+          testcase_name="chunked_causal_subblock",
+          make_mask=lambda s: mask_lib.ChunkedCausalMask(s, chunk_size=8),
+      ),
+      dict(
+          testcase_name="chunked_causal_unaligned",
+          make_mask=lambda s: mask_lib.ChunkedCausalMask(s, chunk_size=24),
+      ),
+      dict(
+          testcase_name="chunked_causal_superblock",
+          make_mask=lambda s: mask_lib.ChunkedCausalMask(s, chunk_size=32),
+      ),
+      dict(
+          testcase_name="logical_or_causal_local",
+          make_mask=lambda s: (
+              mask_lib.CausalMask(s, offset=-16)
+              | mask_lib.LocalMask(s, window_size=(8, 8), offset=0)
+          ),
+      ),
+      dict(
+          testcase_name="logical_and_causal_local",
+          make_mask=lambda s: (
+              mask_lib.CausalMask(s, offset=8)
+              & mask_lib.LocalMask(s, window_size=(24, 16), offset=0)
+          ),
+      ),
+      dict(
+          testcase_name="logical_or_chunked_local",
+          make_mask=lambda s: (
+              mask_lib.ChunkedCausalMask(s, chunk_size=24)
+              | mask_lib.LocalMask(s, window_size=(4, 4), offset=0)
+          ),
+      ),
+  )
+  def test_lazy_and_dense_mask_info_equivalence(self, make_mask):
+    shapes_and_blocks = (
+        ((64, 64), (16, 16)),
+        ((64, 128), (16, 16)),
+        ((128, 64), (16, 16)),
+        ((64, 128), (16, 32)),
+        ((128, 64), (32, 16)),
+    )
+    for shape, block_shape in shapes_and_blocks:
+      lazy_mask = make_mask(shape)
+      dense_mask = mask_lib.NumpyMask(lazy_mask[:, :])
+
+      for shards in (1, 2):
+        for return_dynamic_grid in (True, False):
+          with self.subTest(
+              shape=shape,
+              block_shape=block_shape,
+              shards=shards,
+              return_dynamic_grid=return_dynamic_grid,
+          ):
+            kwargs = dict(
+                q_seq_shards=shards,
+                kv_seq_shards=shards,
+                return_dynamic_grid=return_dynamic_grid,
+            )
+            lazy_info, _ = mask_info_lib.process_mask(
+                lazy_mask, block_shape, **kwargs
+            )
+            dense_info, _ = mask_info_lib.process_mask(
+                dense_mask, block_shape, **kwargs
+            )
+            lazy_dkv, _ = mask_info_lib.process_mask_dkv(
+                lazy_mask, block_shape, **kwargs
+            )
+            dense_dkv, _ = mask_info_lib.process_mask_dkv(
+                dense_mask, block_shape, **kwargs
+            )
+
+            if not hasattr(lazy_mask, "mask_function"):
+              self._assert_mask_info_match(lazy_info, dense_info)
+              self._assert_mask_info_match(lazy_dkv, dense_dkv)
+            else:
+              self._assert_array_equal(
+                  lazy_info.q_sequence, lazy_mask.q_sequence
+              )
+              for actual, expected in (
+                  (lazy_info, dense_info),
+                  (lazy_dkv, dense_dkv),
+              ):
+                self.assertIsNone(actual.mask_next)
+                self.assertIsNone(actual.partial_mask_blocks)
+                self._assert_array_equal(actual.block_mask, expected.block_mask)
+                self._assert_array_equal(
+                    actual.active_rows, expected.active_rows
+                )
+                self._assert_array_equal(
+                    actual.active_cols, expected.active_cols
+                )
+                self._assert_array_equal(
+                    actual.num_active_blocks, expected.num_active_blocks
+                )
+
+  def test_non_contiguous_q_sequence_mask_info_equivalence(self):
+    block_shape = (16, 16)
+    for shape in ((64, 64), (64, 96), (96, 64)):
+      q_blocks = shape[0] // block_shape[0]
+      non_contig_q = (
+          np.arange(shape[0], dtype=np.int32)
+          .reshape(q_blocks, block_shape[0])
+          .T.ravel()
+      )
+
+      local_mask = mask_lib.LocalMask(shape, window_size=(10, 14), offset=2)
+      local_mask.q_sequence = non_contig_q
+      chunked_mask = mask_lib.ChunkedCausalMask(shape, chunk_size=24)
+      chunked_mask.q_sequence = non_contig_q
+
+      for name, lazy_mask in (
+          ("local_non_contig", local_mask),
+          ("chunked_non_contig", chunked_mask),
+      ):
+        with self.subTest(name=name, shape=shape):
+          dense_mask = mask_lib.NumpyMask(lazy_mask[:, :])
+          lazy_info, _ = mask_info_lib.process_mask(lazy_mask, block_shape)
+          dense_info, _ = mask_info_lib.process_mask(dense_mask, block_shape)
+          self._assert_array_equal(lazy_info.block_mask, dense_info.block_mask)
+          self._assert_array_equal(
+              lazy_info.active_rows, dense_info.active_rows
+          )
+          self._assert_array_equal(
+              lazy_info.active_cols, dense_info.active_cols
+          )
+          self._assert_array_equal(
+              lazy_info.num_active_blocks, dense_info.num_active_blocks
+          )
+
 
 if __name__ == "__main__":
   absltest.main()
