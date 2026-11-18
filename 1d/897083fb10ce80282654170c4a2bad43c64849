@@ -1,0 +1,26 @@
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_mask_info.py
+  s_268238866b6f5b::t_f117a72b553f07 281,288,369,382,386-387,608,617-620,633-636,645-657,713
+  s_268238866b6f5b::t_a49a536ac0ceca 183-280,282-287,289-333,339,345-346,356,359,362-363,365-368,370-381,383-385,606-607,614-616,621-622,624-632,637-643,671,692,712,731-735,744,749
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_mask_test.py
+  s_268238866b6f5b::t_851c05fadf62f8 17,688-752,757-763,1829-1995
+  s_268238866b6f5b::t_46c7fd7e928cd6 753-756
+  s_268238866b6f5b::t_f117a72b553f07 1996
+.github/workflows/ci-splash-mask.yml
+  s_268238866b6f5b::t_aafd4b0bf295fd 1-38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1d897083fb10ce80282654170c4a2bad43c64849",
+  "prompts": {},
+  "sessions": {
+    "s_268238866b6f5b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1b07f-05d6-7722-b399-e6f9adfbca94",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "CengTao <cengtao@U-Y2X2PWJC-0001.local>"
+    }
+  }
+}
