@@ -202,6 +202,8 @@ class SplashConfig:
   # If provided, scale FP32 QK logits inside the kernel. Keeping this optional
   # preserves the legacy path, where callers pre-scale Q before invoking Splash.
   softmax_scale: float | None = None
+  # Keeping the forward KV loop rolled can reduce VMEM for large tiles.
+  fwd_kv_unroll: bool = True
 
   def __post_init__(self):
     if self.block_kv_compute is None:
@@ -626,12 +628,16 @@ def flash_attention_kernel(
 
   @pl.when(jnp.logical_and(should_not_mask, should_run))
   def _():
-    lax.fori_loop(0, num_iters, body, None, unroll=True)
+    lax.fori_loop(0, num_iters, body, None, unroll=config.fwd_kv_unroll)
 
   @pl.when(jnp.logical_and(jnp.logical_not(should_not_mask), should_run))
   def _():
     lax.fori_loop(
-        0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
+        0,
+        num_iters,
+        partial(body, has_partial_mask=True),
+        None,
+        unroll=config.fwd_kv_unroll,
     )
 
   @pl.when(should_write)
