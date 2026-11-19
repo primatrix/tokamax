@@ -49,7 +49,7 @@ def _reference(q, k, v):
   return jnp.einsum("hst,htd->hsd", probabilities, v.astype(jnp.float32))
 
 
-def _kernel(*, use_base2_exp, save_residuals=False):
+def _kernel(*, use_base2_exp, save_residuals=False, compact_residuals=False):
   config = splash.SplashConfig(
       block_q=_SEQ_LEN,
       block_kv=_SEQ_LEN,
@@ -58,6 +58,7 @@ def _kernel(*, use_base2_exp, save_residuals=False):
       softmax_scale=_SOFTMAX_SCALE,
       use_base2_exp=use_base2_exp,
       interpret=True,
+      compact_residuals=compact_residuals,
   )
   mask = mask_lib.FullMask((_SEQ_LEN, _SEQ_LEN))
   return splash.make_splash_mha_single_device(
@@ -66,9 +67,16 @@ def _kernel(*, use_base2_exp, save_residuals=False):
 
 
 @pytest.mark.parametrize("use_base2_exp", [False, True])
-def test_softmax_scale_is_applied_to_fp32_attention_logits(use_base2_exp):
+@pytest.mark.parametrize("compact_residuals", [False, True])
+def test_softmax_scale_is_applied_to_fp32_attention_logits(
+    use_base2_exp, compact_residuals
+):
   q, k, v, _ = _inputs()
-  attention = _kernel(use_base2_exp=use_base2_exp, save_residuals=True)
+  attention = _kernel(
+      use_base2_exp=use_base2_exp,
+      save_residuals=True,
+      compact_residuals=compact_residuals,
+  )
 
   output, stats = attention(q, k, v)
   expected = _reference(q, k, v)
@@ -96,9 +104,14 @@ def test_softmax_scale_is_applied_to_fp32_attention_logits(use_base2_exp):
 
 
 @pytest.mark.parametrize("use_base2_exp", [False, True])
-def test_softmax_scale_is_included_in_query_and_key_gradients(use_base2_exp):
+@pytest.mark.parametrize("compact_residuals", [False, True])
+def test_softmax_scale_is_included_in_query_and_key_gradients(
+    use_base2_exp, compact_residuals
+):
   q, k, v, do = _inputs()
-  attention = _kernel(use_base2_exp=use_base2_exp)
+  attention = _kernel(
+      use_base2_exp=use_base2_exp, compact_residuals=compact_residuals
+  )
 
   output, pullback = jax.vjp(attention, q, k, v)
   expected, reference_pullback = jax.vjp(_reference, q, k, v)

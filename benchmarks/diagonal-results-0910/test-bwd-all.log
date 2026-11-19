@@ -1,0 +1,26 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.12, pytest-9.1.1, pluggy-1.6.0 -- /tmp/fdz-sv-validation-0910/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /tmp/fdz-sv-validation-0910
+configfile: pyproject.toml
+plugins: jaxtyping-0.3.11, typeguard-2.13.3
+collecting ... collected 92 items / 76 deselected / 16 selected
+
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-2-False-False-False] PASSED [  6%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-2-False-False-True] PASSED [ 12%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-2-False-True-False] PASSED [ 18%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-2-False-True-True] PASSED [ 25%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-2-True-False-False] PASSED [ 31%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-2-True-False-True] PASSED [ 37%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-2-True-True-False] PASSED [ 43%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-2-True-True-True] PASSED [ 50%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-4-False-False-False] PASSED [ 56%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-4-False-False-True] PASSED [ 62%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-4-False-True-False] PASSED [ 68%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-4-False-True-True] PASSED [ 75%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-4-True-False-False] PASSED [ 81%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-4-True-False-True] PASSED [ 87%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-4-True-True-False] PASSED [ 93%]
+tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_compact_test.py::test_optimized_training_config_matches_fp32_reference[all-4-True-True-True] PASSED [100%]
+
+====================== 16 passed, 76 deselected in 19.91s ======================
