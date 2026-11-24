@@ -740,10 +740,10 @@ def _keep_schedule(info, active):
   def take(x, fill):
     if x is None:
       return None
-    # Diagnostic candidate: gather metadata at int32 width, preserving the
-    # compact dtype consumed by the attention kernels.
+    # Diagnostic candidate: retain int32 schedule metadata through the kernel
+    # boundary so the gather cannot be folded back to compact integer width.
     value = jnp.take(x.astype(jnp.int32), index, mode="fill", fill_value=fill)
-    return value.astype(x.dtype)
+    return value
 
   count = jnp.sum(keep, dtype=info.num_active_blocks.dtype)
   return info._replace(
