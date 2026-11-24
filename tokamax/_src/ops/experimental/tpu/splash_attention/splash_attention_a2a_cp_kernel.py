@@ -737,7 +737,14 @@ def _keep_schedule(info, active):
   keep = active[rows, cols] | (info.block_mask == 1)
   keep &= jnp.arange(size) < info.num_active_blocks[0]
   (index,) = jnp.nonzero(keep, size=size, fill_value=size)
-  take = lambda x, fill: None if x is None else jnp.take(x, index, mode="fill", fill_value=fill)
+  def take(x, fill):
+    if x is None:
+      return None
+    # Diagnostic candidate: gather metadata at int32 width, preserving the
+    # compact dtype consumed by the attention kernels.
+    value = jnp.take(x.astype(jnp.int32), index, mode="fill", fill_value=fill)
+    return value.astype(x.dtype)
+
   count = jnp.sum(keep, dtype=info.num_active_blocks.dtype)
   return info._replace(
       active_rows=take(info.active_rows, -1),
