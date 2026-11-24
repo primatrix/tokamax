@@ -736,8 +736,15 @@ def _keep_schedule(info, active):
   rows, cols = (jnp.maximum(to_i32(x), 0) for x in (info.active_rows, info.active_cols))
   keep = active[rows, cols] | (info.block_mask == 1)
   keep &= jnp.arange(size) < info.num_active_blocks[0]
-  (index,) = jnp.nonzero(keep, size=size, fill_value=size)
-  take = lambda x, fill: None if x is None else jnp.take(x, index, mode="fill", fill_value=fill)
+  # Stable compaction: retained entries have unique, consecutive destinations.
+  # Rejected entries target the out-of-bounds sentinel and are dropped. This
+  # avoids dynamically gathering schedule metadata before scalar prefetch.
+  destination = jnp.where(keep, jnp.cumsum(keep, dtype=jnp.int32) - 1, size)
+
+  def take(x, fill):
+    if x is None:
+      return None
+    return jnp.full_like(x, fill).at[destination].set(x, mode="drop")
   count = jnp.sum(keep, dtype=info.num_active_blocks.dtype)
   return info._replace(
       active_rows=take(info.active_rows, -1),
